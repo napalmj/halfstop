@@ -130,6 +130,22 @@ each time.
 | 16 | **Preset hover preview**: show the preset on the preview while hovering it in the menu | Quicker preset choice | PanelFooter, PreviewArea (temporary adjustments) |
 | 17 | **Panel declutter** 🎨: "solo" sections (opening one collapses the others) and a "Modified only" filter | Detailed tab is a long scroll; this fits the user's "minimal UI" goal | AdjustPanel `DetailedPanel`, `PanelSection` |
 | 18 | **Export keeps metadata** (EXIF/GPS/copyright, with a "strip location" option), plus export presets and "Export again" (⌥⇧⌘E) | Exports currently drop all metadata. `Exporter` never copies source properties (RenderServices.swift) | RenderServices `Exporter`, export sheet |
+| 19 🎨 | **Rating filter on the filmstrip**: a compact star row at the strip's leading edge (click ★3 = "3★ and up", click the lit star again to clear), with the count it shows, e.g. "42 of 378". See notes below the table | In Edit mode the only rating filter is in the toolbar Filter menu, so narrowing the strip to your picks while editing takes several clicks | EditorView `Filmstrip` (:391), LibraryStore `minRating`/`visiblePhotos`/`step`/`setRating` |
+
+**Notes for #19**
+- The filmstrip already shows `store.visiblePhotos`, which applies `minRating` (LibraryStore.swift:262).
+  The new control is just a faster way to set that **same** `minRating`. Don't add separate filmstrip
+  state; the toolbar Filter label (`filterLabel`, LibraryViews.swift:294) and the library grid then stay
+  in sync.
+- Ask in the mockup whether "exactly N★" is wanted as well as "N★ and up" (⌥-click, say). Today's
+  picker only has "and up".
+- **Fix an existing bug at the same time:** if you lower the current photo's rating below the filter,
+  it drops out of `visiblePhotos` but stays current, because `setRating` doesn't re-check visibility.
+  The strip then loses its highlight, and `step()` falls back to index 0, so ← / → jumps to the start
+  of the strip. Keep the current photo in the strip (dimmed) until you move off it, and step from the
+  position it had. Add a selftest case: filter 3★, rate the current photo 1★, step → lands on the next
+  photo, not the first.
+- Show an empty state in the strip ("No 5★ photos · Clear filter") instead of a blank bar.
 
 ## P2: Library and import scale
 
@@ -148,8 +164,8 @@ each time.
    a sample at 3200 px with HSL + brush + subject mask and prints ms). Record baseline numbers in the PR.
 2. Do #5, #2, #1, #4 and #3 as separate small PRs, checking the numbers after each.
 3. Do #6 (sidecar format) carefully. It needs a backward-compat test that loads an old sidecar.
-4. Then the P1 items: no-mockup items (#9–11, #13–15, #18) first, mockup items (#8, #12, #16, #17) after
-   the user approves a sketch.
+4. Then the P1 items: no-mockup items (#9–11, #13–15, #18) first, mockup items (#8, #12, #16, #17, #19) after
+   the user approves a sketch. The #19 current-photo bug fix needs no mockup, so it can go in early.
 
 ## Done means
 
