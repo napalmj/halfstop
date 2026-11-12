@@ -57,7 +57,12 @@ final class Photo: Identifiable, Hashable {
     let ref: PhotoRef
     var rating: Int
     var flag: Flag
-    var adjustments: Adjustments
+    var adjustments: Adjustments {
+        didSet { revision &+= 1 }
+    }
+    /// Bumped on every change to `adjustments`: a cheap redraw key (hashing the full
+    /// adjustments, brush points included, on every frame was not).
+    @ObservationIgnored private(set) var revision = 0
     var history: [HistoryStep]
     var historyIndex: Int
     var snapshots: [EditSnapshot]

@@ -24,7 +24,8 @@ struct EditorView: View {
 
 private struct PreviewToken: Hashable {
     let url: URL
-    let adjustments: Adjustments
+    let revision: Int
+    let before: Bool
     let geometry: String
     let overlay: UUID?
     let generation: Int
@@ -70,16 +71,20 @@ struct PreviewArea: View {
         // adjustments yet (otherwise fresh brush strokes would be invisible).
         let wantsOverlay = store.showMaskOverlay || store.maskInteracting || (store.activeMask?.local.isNeutral ?? false)
         let overlayID = wantsOverlay && !store.showBefore ? store.activeMaskID : nil
-        let token = PreviewToken(url: url, adjustments: shown, geometry: "\(mode)", overlay: overlayID, generation: renderer.generation)
+        let token = PreviewToken(url: url, revision: photo.revision, before: store.showBefore, geometry: "\(mode)", overlay: overlayID, generation: renderer.generation)
 
         PreviewImageView(
             token: token,
-            provider: { renderer.source(for: url)?.developed(shown, geometry: mode, overlayMask: overlayID) },
-            onRendered: { img in if overlayID == nil { renderer.requestHistogram(img) } }
+            provider: { drawable, scale in
+                renderer.source(for: url).map {
+                    PreviewRenderer.previewImage($0, shown, geometry: mode, overlayMask: overlayID, drawableSize: drawable, scale: scale)
+                }
+            },
+            onHistogram: overlayID == nil ? { renderer.receiveHistogram($0) } : nil
         )
 
         if let source = renderer.source(for: url) {
-            let contentSize = Self.contentSize(source.size, a, mode)
+            let contentSize = PreviewLayout.contentSize(source.size, a, mode)
             let rect = PreviewLayout.fit(contentSize, in: size)
             if store.isCropping {
                 CropOverlay(
@@ -115,17 +120,6 @@ struct PreviewArea: View {
             .background(.black.opacity(0.5), in: RoundedRectangle(cornerRadius: 5))
             .foregroundStyle(Theme.text)
             .padding(10)
-    }
-
-    static func contentSize(_ size: CGSize, _ a: Adjustments, _ mode: GeometryMode) -> CGSize {
-        switch mode {
-        case .none: return size
-        case .straightenOnly: return ImageSource.straightenedFrameSize(size: size, angle: a.crop.angle)
-        case .full:
-            if a.crop.isIdentity { return size }
-            let f = ImageSource.straightenedFrameSize(size: size, angle: a.crop.angle)
-            return CGSize(width: f.width * a.crop.rect.width, height: f.height * a.crop.rect.height)
-        }
     }
 
     private func prepare() {
@@ -378,19 +372,7 @@ struct Filmstrip: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 LazyHStack(spacing: 6) {
                     ForEach(store.visiblePhotos) { photo in
-                        ThumbnailView(photo: photo, maxSize: 150)
-                            .frame(width: 96, height: 64)
-                            .opacity(photo.flag == .reject ? 0.35 : 1)
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 4)
-                                    .stroke(photo.url == store.currentID ? Theme.accent : .clear, lineWidth: 2)
-                            )
-                            .overlay(alignment: .bottomLeading) { StarsBadge(rating: photo.rating, size: 7) }
-                            .overlay(alignment: .topTrailing) {
-                                if !photo.adjustments.isDefault { EditedBadge(compact: true).padding(3) }
-                            }
-                            .contentShape(Rectangle())
-                            .onTapGesture { store.select(photo) }
+                        FilmstripCell(photo: photo, isCurrent: photo.url == store.currentID)
                             .id(photo.url)
                     }
                 }
@@ -403,5 +385,28 @@ struct Filmstrip: View {
             .onAppear { proxy.scrollTo(store.currentID, anchor: .center) }
         }
         .background(Theme.panel)
+    }
+}
+
+/// Its own view so a cell's edits re-render only that cell, not the whole strip.
+private struct FilmstripCell: View {
+    @Environment(LibraryStore.self) private var store
+    let photo: Photo
+    let isCurrent: Bool
+
+    var body: some View {
+        ThumbnailView(photo: photo, maxSize: 150)
+            .frame(width: 96, height: 64)
+            .opacity(photo.flag == .reject ? 0.35 : 1)
+            .overlay(
+                RoundedRectangle(cornerRadius: 4)
+                    .stroke(isCurrent ? Theme.accent : .clear, lineWidth: 2)
+            )
+            .overlay(alignment: .bottomLeading) { StarsBadge(rating: photo.rating, size: 7) }
+            .overlay(alignment: .topTrailing) {
+                if !photo.adjustments.isDefault { EditedBadge(compact: true).padding(3) }
+            }
+            .contentShape(Rectangle())
+            .onTapGesture { store.select(photo) }
     }
 }

@@ -19,7 +19,7 @@ enum MaskRenderer {
         var m: CIImage?
         switch mask.kind {
         case .radial, .linear: m = mask.mainShape.flatMap { shape($0, size: size) }
-        case .brush: m = brush(mask.strokes, size: size)
+        case .brush: m = brush(mask.strokes, size: size, maskID: mask.id)
         case .subject:
             m = exporting
                 ? SubjectDetector.shared.maskSync(for: url, base: base, size: size, subjects: mask.subjects)
@@ -55,7 +55,10 @@ enum MaskRenderer {
         if refines {
             let version = mask.kind == .subject ? SubjectDetector.shared.version(url) : 0
             let cacheable = mask.kind != .sky
-            out = refine(out, strokes: mask.strokes, size: size,
+            var unrefined = mask
+            unrefined.strokes = []
+            out = refine(out, strokes: mask.strokes, size: size, maskID: mask.id,
+                         baseKey: cacheable ? [unrefined.shapeKey, version, Int(size.width), Int(size.height)] : nil,
                          cacheKey: cacheable ? [mask.shapeKey, version, Int(size.width), Int(size.height)] : nil) ?? out
         }
         return out
@@ -151,80 +154,170 @@ enum MaskRenderer {
         return (max(Int(size.width * scale), 1), max(Int(size.height * scale), 1))
     }
 
-    private static func brush(_ strokes: [BrushStroke], size: CGSize) -> CIImage? {
+    private static func scaled(_ cg: CGImage, to size: CGSize) -> CIImage {
+        CIImage(cgImage: cg).transformed(by: CGAffineTransform(scaleX: size.width / CGFloat(cg.width), y: size.height / CGFloat(cg.height)))
+    }
+
+    private static func brush(_ strokes: [BrushStroke], size: CGSize, maskID: UUID) -> CIImage? {
         guard !strokes.isEmpty else { return nil }
         let (w, h) = rasterSize(size)
+        // A stroke in progress only paints its new dabs onto what's already there.
+        if let cg = LiveRaster.extend(maskID: maskID, width: w, height: h, baseKey: nil, strokes: strokes) {
+            return scaled(cg, to: size)
+        }
         var hasher = Hasher()
         hasher.combine(strokes); hasher.combine(w); hasher.combine(h)
         let key = NSNumber(value: hasher.finalize())
-        let cg: CGImage
-        if let hit = rasterCache.object(forKey: key) {
-            cg = hit
-        } else {
-            guard let img = rasterize(strokes, width: w, height: h) else { return nil }
-            rasterCache.setObject(img, forKey: key)
-            cg = img
-        }
-        return CIImage(cgImage: cg).transformed(by: CGAffineTransform(scaleX: size.width / CGFloat(w), y: size.height / CGFloat(h)))
+        if let hit = rasterCache.object(forKey: key) { return scaled(hit, to: size) }
+        guard let cg = LiveRaster.rebuild(maskID: maskID, width: w, height: h, background: nil, baseKey: nil, strokes: strokes) else { return nil }
+        rasterCache.setObject(cg, forKey: key)
+        return scaled(cg, to: size)
     }
 
     /// Paints add/subtract strokes on top of an existing mask.
-    private static func refine(_ mask: CIImage, strokes: [BrushStroke], size: CGSize, cacheKey: [Int]?) -> CIImage? {
+    /// - baseKey: identifies the unrefined mask; nil when it can't be cached (sky), which forces a readback.
+    private static func refine(_ mask: CIImage, strokes: [BrushStroke], size: CGSize, maskID: UUID,
+                               baseKey: [Int]?, cacheKey: [Int]?) -> CIImage? {
         let (w, h) = rasterSize(size)
+        var bk: Int?
+        if let baseKey {
+            var hasher = Hasher()
+            hasher.combine(baseKey); hasher.combine(w); hasher.combine(h)
+            bk = hasher.finalize()
+            if let cg = LiveRaster.extend(maskID: maskID, width: w, height: h, baseKey: bk, strokes: strokes) {
+                return scaled(cg, to: size)
+            }
+        }
         var key: NSNumber?
         if let cacheKey {
             var hasher = Hasher()
             hasher.combine(cacheKey); hasher.combine(w); hasher.combine(h)
             key = NSNumber(value: hasher.finalize())
-            if let hit = rasterCache.object(forKey: key!) {
-                return CIImage(cgImage: hit).transformed(by: CGAffineTransform(scaleX: size.width / CGFloat(w), y: size.height / CGFloat(h)))
-            }
+            if let hit = rasterCache.object(forKey: key!) { return scaled(hit, to: size) }
         }
         let small = mask.transformed(by: CGAffineTransform(scaleX: CGFloat(w) / size.width, y: CGFloat(h) / size.height))
         guard let baseCG = Render.background.createCGImage(small, from: CGRect(x: 0, y: 0, width: w, height: h),
                                                            format: .L8, colorSpace: linearGray),
-              let out = rasterize(strokes, width: w, height: h, background: baseCG) else { return nil }
+              let out = LiveRaster.rebuild(maskID: maskID, width: w, height: h, background: baseCG, baseKey: bk, strokes: strokes)
+        else { return nil }
         if let key { rasterCache.setObject(out, forKey: key) }
-        return CIImage(cgImage: out).transformed(by: CGAffineTransform(scaleX: size.width / CGFloat(w), y: size.height / CGFloat(h)))
+        return scaled(out, to: size)
     }
 
     static func rasterize(_ strokes: [BrushStroke], width: Int, height: Int, background: CGImage? = nil) -> CGImage? {
-        let space = background == nil ? CGColorSpaceCreateDeviceGray() : linearGray
+        guard let ctx = StrokePainter.context(width: width, height: height, background: background) else { return nil }
+        for stroke in strokes { StrokePainter.paint(stroke, from: 0, in: ctx, width: width, height: height) }
+        return ctx.makeImage()
+    }
+}
+
+/// Draws brush strokes as feathered dabs into an 8-bit gray bitmap.
+enum StrokePainter {
+    /// A black bitmap (optionally starting from `background`), flipped so normalized
+    /// top-left stroke coordinates map directly.
+    static func context(width: Int, height: Int, background: CGImage?) -> CGContext? {
+        let space = background == nil ? CGColorSpaceCreateDeviceGray() : MaskRenderer.linearGray
         guard let ctx = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
                                   space: space, bitmapInfo: CGImageAlphaInfo.none.rawValue) else { return nil }
         ctx.setFillColor(gray: 0, alpha: 1)
         ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
         if let background { ctx.draw(background, in: CGRect(x: 0, y: 0, width: width, height: height)) }
-        // Flip so normalized top-left coordinates map directly.
         ctx.translateBy(x: 0, y: CGFloat(height))
         ctx.scaleBy(x: 1, y: -1)
+        return ctx
+    }
+
+    /// Paints a stroke's dabs starting at segment `from` (segment i joins points i-1 and i;
+    /// 0 also paints the first point). Painting 0..<k and then k... gives the same pixels as
+    /// painting the whole stroke at once, which is what lets live strokes grow incrementally.
+    static func paint(_ stroke: BrushStroke, from: Int, in ctx: CGContext, width: Int, height: Int) {
+        guard let space = ctx.colorSpace, !stroke.points.isEmpty, from < stroke.points.count else { return }
         let long = CGFloat(max(width, height))
-        for stroke in strokes {
-            let r = CGFloat(stroke.radius) * long
-            let tone: CGFloat = stroke.erase ? 0 : 1
-            let core = max(0, 1 - CGFloat(stroke.feather))
-            let flow = CGFloat(stroke.flow)
-            guard let gradient = CGGradient(colorSpace: space, colorComponents: [tone, flow, tone, flow, tone, 0],
-                                            locations: [0, core * 0.999, 1], count: 3) else { continue }
-            let pts = stroke.points.map { CGPoint(x: $0.x * Double(width), y: $0.y * Double(height)) }
-            var dabs: [CGPoint] = []
-            if let first = pts.first { dabs.append(first) }
-            let spacing = max(r * 0.2, 0.5)
-            for i in 1..<max(pts.count, 1) {
-                let a = pts[i - 1], b = pts[i]
-                let d = hypot(b.x - a.x, b.y - a.y)
-                var t = spacing
-                while t <= d {
-                    dabs.append(CGPoint(x: a.x + (b.x - a.x) * t / d, y: a.y + (b.y - a.y) * t / d))
-                    t += spacing
-                }
-                if d < spacing { dabs.append(b) }
-            }
-            for p in dabs {
-                ctx.drawRadialGradient(gradient, startCenter: p, startRadius: 0, endCenter: p, endRadius: r, options: [])
-            }
+        let r = CGFloat(stroke.radius) * long
+        let tone: CGFloat = stroke.erase ? 0 : 1
+        let core = max(0, 1 - CGFloat(stroke.feather))
+        let flow = CGFloat(stroke.flow)
+        guard let gradient = CGGradient(colorSpace: space, colorComponents: [tone, flow, tone, flow, tone, 0],
+                                        locations: [0, core * 0.999, 1], count: 3) else { return }
+        func pt(_ i: Int) -> CGPoint { CGPoint(x: stroke.points[i].x * Double(width), y: stroke.points[i].y * Double(height)) }
+        func dab(_ p: CGPoint) {
+            ctx.drawRadialGradient(gradient, startCenter: p, startRadius: 0, endCenter: p, endRadius: r, options: [])
         }
-        return ctx.makeImage()
+        if from == 0 { dab(pt(0)) }
+        let spacing = max(r * 0.2, 0.5)
+        for i in max(from, 1)..<max(stroke.points.count, 1) {
+            let a = pt(i - 1), b = pt(i)
+            let d = hypot(b.x - a.x, b.y - a.y)
+            var t = spacing
+            while t <= d {
+                dab(CGPoint(x: a.x + (b.x - a.x) * t / d, y: a.y + (b.y - a.y) * t / d))
+                t += spacing
+            }
+            if d < spacing { dab(b) }
+        }
+    }
+}
+
+/// Per-mask bitmaps kept between frames. While you paint, each frame adds one point to the
+/// last stroke; instead of re-painting every stroke (cost growing with everything painted so
+/// far), only the new segment's dabs are drawn onto the bitmap from the previous frame.
+enum LiveRaster {
+    private final class Entry {
+        let ctx: CGContext
+        let baseKey: Int?
+        var drawn: [BrushStroke]
+        var image: CGImage?
+        init(ctx: CGContext, baseKey: Int?, drawn: [BrushStroke]) {
+            self.ctx = ctx; self.baseKey = baseKey; self.drawn = drawn
+        }
+    }
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var entries: [String: Entry] = [:]
+    private static let maxEntries = 8
+
+    private static func key(_ id: UUID, _ w: Int, _ h: Int) -> String { "\(id.uuidString)#\(w)x\(h)" }
+
+    /// The bitmap for `strokes` if it can be had from the last one painted for this mask and size
+    /// (unchanged, or the same strokes plus new points/strokes at the end); nil means rebuild.
+    static func extend(maskID: UUID, width: Int, height: Int, baseKey: Int?, strokes: [BrushStroke]) -> CGImage? {
+        lock.lock(); defer { lock.unlock() }
+        guard let e = entries[key(maskID, width, height)], e.baseKey == baseKey,
+              let start = appendedFrom(e.drawn, to: strokes) else { return nil }
+        if start.stroke == strokes.count { return e.image }  // nothing new
+        for i in start.stroke..<strokes.count {
+            StrokePainter.paint(strokes[i], from: i == start.stroke ? start.segment : 0, in: e.ctx, width: width, height: height)
+        }
+        e.drawn = strokes
+        e.image = e.ctx.makeImage()
+        return e.image
+    }
+
+    /// Paints all strokes from scratch and keeps the bitmap for later `extend` calls.
+    static func rebuild(maskID: UUID, width: Int, height: Int, background: CGImage?, baseKey: Int?, strokes: [BrushStroke]) -> CGImage? {
+        guard let ctx = StrokePainter.context(width: width, height: height, background: background) else { return nil }
+        for stroke in strokes { StrokePainter.paint(stroke, from: 0, in: ctx, width: width, height: height) }
+        let entry = Entry(ctx: ctx, baseKey: baseKey, drawn: strokes)
+        entry.image = ctx.makeImage()
+        lock.lock(); defer { lock.unlock() }
+        let k = key(maskID, width, height)
+        if entries[k] == nil, entries.count >= maxEntries, let victim = entries.keys.first { entries[victim] = nil }
+        entries[k] = entry
+        return entry.image
+    }
+
+    /// Where `new` continues `old`: the first stroke index with unpainted content and, for that
+    /// stroke, the first unpainted segment. nil if `new` isn't `old` with things appended.
+    static func appendedFrom(_ old: [BrushStroke], to new: [BrushStroke]) -> (stroke: Int, segment: Int)? {
+        guard new.count >= old.count else { return nil }
+        guard let lastOld = old.last else { return (0, 0) }
+        let n = old.count - 1
+        for i in 0..<n where new[i] != old[i] { return nil }
+        let a = lastOld, b = new[n]
+        guard a.radius == b.radius, a.feather == b.feather, a.flow == b.flow, a.erase == b.erase,
+              b.points.count >= a.points.count, Array(b.points.prefix(a.points.count)) == a.points else { return nil }
+        if b.points.count == a.points.count { return (n + 1, 0) }
+        return (n, a.points.count)
     }
 }
 

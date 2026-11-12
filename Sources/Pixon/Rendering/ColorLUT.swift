@@ -63,39 +63,46 @@ enum ColorLUT {
         let n = dimension
         let tone = toneTable(key)
         let toneMax = Float(tone.count - 1)
-        @inline(__always) func applyTone(_ x: Float) -> Float {
-            let p = x * toneMax
-            let i = min(Int(p), tone.count - 2)
-            let f = p - Float(i)
-            return tone[i] + (tone[i + 1] - tone[i]) * f
-        }
 
         let hslActive = !key.hsl.allSatisfy(\.isNeutral)
         let grade = GradePrep(key.grading)
-        let bands = key.hsl
-        let centers = HSLColor.allCases.map { Float($0.centerHue) }
+        let bands = HSLBands(key.hsl)
 
         var cube = [Float](repeating: 0, count: n * n * n * 4)
         let scale = 1 / Float(n - 1)
+        let slice = n * n * 4
+        // One blue slice per task: the cells are independent, and nothing below allocates.
         cube.withUnsafeMutableBufferPointer { buf in
-            var idx = 0
-            for b in 0..<n {
-                for g in 0..<n {
-                    for r in 0..<n {
-                        var rr = applyTone(Float(r) * scale)
-                        var gg = applyTone(Float(g) * scale)
-                        var bb = applyTone(Float(b) * scale)
-                        if hslActive {
-                            (rr, gg, bb) = applyHSL(rr, gg, bb, bands: bands, centers: centers)
+            let base = buf.baseAddress!
+            do {
+                let toneBuf = tone
+                DispatchQueue.concurrentPerform(iterations: n) { b in
+                    @inline(__always) func applyTone(_ x: Float) -> Float {
+                        let p = x * toneMax
+                        let i = min(Int(p), toneBuf.count - 2)
+                        let f = p - Float(i)
+                        return toneBuf[i] + (toneBuf[i + 1] - toneBuf[i]) * f
+                    }
+                    var idx = b * slice
+                    let bb0 = applyTone(Float(b) * scale)
+                    for g in 0..<n {
+                        let gg0 = applyTone(Float(g) * scale)
+                        for r in 0..<n {
+                            var rr = applyTone(Float(r) * scale)
+                            var gg = gg0
+                            var bb = bb0
+                            if hslActive {
+                                (rr, gg, bb) = applyHSL(rr, gg, bb, bands: bands)
+                            }
+                            if let grade {
+                                (rr, gg, bb) = grade.apply(rr, gg, bb)
+                            }
+                            base[idx] = rr
+                            base[idx + 1] = gg
+                            base[idx + 2] = bb
+                            base[idx + 3] = 1
+                            idx += 4
                         }
-                        if let grade {
-                            (rr, gg, bb) = grade.apply(rr, gg, bb)
-                        }
-                        buf[idx] = rr
-                        buf[idx + 1] = gg
-                        buf[idx + 2] = bb
-                        buf[idx + 3] = 1
-                        idx += 4
                     }
                 }
             }
@@ -103,45 +110,47 @@ enum ColorLUT {
         return cube.withUnsafeBufferPointer { Data(buffer: $0) }
     }
 
-    /// Weight of each band at a hue: raised-cosine falloff reaching zero at the neighboring
-    /// band centers, so weights always sum to 1 and there are no seams between colors.
-    private static func bandWeights(hue: Float, centers: [Float]) -> [(Int, Float)] {
-        let count = centers.count
-        var result: [(Int, Float)] = []
-        for i in 0..<count {
-            let c = centers[i]
-            let prev = centers[(i + count - 1) % count]
-            let next = centers[(i + 1) % count]
-            let widthBelow = wrapDistance(c, prev)
-            let widthAbove = wrapDistance(next, c)
-            var d = hue - c
-            if d > 180 { d -= 360 }
-            if d < -180 { d += 360 }
-            let width = d >= 0 ? widthAbove : widthBelow
-            let ad = abs(d)
-            if ad < width {
-                result.append((i, 0.5 * (1 + cos(Float.pi * ad / width))))
-            }
+    /// HSL band offsets and the hue span each band covers, prepared once per LUT.
+    struct HSLBands {
+        let centers: [Float], below: [Float], above: [Float]
+        let hue: [Float], sat: [Float], lum: [Float]
+
+        init(_ bands: [HSLBand]) {
+            let c = HSLColor.allCases.map { Float($0.centerHue) }
+            let n = c.count
+            centers = c
+            below = (0..<n).map { ColorLUT.wrapDistance(c[$0], c[($0 + n - 1) % n]) }
+            above = (0..<n).map { ColorLUT.wrapDistance(c[($0 + 1) % n], c[$0]) }
+            hue = bands.map { Float($0.hue) }
+            sat = bands.map { Float($0.saturation) }
+            lum = bands.map { Float($0.luminance) }
         }
-        return result
     }
 
-    private static func wrapDistance(_ a: Float, _ b: Float) -> Float {
+    static func wrapDistance(_ a: Float, _ b: Float) -> Float {
         var d = a - b
         while d < 0 { d += 360 }
         while d >= 360 { d -= 360 }
         return d
     }
 
-    private static func applyHSL(_ r: Float, _ g: Float, _ b: Float, bands: [HSLBand], centers: [Float]) -> (Float, Float, Float) {
+    /// Each band's weight at a hue is a raised-cosine falloff reaching zero at the neighboring
+    /// band centers, so weights always sum to 1 and there are no seams between colors.
+    private static func applyHSL(_ r: Float, _ g: Float, _ b: Float, bands: HSLBands) -> (Float, Float, Float) {
         var (h, s, l) = rgbToHSL(r, g, b)
         if s < 0.0001 { return (r, g, b) }
         var dh: Float = 0, ds: Float = 0, dl: Float = 0
-        for (i, w) in bandWeights(hue: h, centers: centers) {
-            let band = bands[i]
-            dh += w * Float(band.hue)
-            ds += w * Float(band.saturation)
-            dl += w * Float(band.luminance)
+        for i in 0..<bands.centers.count {
+            var d = h - bands.centers[i]
+            if d > 180 { d -= 360 }
+            if d < -180 { d += 360 }
+            let width = d >= 0 ? bands.above[i] : bands.below[i]
+            let ad = abs(d)
+            guard ad < width else { continue }
+            let w = 0.5 * (1 + cos(Float.pi * ad / width))
+            dh += w * bands.hue[i]
+            ds += w * bands.sat[i]
+            dl += w * bands.lum[i]
         }
         // Gray-ish pixels barely respond, like Lightroom.
         let satWeight = min(1, s * 2.5)
@@ -155,8 +164,9 @@ enum ColorLUT {
 
     /// Precomputed color-grading wheel offsets.
     struct GradePrep {
-        let tints: [(Float, Float, Float)]  // chroma offset per wheel (shadows, mids, highs)
-        let lums: [Float]
+        // Chroma offset and luminance shift per wheel: shadows (0), midtones (1), highlights (2).
+        let s0: (Float, Float, Float), s1: (Float, Float, Float), s2: (Float, Float, Float)
+        let l0: Float, l1: Float, l2: Float
         let shadowEnd: Float
         let highlightStart: Float
 
@@ -168,8 +178,10 @@ enum ColorLUT {
                 let k = Float(w.saturation / 100) * 0.35
                 return ((r - y) * k, (g - y) * k, (b - y) * k)
             }
-            tints = [tint(g.shadows), tint(g.midtones), tint(g.highlights)]
-            lums = [g.shadows, g.midtones, g.highlights].map { Float($0.luminance / 100) * 0.2 }
+            s0 = tint(g.shadows); s1 = tint(g.midtones); s2 = tint(g.highlights)
+            l0 = Float(g.shadows.luminance / 100) * 0.2
+            l1 = Float(g.midtones.luminance / 100) * 0.2
+            l2 = Float(g.highlights.luminance / 100) * 0.2
             let shift = Float(g.balance / 100) * 0.25
             shadowEnd = 0.55 + shift
             highlightStart = 0.45 + shift
@@ -185,13 +197,11 @@ enum ColorLUT {
             let ws = 1 - smoothstep(0, shadowEnd, y)
             let wh = smoothstep(highlightStart, 1, y)
             let wm = max(0, 1 - ws - wh)
-            let w = [ws, wm, wh]
             var rr = r, gg = g, bb = b
-            for i in 0..<3 where w[i] > 0 {
-                rr += (tints[i].0 + lums[i]) * w[i]
-                gg += (tints[i].1 + lums[i]) * w[i]
-                bb += (tints[i].2 + lums[i]) * w[i]
-            }
+            // Unrolled: an array literal here would allocate once per LUT cell.
+            if ws > 0 { rr += (s0.0 + l0) * ws; gg += (s0.1 + l0) * ws; bb += (s0.2 + l0) * ws }
+            if wm > 0 { rr += (s1.0 + l1) * wm; gg += (s1.1 + l1) * wm; bb += (s1.2 + l1) * wm }
+            if wh > 0 { rr += (s2.0 + l2) * wh; gg += (s2.1 + l2) * wh; bb += (s2.2 + l2) * wh }
             return (min(max(rr, 0), 1), min(max(gg, 0), 1), min(max(bb, 0), 1))
         }
     }

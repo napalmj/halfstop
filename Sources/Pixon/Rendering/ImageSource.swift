@@ -87,7 +87,10 @@ final class ImageSource {
     /// - Parameters:
     ///   - overlayMask: draws this mask as a red overlay (for the mask tools).
     ///   - exporting: detect subjects synchronously instead of skipping them while pending.
-    func developed(_ a: Adjustments, geometry: GeometryMode = .full, overlayMask: UUID? = nil, exporting: Bool = false) -> CIImage {
+    ///   - renderScale: develop at this fraction of the source's resolution (the live preview
+    ///     passes what fits on screen). Radii and masks scale with the image, so the look holds.
+    func developed(_ a: Adjustments, geometry: GeometryMode = .full, overlayMask: UUID? = nil, exporting: Bool = false,
+                   renderScale: CGFloat = 1) -> CIImage {
         var img: CIImage
         if let raw {
             raw.exposure = Float(a.exposure)
@@ -99,8 +102,9 @@ final class ImageSource {
             }
             img = raw.outputImage ?? CIImage.empty()
             img = img.transformed(by: CGAffineTransform(translationX: -img.extent.minX, y: -img.extent.minY))
+            img = Self.downscaled(img, renderScale)
         } else {
-            img = base ?? CIImage.empty()
+            img = Self.downscaled(base ?? CIImage.empty(), renderScale)
             if a.temperature != 0 || a.tint != 0 {
                 let f = CIFilter.temperatureAndTint()
                 f.inputImage = img
@@ -207,6 +211,26 @@ final class ImageSource {
             img = (f.outputImage ?? img).cropped(to: e)
         }
         return img
+    }
+
+    /// Scales an origin-at-zero image down (bilinear for mild reductions, Lanczos below half
+    /// size where bilinear would alias), cropped to whole pixels.
+    static func downscaled(_ image: CIImage, _ scale: CGFloat) -> CIImage {
+        guard scale < 0.999, scale > 0, !image.extent.isEmpty, image.extent.width.isFinite else { return image }
+        let out: CIImage
+        // Clamp first so edge pixels don't blend with transparency.
+        let clamped = image.clampedToExtent()
+        if scale >= 0.5 {
+            out = clamped.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        } else {
+            let f = CIFilter.lanczosScaleTransform()
+            f.inputImage = clamped
+            f.scale = Float(scale)
+            f.aspectRatio = 1
+            out = f.outputImage ?? clamped
+        }
+        let size = image.extent.size
+        return out.cropped(to: CGRect(x: 0, y: 0, width: max(1, floor(size.width * scale)), height: max(1, floor(size.height * scale))))
     }
 
     /// The subset of develop steps a mask can apply locally.

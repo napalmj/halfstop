@@ -5,6 +5,7 @@ import CoreGraphics
 import ImageIO
 import UniformTypeIdentifiers
 import AppKit
+import Metal
 
 /// Headless checks for the develop pipeline: `Pixon --selftest <output-dir>`.
 /// Also `Pixon --make-samples <dir>` writes synthetic test photos.
@@ -302,12 +303,93 @@ enum SelfTest {
             }
         }
 
+        // Live brush strokes: painting point by point must give the same pixels as painting at once.
+        func bytes(_ img: CGImage) -> [UInt8] {
+            var out = [UInt8](repeating: 0, count: img.width * img.height)
+            out.withUnsafeMutableBytes { buf in
+                let ctx = CGContext(data: buf.baseAddress, width: img.width, height: img.height, bitsPerComponent: 8, bytesPerRow: img.width,
+                                    space: CGColorSpaceCreateDeviceGray(), bitmapInfo: CGImageAlphaInfo.none.rawValue)
+                ctx?.draw(img, in: CGRect(x: 0, y: 0, width: img.width, height: img.height))
+            }
+            return out
+        }
+        let wave = (0..<80).map { NormPoint(x: 0.1 + Double($0) * 0.01, y: 0.5 + 0.2 * sin(Double($0) * 0.15)) }
+        let strokesFull = [BrushStroke(points: wave, radius: 0.05, feather: 0.6, flow: 0.7),
+                           BrushStroke(points: wave.map { NormPoint(x: $0.x, y: $0.y - 0.05) }, radius: 0.02, feather: 0.2, flow: 1, erase: true)]
+        let liveID = UUID()
+        var liveImage = LiveRaster.rebuild(maskID: liveID, width: 600, height: 400, background: nil, baseKey: nil,
+                                           strokes: [BrushStroke(points: Array(wave.prefix(1)), radius: 0.05, feather: 0.6, flow: 0.7)])
+        var extendedEveryTime = true
+        for count in 2...wave.count {
+            let partial = [BrushStroke(points: Array(wave.prefix(count)), radius: 0.05, feather: 0.6, flow: 0.7)]
+            liveImage = LiveRaster.extend(maskID: liveID, width: 600, height: 400, baseKey: nil, strokes: partial)
+            if liveImage == nil { extendedEveryTime = false; break }
+        }
+        for count in 1...wave.count where extendedEveryTime {
+            var two = strokesFull
+            two[1].points = Array(strokesFull[1].points.prefix(count))
+            liveImage = LiveRaster.extend(maskID: liveID, width: 600, height: 400, baseKey: nil, strokes: two)
+            if liveImage == nil { extendedEveryTime = false }
+        }
+        check("live strokes extend point by point", extendedEveryTime, "")
+        if let live = liveImage, let full = MaskRenderer.rasterize(strokesFull, width: 600, height: 400) {
+            let a = bytes(live), b = bytes(full)
+            let maxDiff = zip(a, b).map { abs(Int($0) - Int($1)) }.max() ?? 255
+            check("live strokes match painting at once", maxDiff <= 1, "max diff \(maxDiff)")
+        }
+        check("undoing a stroke repaints from scratch",
+              LiveRaster.extend(maskID: liveID, width: 600, height: 400, baseKey: nil, strokes: [strokesFull[0]]) == nil, "")
+
+        // Preview develops at screen resolution: same look at a lower scale.
+        var scaledA = Adjustments(); scaledA.highlights = -50; scaledA.shadows = 40; scaledA.hsl[5].saturation = 50; scaledA.vignette = -30
+        let fullDev = src.developed(scaledA), halfDev = src.developed(scaledA, renderScale: 0.5)
+        check("render scale halves the size", Int(halfDev.extent.width) == Int(fullDev.extent.width) / 2, "\(halfDev.extent.size)")
+        let scaleDiffs = [gray, dark, skyP, bluePatch].map { abs(s(fullDev, $0).luma - s(halfDev, $0).luma) }
+        check("render scale keeps the look", scaleDiffs.max()! < 0.03, "\(scaleDiffs)")
+        let laptop = PreviewRenderer.renderScale(source: ImageSource(image: img, url: url), Adjustments(), geometry: .full,
+                                                 drawableSize: CGSize(width: 1000, height: 700), scale: 2)
+        let big = PreviewRenderer.renderScale(source: ImageSource(image: img, url: url), Adjustments(), geometry: .full,
+                                              drawableSize: CGSize(width: 5000, height: 3000), scale: 2)
+        check("render scale fits the drawable", laptop > 0.55 && laptop < 0.75 && big == 1, "\(laptop) / \(big)")
+
+        // Histogram from the drawn frame: a gray ramp (evenly spread sRGB values) must read back flat.
+        let rampCtx = CGContext(data: nil, width: 1024, height: 128, bitsPerComponent: 8, bytesPerRow: 0, space: Render.sRGB,
+                                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        for x in 0..<1024 {
+            let v = CGFloat(x) / 1023
+            rampCtx.setFillColor(CGColor(colorSpace: Render.sRGB, components: [v, v, v, 1])!)
+            rampCtx.fill(CGRect(x: x, y: 0, width: 1, height: 128))
+        }
+        let ramp = CIImage(cgImage: rampCtx.makeImage()!)
+        let histTexDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: 1200, height: 400, mipmapped: false)
+        histTexDesc.usage = [.shaderWrite, .shaderRead, .renderTarget]
+        histTexDesc.storageMode = .private
+        if let tex = Render.device.makeTexture(descriptor: histTexDesc), let cb = Render.commandQueue.makeCommandBuffer() {
+            let rect = PreviewMTKView.encode(ramp, drawableSize: CGSize(width: 1200, height: 400), scale: 1, background: CIColor(red: 1, green: 0, blue: 0),
+                                             colorSpace: Render.sRGB, pixelFormat: .bgra8Unorm, commandBuffer: cb, texture: { tex })
+            let readback = rect.flatMap { HistogramReadback(source: tex, rect: $0, commandBuffer: cb) }
+            cb.commit(); cb.waitUntilCompleted()
+            if let h = readback?.read() {
+                // Kolmogorov–Smirnov distance from a flat distribution, worst channel.
+                func ks(_ x: [Float]) -> Float {
+                    let total = max(x.reduce(0, +), 1e-6)
+                    var c: Float = 0, d: Float = 0
+                    for i in 0..<x.count { c += x[i] / total; d = max(d, abs(c - Float(i + 1) / Float(x.count))) }
+                    return d
+                }
+                let d = max(ks(h.red), ks(h.green), ks(h.blue))
+                check("histogram from the drawn frame is right", d < 0.03, String(format: "KS %.3f", d))
+            } else {
+                check("histogram from the drawn frame is right", false, "no readback")
+            }
+        }
+
         // LUT speed (rebuilt on every curve/HSL/wheel drag).
         let t0 = Date()
         var key = ColorLUTKey(Adjustments()); key.contrast = 13; key.hsl[2].hue = 20; key.grading.midtones.saturation = 30
         _ = ColorLUT.cubeData(for: key)
         let ms = Date().timeIntervalSince(t0) * 1000
-        check("LUT builds fast", ms < 60, String(format: "%.1f ms", ms))
+        check("LUT builds fast", ms < 15, String(format: "%.1f ms", ms))
 
         print(ok ? "ALL PASSED" : "SOME FAILED")
         return ok

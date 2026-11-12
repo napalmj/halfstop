@@ -88,24 +88,34 @@ struct HistogramData: Equatable {
 }
 
 enum Histogram {
+    /// Histogram of a developed (linear) image; renders it, so only for one-off use (tests).
     static func compute(_ image: CIImage) -> HistogramData? {
         let extent = image.extent
         guard extent.width > 0, extent.height > 0, extent.width.isFinite else { return nil }
         let scale = min(1, 600 / max(extent.width, extent.height))
         let small = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
             .applyingFilter("CILinearToSRGBToneCurve")
-        let f = CIFilter.areaHistogram()
-        f.inputImage = small
-        f.extent = small.extent
-        f.count = HistogramData.bins
-        f.scale = 1
-        guard let out = f.outputImage else { return nil }
+        guard let out = areaHistogram(small, extent: small.extent) else { return nil }
         var px = [Float](repeating: 0, count: HistogramData.bins * 4)
         px.withUnsafeMutableBytes { buf in
             Render.background.render(out, toBitmap: buf.baseAddress!, rowBytes: HistogramData.bins * 16,
                                      bounds: CGRect(x: 0, y: 0, width: HistogramData.bins, height: 1),
                                      format: .RGBAf, colorSpace: nil)
         }
+        return make(px)
+    }
+
+    static func areaHistogram(_ image: CIImage, extent: CGRect) -> CIImage? {
+        let f = CIFilter.areaHistogram()
+        f.inputImage = image
+        f.extent = extent
+        f.count = HistogramData.bins
+        f.scale = 1
+        return f.outputImage
+    }
+
+    /// Normalizes raw RGBA bin values (`bins * 4` floats).
+    static func make(_ px: [Float]) -> HistogramData {
         var r = [Float](), g = [Float](), b = [Float]()
         for i in 0..<HistogramData.bins {
             r.append(px[i * 4]); g.append(px[i * 4 + 1]); b.append(px[i * 4 + 2])
@@ -117,6 +127,44 @@ enum Histogram {
         let peak = max((1..<last).map { max(r[$0], g[$0], b[$0]) }.max() ?? 1, 1e-6)
         func norm(_ a: [Float]) -> [Float] { a.map { min(1, $0 / peak) } }
         return HistogramData(red: norm(r), green: norm(g), blue: norm(b), clippedShadows: clipLow, clippedHighlights: clipHigh)
+    }
+}
+
+/// Takes the histogram of pixels already rendered into a texture (the live preview's drawable),
+/// encoded into the same command buffer, so it costs a small GPU pass instead of re-developing
+/// the photo. Call `read()` once the command buffer has completed.
+final class HistogramReadback: @unchecked Sendable {
+    private let output: MTLTexture
+
+    /// `rect` is in the texture's pixels, top-left origin.
+    init?(source: MTLTexture, rect: CGRect, commandBuffer: MTLCommandBuffer) {
+        let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba32Float, width: HistogramData.bins, height: 1, mipmapped: false)
+        desc.usage = [.shaderWrite, .shaderRead, .renderTarget]
+        desc.storageMode = .shared
+        guard rect.width >= 1, rect.height >= 1,
+              let output = Render.device.makeTexture(descriptor: desc),
+              // The drawable already holds display-encoded values, so no tone curve is needed.
+              var image = CIImage(mtlTexture: source, options: [.colorSpace: NSNull()]) else { return nil }
+        self.output = output
+        // CIImage(mtlTexture:) has a bottom-left origin.
+        let region = CGRect(x: rect.minX, y: CGFloat(source.height) - rect.maxY, width: rect.width, height: rect.height).integral
+            .intersection(image.extent)
+        let s = min(1, 512 / max(region.width, region.height))
+        image = image.cropped(to: region)
+            .transformed(by: CGAffineTransform(translationX: -region.minX, y: -region.minY))
+            .transformed(by: CGAffineTransform(scaleX: s, y: s))
+        let small = CGRect(x: 0, y: 0, width: floor(region.width * s), height: floor(region.height * s))
+        guard small.width >= 1, small.height >= 1,
+              let hist = Histogram.areaHistogram(image, extent: small) else { return nil }
+        let dest = CIRenderDestination(mtlTexture: output, commandBuffer: commandBuffer)
+        dest.colorSpace = nil
+        guard (try? Render.preview.startTask(toRender: hist, to: dest)) != nil else { return nil }
+    }
+
+    func read() -> HistogramData? {
+        var px = [Float](repeating: 0, count: HistogramData.bins * 4)
+        output.getBytes(&px, bytesPerRow: HistogramData.bins * 16, from: MTLRegionMake2D(0, 0, HistogramData.bins, 1), mipmapLevel: 0)
+        return Histogram.make(px)
     }
 }
 

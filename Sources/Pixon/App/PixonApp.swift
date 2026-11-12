@@ -10,6 +10,7 @@ struct PixonApp: App {
 
     init() {
         SelfTest.runIfRequested()
+        Bench.runIfRequested()
     }
 
     var body: some Scene {

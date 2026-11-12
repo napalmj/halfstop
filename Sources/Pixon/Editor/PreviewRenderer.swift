@@ -18,8 +18,6 @@ final class PreviewRenderer {
     @ObservationIgnored private var lru: [URL] = []
     @ObservationIgnored private var inflight: Set<URL> = []
     @ObservationIgnored private var placeholders: [URL: ImageSource] = [:]
-    @ObservationIgnored private var histogramBusy = false
-    @ObservationIgnored private var histogramPending: CIImage?
     /// Bumped whenever a source finishes loading so views redraw.
     private(set) var generation = 0
 
@@ -36,6 +34,29 @@ final class PreviewRenderer {
     }
 
     func hasFullSource(_ url: URL) -> Bool { sources[url] != nil }
+
+    /// The image the live preview draws for a frame (shared with `--bench`).
+    ///
+    /// Develops at the resolution the image actually occupies on screen rather than the
+    /// full decoded preview size: every filter then touches only the pixels you can see.
+    nonisolated static func previewImage(_ source: ImageSource, _ a: Adjustments, geometry: GeometryMode, overlayMask: UUID?,
+                                         drawableSize: CGSize, scale: CGFloat) -> CIImage {
+        source.developed(a, geometry: geometry, overlayMask: overlayMask,
+                         renderScale: renderScale(source: source, a, geometry: geometry, drawableSize: drawableSize, scale: scale))
+    }
+
+    /// Fraction of the decoded source's resolution needed to fill the on-screen image rect,
+    /// quantized so small window resizes don't keep invalidating cached intermediates.
+    nonisolated static func renderScale(source: ImageSource, _ a: Adjustments, geometry: GeometryMode,
+                                        drawableSize: CGSize, scale: CGFloat) -> CGFloat {
+        guard source.size.width > 0, drawableSize.width > 0, scale > 0 else { return 1 }
+        let content = PreviewLayout.contentSize(source.size, a, geometry)
+        let rect = PreviewLayout.fit(content, in: CGSize(width: drawableSize.width / scale, height: drawableSize.height / scale))
+        guard content.width > 0, rect.width > 0 else { return 1 }
+        let needed = rect.width * scale / content.width
+        let step: CGFloat = 1 / 16
+        return min(1, max(step, (needed / step).rounded(.up) * step))
+    }
 
     /// Forces a redraw (e.g. a subject mask finished detecting).
     func bump() { generation += 1 }
@@ -110,22 +131,19 @@ final class PreviewRenderer {
 
     // MARK: - Histogram
 
-    func requestHistogram(_ image: CIImage) {
-        if histogramBusy {
-            histogramPending = image
-            return
-        }
-        histogramBusy = true
-        Task.detached(priority: .utility) {
-            let data = Histogram.compute(image)
-            await MainActor.run {
-                self.histogram = data
-                self.histogramBusy = false
-                if let next = self.histogramPending {
-                    self.histogramPending = nil
-                    self.requestHistogram(next)
-                }
-            }
+    @ObservationIgnored private var histogramLatest: HistogramData?
+    @ObservationIgnored private var histogramScheduled = false
+
+    /// Takes the histogram of a frame that was just drawn. Publishes at most ~15 times a
+    /// second (always ending on the latest frame) so the panel doesn't re-render per frame.
+    func receiveHistogram(_ data: HistogramData) {
+        histogramLatest = data
+        guard !histogramScheduled else { return }
+        histogramScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0 / 15) { [weak self] in
+            guard let self else { return }
+            self.histogramScheduled = false
+            if let latest = self.histogramLatest, latest != self.histogram { self.histogram = latest }
         }
     }
 }
@@ -134,6 +152,19 @@ final class PreviewRenderer {
 
 enum PreviewLayout {
     static let padding: CGFloat = 28
+
+    /// Size of what's drawn for a source of `size` (the straightened frame while cropping,
+    /// the uncropped photo while editing a mask, else the crop).
+    static func contentSize(_ size: CGSize, _ a: Adjustments, _ mode: GeometryMode) -> CGSize {
+        switch mode {
+        case .none: return size
+        case .straightenOnly: return ImageSource.straightenedFrameSize(size: size, angle: a.crop.angle)
+        case .full:
+            if a.crop.isIdentity { return size }
+            let f = ImageSource.straightenedFrameSize(size: size, angle: a.crop.angle)
+            return CGSize(width: f.width * a.crop.rect.width, height: f.height * a.crop.rect.height)
+        }
+    }
 
     /// Where an image of `content` size sits inside `bounds` (top-left origin, points).
     static func fit(_ content: CGSize, in bounds: CGSize, padding: CGFloat = padding) -> CGRect {
@@ -149,8 +180,10 @@ enum PreviewLayout {
 // MARK: - Metal view
 
 final class PreviewMTKView: MTKView {
-    var imageProvider: (() -> CIImage?)?
-    var onRendered: ((CIImage) -> Void)?
+    /// Called with the drawable size (pixels) and backing scale.
+    var imageProvider: ((CGSize, CGFloat) -> CIImage?)?
+    /// When set, gets the histogram of each drawn frame (main thread).
+    var onHistogram: ((HistogramData) -> Void)?
     var backgroundColor = CIColor(red: 0.09, green: 0.09, blue: 0.095)
     private let colorSpace = Render.displayP3
 
@@ -171,21 +204,32 @@ final class PreviewMTKView: MTKView {
     override func draw(_ dirtyRect: NSRect) {
         guard let drawable = currentDrawable,
               let commandBuffer = Render.commandQueue.makeCommandBuffer() else { return }
-        let image = imageProvider?()
-        Self.encode(image, drawableSize: drawableSize, scale: window?.backingScaleFactor ?? 2,
-                    background: backgroundColor, colorSpace: colorSpace, pixelFormat: colorPixelFormat,
-                    commandBuffer: commandBuffer, texture: { drawable.texture })
-        if let image, !image.extent.isEmpty { onRendered?(image) }
+        let scale = window?.backingScaleFactor ?? 2
+        let image = imageProvider?(drawableSize, scale)
+        let rect = Self.encode(image, drawableSize: drawableSize, scale: scale,
+                               background: backgroundColor, colorSpace: colorSpace, pixelFormat: colorPixelFormat,
+                               commandBuffer: commandBuffer, texture: { drawable.texture })
+        // Histogram of the pixels just drawn: no second trip through the develop pipeline.
+        if let onHistogram, let rect,
+           let readback = HistogramReadback(source: drawable.texture, rect: rect, commandBuffer: commandBuffer) {
+            commandBuffer.addCompletedHandler { _ in
+                guard let data = readback.read() else { return }
+                DispatchQueue.main.async { onHistogram(data) }
+            }
+        }
         commandBuffer.present(drawable)
         commandBuffer.commit()
     }
 
-    /// Shared by the live view and the offscreen check, so both go through identical code.
+    /// Shared by the live view, the benchmark and the offscreen check, so all go through identical code.
+    /// Returns where the image landed in the drawable (pixels, Metal's top-left origin), if anything was drawn.
+    @discardableResult
     static func encode(_ image: CIImage?, drawableSize: CGSize, scale: CGFloat, background: CIColor,
                        colorSpace: CGColorSpace, pixelFormat: MTLPixelFormat,
-                       commandBuffer: MTLCommandBuffer, texture: @escaping () -> MTLTexture) {
+                       commandBuffer: MTLCommandBuffer, texture: @escaping () -> MTLTexture) -> CGRect? {
         let full = CGRect(origin: .zero, size: drawableSize)
         var composite = CIImage(color: background).cropped(to: full)
+        var placedRect: CGRect?
         if let image, !image.extent.isEmpty, image.extent.width.isFinite {
             let rectPts = PreviewLayout.fit(image.extent.size, in: CGSize(width: drawableSize.width / scale, height: drawableSize.height / scale))
             let rect = CGRect(x: rectPts.minX * scale, y: drawableSize.height - rectPts.maxY * scale,
@@ -196,12 +240,14 @@ final class PreviewMTKView: MTKView {
                 .transformed(by: CGAffineTransform(scaleX: s, y: s))
                 .transformed(by: CGAffineTransform(translationX: rect.minX, y: rect.minY))
             composite = placed.composited(over: composite)
+            placedRect = CGRect(x: rect.minX, y: drawableSize.height - rect.maxY, width: rect.width, height: rect.height)
         }
         let dest = CIRenderDestination(width: Int(drawableSize.width), height: Int(drawableSize.height),
                                        pixelFormat: pixelFormat, commandBuffer: commandBuffer,
                                        mtlTextureProvider: texture)
         dest.colorSpace = colorSpace
         _ = try? Render.preview.startTask(toRender: composite, to: dest)
+        return placedRect
     }
 
     /// Renders through the live-view path into a readable texture and saves a PNG (orientation check).
@@ -230,8 +276,9 @@ final class PreviewMTKView: MTKView {
 struct PreviewImageView: NSViewRepresentable {
     /// Changes to this value trigger a redraw.
     let token: AnyHashable
-    let provider: () -> CIImage?
-    let onRendered: (CIImage) -> Void
+    let provider: (CGSize, CGFloat) -> CIImage?
+    /// nil = don't take histograms (e.g. while the red mask overlay is showing).
+    let onHistogram: ((HistogramData) -> Void)?
 
     final class Coordinator { var lastToken: AnyHashable? }
 
@@ -240,14 +287,14 @@ struct PreviewImageView: NSViewRepresentable {
     func makeNSView(context: Context) -> PreviewMTKView {
         let v = PreviewMTKView()
         v.imageProvider = provider
-        v.onRendered = onRendered
+        v.onHistogram = onHistogram
         context.coordinator.lastToken = token
         return v
     }
 
     func updateNSView(_ view: PreviewMTKView, context: Context) {
         view.imageProvider = provider
-        view.onRendered = onRendered
+        view.onHistogram = onHistogram
         // Only redraw when what's shown actually changed (histogram updates re-run body too).
         if context.coordinator.lastToken != token {
             context.coordinator.lastToken = token

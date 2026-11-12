@@ -46,8 +46,16 @@ final class LibraryStore {
     // Library contents
     /// Mutated only by the store and its Importer extension.
     var catalog = Catalog()
-    var photos: [Photo] = []
+    var photos: [Photo] = [] {
+        didSet {
+            photoByRef = Dictionary(photos.map { ($0.ref, $0) }, uniquingKeysWith: { a, _ in a })
+            photoByURL = Dictionary(photos.map { ($0.url, $0) }, uniquingKeysWith: { a, _ in a })
+        }
+    }
     @ObservationIgnored private var photoByRef: [PhotoRef: Photo] = [:]
+    /// Lookup for `current`, which every slider reads on every tick (a scan was O(library)).
+    /// Observed, so views reading `current` still update when the library changes.
+    private var photoByURL: [URL: Photo] = [:]
     private(set) var isLoading = false
     var source: LibrarySource = .all {
         didSet { if oldValue != source { selection = []; keepCurrentVisible() } }
@@ -203,7 +211,7 @@ final class LibraryStore {
 
     var current: Photo? {
         guard let currentID else { return nil }
-        return photos.first { $0.url == currentID }
+        return photoByURL[currentID]
     }
 
     /// Photos an action like "apply preset" should hit: the selection in the grid, the current photo in the editor.
@@ -258,7 +266,6 @@ final class LibraryStore {
                     }
                 }
                 self.photos = list
-                self.photoByRef = Dictionary(list.map { ($0.ref, $0) }, uniquingKeysWith: { a, _ in a })
                 self.isLoading = false
                 self.keepCurrentVisible()
                 self.backfillFingerprints()
@@ -416,7 +423,7 @@ final class LibraryStore {
 
     /// Drag and drop: dropping one photo of a multi-selection adds the whole selection.
     func dropOnCollection(_ id: UUID, urls: [URL]) {
-        var items = urls.compactMap { u in photos.first { $0.url == u } }
+        var items = urls.compactMap { photoByURL[$0] }
         if items.contains(where: { selection.contains($0.url) }) {
             items = photos.filter { selection.contains($0.url) }
         }
@@ -454,7 +461,7 @@ final class LibraryStore {
         commitAllPending()
         for (url, work) in pendingSaves {
             work.cancel()
-            if let photo = photos.first(where: { $0.url == url }) {
+            if let photo = photoByURL[url] {
                 LibraryStore.writeSidecar(photo.sidecar, for: url)
             }
         }
@@ -590,7 +597,6 @@ final class LibraryStore {
         saveCatalog()
         let gone = Set(moved.map(\.url))
         photos.removeAll { gone.contains($0.url) }
-        photoByRef = Dictionary(photos.map { ($0.ref, $0) }, uniquingKeysWith: { a, _ in a })
         selection.subtract(gone)
 
         if let id = currentID, gone.contains(id) {
