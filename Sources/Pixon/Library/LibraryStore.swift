@@ -15,6 +15,19 @@ enum LibrarySource: Hashable {
     case collection(UUID)
 }
 
+enum SortOrder: String, CaseIterable, Identifiable {
+    case folder, fileName, captureTime, rating
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .folder: "Folder order"
+        case .fileName: "File name"
+        case .captureTime: "Capture time"
+        case .rating: "Rating"
+        }
+    }
+}
+
 enum EditsFilter: String, CaseIterable, Identifiable {
     case any, edited, unedited
     var id: String { rawValue }
@@ -46,13 +59,25 @@ final class LibraryStore {
     // Library contents
     /// Mutated only by the store and its Importer extension.
     var catalog = Catalog()
+    /// Kept in the chosen sort order (see `sorted`); assign through `sorted(_:)` when replacing.
     var photos: [Photo] = [] {
         didSet {
+            photoPosition = Dictionary(photos.enumerated().map { ($1.ref, $0) }, uniquingKeysWith: { a, _ in a })
             photoByRef = Dictionary(photos.map { ($0.ref, $0) }, uniquingKeysWith: { a, _ in a })
             photoByURL = Dictionary(photos.map { ($0.url, $0) }, uniquingKeysWith: { a, _ in a })
         }
     }
     @ObservationIgnored private var photoByRef: [PhotoRef: Photo] = [:]
+    /// Index in `photos`, to put collections in the same order.
+    @ObservationIgnored private var photoPosition: [PhotoRef: Int] = [:]
+    /// Position of each photo in the last folder scan (folders in turn, Finder path order).
+    @ObservationIgnored private var scanOrder: [URL: Int] = [:]
+    var sortOrder = SortOrder(rawValue: UserDefaults.standard.string(forKey: "sortOrder") ?? "") ?? .folder {
+        didSet { UserDefaults.standard.set(sortOrder.rawValue, forKey: "sortOrder"); resort() }
+    }
+    var sortDescending = UserDefaults.standard.bool(forKey: "sortDescending") {
+        didSet { UserDefaults.standard.set(sortDescending, forKey: "sortDescending"); resort() }
+    }
     /// Lookup for `current`, which every slider reads on every tick (a scan was O(library)).
     /// Observed, so views reading `current` still update when the library changes.
     private var photoByURL: [URL: Photo] = [:]
@@ -91,6 +116,14 @@ final class LibraryStore {
     // Editor state
     var isCropping = false { didSet { if isCropping { activeMaskID = nil } } }
     var showBefore = false
+    /// Paints blown highlights red and crushed shadows blue on the preview (J).
+    var showClipping = false
+    /// The next click on the photo sets white balance from that spot (W).
+    var pickingWhite = false
+    /// Move to the next photo after rating or flagging one (⇧ with the key does it once).
+    var autoAdvance = UserDefaults.standard.bool(forKey: "autoAdvance") {
+        didSet { UserDefaults.standard.set(autoAdvance, forKey: "autoAdvance") }
+    }
     var thumbnailSize: Double = 200
     var panelTab: PanelTab = .quick { didSet { if panelTab == .quick { activeMaskID = nil } } }
     /// Mask currently being edited; nil = whole photo.
@@ -148,8 +181,8 @@ final class LibraryStore {
             saveCatalog()
         }
         if watch {
-            watcher = FolderWatcher { [weak self] _ in
-                MainActor.assumeIsolated { self?.scheduleReload() }
+            watcher = FolderWatcher { [weak self] paths in
+                MainActor.assumeIsolated { self?.scheduleReload(changed: paths) }
             }
         }
         reload()
@@ -167,12 +200,61 @@ final class LibraryStore {
         case .all:
             photos
         case .lastImport:
-            (catalog.lastImport?.refs ?? []).compactMap { photoByRef[$0] }
+            inSortOrder((catalog.lastImport?.refs ?? []).compactMap { photoByRef[$0] })
         case .folder(let id):
             photos.filter { $0.ref.folder == id }
         case .collection(let id):
-            (catalog.collections.first { $0.id == id }?.members ?? []).compactMap { photoByRef[$0] }
+            inSortOrder((catalog.collections.first { $0.id == id }?.members ?? []).compactMap { photoByRef[$0] })
         }
+    }
+
+    /// Collections keep the order photos were added in, unless a sort is chosen.
+    private func inSortOrder(_ list: [Photo]) -> [Photo] {
+        guard sortOrder != .folder || sortDescending else { return list }
+        return list.sorted { (photoPosition[$0.ref] ?? 0) < (photoPosition[$1.ref] ?? 0) }
+    }
+
+    /// `list` in the chosen order. Done once per reload or sort change rather than on every
+    /// access, so a rating change doesn't make photos jump while culling.
+    func sorted(_ list: [Photo]) -> [Photo] {
+        // Folder order is the scan order: imported folders in turn, each in Finder's path order.
+        // That's what a scan produces already, so keep it rather than re-comparing strings.
+        let scanRank = scanOrder
+        let folderRank = Dictionary(catalog.folders.enumerated().map { ($1.id, $0) }, uniquingKeysWith: { a, _ in a })
+        let pathKeys = Dictionary(list.map { ($0.url, $0.ref.path) }, uniquingKeysWith: { a, _ in a })
+        func pathLess(_ a: Photo, _ b: Photo) -> Bool {
+            let fa = folderRank[a.ref.folder] ?? 0, fb = folderRank[b.ref.folder] ?? 0
+            if fa != fb { return fa < fb }
+            if sortOrder == .folder, let ra = scanRank[a.url], let rb = scanRank[b.url] { return ra < rb }
+            return pathKeys[a.url]!.localizedStandardCompare(pathKeys[b.url]!) == .orderedAscending
+        }
+        var out: [Photo]
+        switch sortOrder {
+        case .folder:
+            out = list.sorted(by: pathLess)
+        case .fileName:
+            let keys = Dictionary(list.map { ($0.url, $0.name.lowercased()) }, uniquingKeysWith: { a, _ in a })
+            out = list.sorted { a, b in
+                let ka = keys[a.url]!, kb = keys[b.url]!
+                if ka != kb { return ka.compare(kb, options: [.numeric]) == .orderedAscending }
+                return pathLess(a, b)
+            }
+        case .captureTime:
+            let dates = catalog.captureDates
+            out = list.sorted { a, b in
+                let da = dates[a.ref.key] ?? .distantFuture, db = dates[b.ref.key] ?? .distantFuture
+                return da != db ? da < db : pathLess(a, b)
+            }
+        case .rating:
+            // Best first reads naturally; descending flips to worst first.
+            out = list.sorted { a, b in a.rating != b.rating ? a.rating > b.rating : pathLess(a, b) }
+        }
+        return sortDescending ? out.reversed() : out
+    }
+
+    private func resort() {
+        let next = sorted(photos)
+        if next.map(\.url) != photos.map(\.url) { photos = next }
     }
 
     var visiblePhotos: [Photo] {
@@ -239,35 +321,68 @@ final class LibraryStore {
         showImport = true
     }
 
-    private func scheduleReload() {
+    @ObservationIgnored private var changedPaths: [String] = []
+
+    private func scheduleReload(changed paths: [String] = []) {
+        changedPaths += paths
         guard !reloadPending else { return }
         reloadPending = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
             guard let self else { return }
             self.reloadPending = false
-            self.reload()
+            let changed = self.changedPaths
+            self.changedPaths = []
+            self.reload(only: self.foldersContaining(changed))
         }
     }
 
-    /// Rescans every imported folder. Keeps existing Photo objects (and their unsaved state) for files still present.
-    func reload(completion: (() -> Void)? = nil) {
+    /// The imported folders the changed paths are in; nil (rescan everything) when a path is outside
+    /// all of them or folders overlap (then which folder owns a file depends on the others).
+    func foldersContaining(_ paths: [String]) -> Set<UUID>? {
+        guard !paths.isEmpty else { return nil }
+        let folders = catalog.folders
+        for a in folders {
+            for b in folders where a.id != b.id && (b.path + "/").hasPrefix(a.path + "/") { return nil }
+        }
+        var ids = Set<UUID>()
+        for raw in paths {
+            let path = raw.hasSuffix("/") ? String(raw.dropLast()) : raw
+            guard let f = folders.first(where: { path == $0.path || path.hasPrefix($0.path + "/") }) else { return nil }
+            ids.insert(f.id)
+        }
+        return ids
+    }
+
+    /// Rescans the imported folders (only `only`, when given). Keeps existing Photo objects
+    /// (and their unsaved state) for files still present.
+    func reload(only: Set<UUID>? = nil, completion: (() -> Void)? = nil) {
         let catalog = self.catalog
         let existing = Dictionary(photos.map { ($0.url, $0) }, uniquingKeysWith: { a, _ in a })
         let known = Set(existing.keys)
+        let previousOrder = scanOrder
         if photos.isEmpty { isLoading = true }
-        watcher?.watch(catalog.folders.filter(\.exists).map(\.path))
+        if only == nil { watcher?.watch(catalog.folders.filter(\.exists).map(\.path)) }
         Task.detached(priority: .userInitiated) {
-            let found = LibraryStore.scanCatalog(catalog, known: known)
+            let found = LibraryStore.scanCatalog(catalog, known: known, only: only)
             await MainActor.run {
-                var list: [Photo] = []
+                var scanned: [UUID: [Photo]] = [:]
                 for item in found {
-                    if let p = existing[item.url], p.ref == item.ref {
-                        list.append(p)
+                    let p = existing[item.url].flatMap { $0.ref == item.ref ? $0 : nil }
+                        ?? Photo(url: item.url, ref: item.ref, sidecar: item.sidecar ?? Sidecar())
+                    scanned[item.ref.folder, default: []].append(p)
+                }
+                // Folders in catalog order; untouched ones keep the photos (and order) they had.
+                var list: [Photo] = []
+                for folder in catalog.folders {
+                    if only == nil || only!.contains(folder.id) {
+                        list += scanned[folder.id] ?? []
                     } else {
-                        list.append(Photo(url: item.url, ref: item.ref, sidecar: item.sidecar ?? Sidecar()))
+                        list += self.photos.filter { $0.ref.folder == folder.id }
+                            .sorted { (previousOrder[$0.url] ?? .max) < (previousOrder[$1.url] ?? .max) }
                     }
                 }
-                self.photos = list
+                self.scanOrder = Dictionary(list.enumerated().map { ($1.url, $0) }, uniquingKeysWith: { a, _ in a })
+                self.photos = self.sorted(list)
                 self.isLoading = false
                 self.keepCurrentVisible()
                 self.backfillFingerprints()
@@ -282,42 +397,58 @@ final class LibraryStore {
         let sidecar: Sidecar?
     }
 
-    nonisolated static func scanCatalog(_ catalog: Catalog, known: Set<URL>) -> [ScannedPhoto] {
+    nonisolated static func scanCatalog(_ catalog: Catalog, known: Set<URL>, only: Set<UUID>? = nil) -> [ScannedPhoto] {
         var seen = Set<String>()
-        var out: [ScannedPhoto] = []
-        for folder in catalog.folders where folder.exists {
+        var entries: [(url: URL, ref: PhotoRef)] = []
+        for folder in catalog.folders where folder.exists && (only?.contains(folder.id) ?? true) {
             for rel in LibraryFiles.enumerate(folder.url, recursive: folder.includeSubfolders) where !folder.excluded.contains(rel) {
                 let url = URL(fileURLWithPath: folder.path).appendingPathComponent(rel)
                 guard seen.insert(url.path).inserted else { continue }
-                var sidecar: Sidecar?
-                if !known.contains(url) {
-                    sidecar = SidecarFiles.read(for: url)
-                }
-                out.append(ScannedPhoto(url: url, ref: PhotoRef(folder: folder.id, path: rel), sidecar: sidecar))
+                entries.append((url, PhotoRef(folder: folder.id, path: rel)))
             }
         }
-        return out
+        // Sidecars for photos not loaded yet, read in parallel (JSON decoding dominates a first scan).
+        let need = entries.indices.filter { !known.contains(entries[$0].url) }
+        let box = SidecarBox(count: entries.count)
+        DispatchQueue.concurrentPerform(iterations: need.count) { k in
+            let i = need[k]
+            box.set(i, SidecarFiles.read(for: entries[i].url))
+        }
+        return entries.indices.map { ScannedPhoto(url: entries[$0].url, ref: entries[$0].ref, sidecar: box.get($0)) }
+    }
+
+    private final class SidecarBox: @unchecked Sendable {
+        private var items: [Sidecar?]
+        private let lock = NSLock()
+        init(count: Int) { items = Array(repeating: nil, count: count) }
+        func set(_ i: Int, _ s: Sidecar?) { lock.lock(); items[i] = s; lock.unlock() }
+        func get(_ i: Int) -> Sidecar? { lock.lock(); defer { lock.unlock() }; return items[i] }
     }
 
     nonisolated static func sidecarURL(for photo: URL) -> URL { SidecarFiles.mainURL(for: photo) }
 
-    /// Computes fingerprints for library photos that don't have one yet (in the background).
+    /// Computes fingerprints (duplicate detection) and capture dates (sorting) for library photos
+    /// that don't have them yet, in the background.
     @ObservationIgnored private var fingerprinting = false
     private func backfillFingerprints() {
         guard !fingerprinting else { return }
-        let missing = photos.filter { catalog.fingerprints[$0.ref.key] == nil }.map { ($0.ref, $0.url) }
-        guard !missing.isEmpty else { return }
+        let needPrint = photos.filter { catalog.fingerprints[$0.ref.key] == nil }.map { ($0.ref.key, $0.url) }
+        let needDate = photos.filter { catalog.captureDates[$0.ref.key] == nil }.map { ($0.ref.key, $0.url) }
+        guard !needPrint.isEmpty || !needDate.isEmpty else { return }
         fingerprinting = true
         Task.detached(priority: .utility) {
-            var found: [String: String] = [:]
-            for (ref, url) in missing {
-                if let fp = LibraryFiles.fingerprint(url) { found[ref.key] = fp }
+            var prints: [String: String] = [:], dates: [String: Date] = [:]
+            for (key, url) in needPrint {
+                if let fp = LibraryFiles.fingerprint(url) { prints[key] = fp }
             }
-            let computed = found
+            for (key, url) in needDate { dates[key] = LibraryFiles.captureDate(url) }
+            let (p, d) = (prints, dates)
             await MainActor.run {
-                self.catalog.fingerprints.merge(computed) { _, new in new }
+                self.catalog.fingerprints.merge(p) { _, new in new }
+                self.catalog.captureDates.merge(d) { _, new in new }
                 self.saveCatalog()
                 self.fingerprinting = false
+                if self.sortOrder == .captureTime && !d.isEmpty { self.resort() }
             }
         }
     }
@@ -509,9 +640,13 @@ final class LibraryStore {
         mode = .edit
     }
 
+    /// Which way the last step went (+1 / -1), so the editor preloads ahead of you.
+    @ObservationIgnored private(set) var browseDirection = 1
+
     func step(_ delta: Int) {
         let list = visiblePhotos
         guard !list.isEmpty else { return }
+        if delta != 0 { browseDirection = delta > 0 ? 1 : -1 }
         let index = list.firstIndex { $0.url == currentID } ?? 0
         let next = list[min(max(index + delta, 0), list.count - 1)]
         select(next)
@@ -690,6 +825,36 @@ final class LibraryStore {
     }
 
     /// Sets a photo's edits as one labelled step (paste, presets, snapshots, reset).
+    // MARK: - Auto adjustments
+
+    /// White balance that makes the clicked spot neutral gray (`p` normalized in the cropped photo).
+    func pickWhiteBalance(at p: NormPoint, using source: ImageSource) {
+        pickingWhite = false
+        guard let photo = current else { return }
+        let half = 0.008
+        let region = CGRect(x: p.x - half, y: p.y - half, width: half * 2, height: half * 2)
+        let wb = AutoAdjust.whiteBalance(source: source, adjustments: photo.adjustments, region: region)
+        var a = photo.adjustments
+        a.temperature = wb.temperature; a.tint = wb.tint
+        applyStep(photo, a, label: "White balance (picked)")
+    }
+
+    func autoWhiteBalance(using source: ImageSource) {
+        guard let photo = current else { return }
+        let wb = AutoAdjust.whiteBalance(source: source, adjustments: photo.adjustments, region: nil)
+        var a = photo.adjustments
+        a.temperature = wb.temperature; a.tint = wb.tint
+        applyStep(photo, a, label: "Auto white balance")
+    }
+
+    func autoTone(using source: ImageSource) {
+        guard let photo = current else { return }
+        let t = AutoAdjust.tone(source: source, adjustments: photo.adjustments)
+        var a = photo.adjustments
+        a.exposure = t.exposure; a.contrast = t.contrast; a.highlights = t.highlights; a.shadows = t.shadows
+        applyStep(photo, a, label: "Auto tone")
+    }
+
     private func applyStep(_ photo: Photo, _ adjustments: Adjustments, label: String) {
         commitPending(photo)
         photo.adjustments = adjustments
@@ -905,6 +1070,21 @@ final class LibraryStore {
     func pasteSettings() {
         guard let clipboard else { return }
         for p in targets { applyStep(p, clipboard.withCrop(from: p.adjustments), label: "Paste settings") }
+    }
+
+    /// Groups ticked in the last selective paste.
+    var pasteGroups: Set<SettingsGroup> = {
+        let saved = (UserDefaults.standard.array(forKey: "pasteGroups") as? [String])?.compactMap(SettingsGroup.init(rawValue:))
+        return saved.map(Set.init) ?? SettingsGroup.standard
+    }() {
+        didSet { UserDefaults.standard.set(pasteGroups.map(\.rawValue), forKey: "pasteGroups") }
+    }
+    var showSelectivePaste = false
+
+    func pasteSettings(_ groups: Set<SettingsGroup>) {
+        guard let clipboard, !groups.isEmpty else { return }
+        let label = groups == Set(SettingsGroup.allCases) ? "Paste all settings" : "Paste settings (\(groups.count) of \(SettingsGroup.allCases.count))"
+        for p in targets { applyStep(p, p.adjustments.copying(groups, from: clipboard), label: label) }
     }
 
     func apply(_ preset: Preset) {

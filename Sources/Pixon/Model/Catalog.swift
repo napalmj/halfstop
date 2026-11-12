@@ -57,6 +57,8 @@ struct Catalog: Codable {
     var collections: [PhotoCollection] = []
     /// PhotoRef.key → content fingerprint, for duplicate detection.
     var fingerprints: [String: String] = [:]
+    /// PhotoRef.key → when the photo was taken (EXIF, else file date), for sorting.
+    var captureDates: [String: Date] = [:]
     var lastImport: ImportRecord?
     var targetCollection: UUID?
 
@@ -68,6 +70,7 @@ struct Catalog: Codable {
         folders = (try? c.decodeIfPresent([CatalogFolder].self, forKey: .folders)) ?? []
         collections = (try? c.decodeIfPresent([PhotoCollection].self, forKey: .collections)) ?? []
         fingerprints = (try? c.decodeIfPresent([String: String].self, forKey: .fingerprints)) ?? [:]
+        captureDates = (try? c.decodeIfPresent([String: Date].self, forKey: .captureDates)) ?? [:]
         lastImport = try? c.decodeIfPresent(ImportRecord.self, forKey: .lastImport)
         targetCollection = try? c.decodeIfPresent(UUID.self, forKey: .targetCollection)
     }
@@ -103,7 +106,7 @@ struct Catalog: Codable {
     /// Drops every reference to photos that are gone (moved to the Trash).
     mutating func forget(_ refs: Set<PhotoRef>) {
         for i in collections.indices { collections[i].members.removeAll { refs.contains($0) } }
-        for r in refs { fingerprints[r.key] = nil }
+        for r in refs { fingerprints[r.key] = nil; captureDates[r.key] = nil }
         if var record = lastImport {
             record.refs.removeAll { refs.contains($0) }
             lastImport = record

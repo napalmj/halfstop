@@ -2,7 +2,7 @@
 
 A fast, native photo editor and library for macOS, built with SwiftUI, Core Image and Metal.
 
-Pixon is a non-destructive editor in the spirit of Lightroom, aimed at responsive sliders, an
+Pixon is a non-destructive editor aimed at responsive sliders, an
 uncluttered interface and quick imports. Your photos are never modified or copied: Pixon works on
 them where they are and stores edits as small sidecar files next to them. The only time Pixon
 touches a photo file's name is the optional rename on import, which is off by default and revertible.
@@ -78,15 +78,20 @@ Press **⌘?** (Help ▸ Pixon Help) for a searchable list of every shortcut. Mo
 | ← → (↑ ↓ in grid) | Previous / next photo |
 | 0–5 | Rate |
 | P / X / U | Pick / reject / unflag |
+| ⇧ + rating or flag key | Rate or flag, then go to the next photo (Photo ▸ Auto Advance makes it the default) |
 | G / E | Library / edit |
 | C or R | Crop |
 | \\ | Before / after |
 | D | Toggle Quick / Detailed |
+| J | Show clipping (red = blown, blue = crushed) |
+| W | Pick white balance from a neutral spot |
+| ↑ ↓ over a slider | Nudge it (⇧ = bigger steps); click its value to type one |
 | O | Mask overlay |
 | [ ] | Brush size (⌥ while painting erases) |
 | Esc | Leave crop / mask / back to library |
 | ⌘Z / ⇧⌘Z | Undo / redo |
 | ⇧⌘C / ⇧⌘V | Copy / paste settings |
+| ⌥⇧⌘V | Paste only selected settings |
 | ⇧⌘E | Export |
 | ⌘I | Import photos |
 | B | Add selection to the target collection |
@@ -103,6 +108,7 @@ Press **⌘?** (Help ▸ Pixon Help) for a searchable list of every shortcut. Mo
 | Edits, ratings, flags, history | `<photo folder>/.pixon/<filename>.json` plus `<filename>.history.json`, small JSON sidecars per photo |
 | Library index (folders, collections) | `~/Library/Application Support/Pixon/catalog.json` |
 | Presets | `~/Library/Application Support/Pixon/presets.json` |
+| Thumbnail cache | `~/Library/Caches/Pixon/Thumbnails` (safe to delete; kept under 1 GB) |
 
 To back up your work, back up your photo folders (hidden `.pixon` folders included) and the
 `Pixon` folder in Application Support. Nothing is uploaded anywhere; Pixon makes no network requests.

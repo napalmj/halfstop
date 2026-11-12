@@ -18,6 +18,9 @@ enum SelfTest {
         }
         if let i = args.firstIndex(of: "--selftest"), i + 1 < args.count {
             let dir = URL(fileURLWithPath: args[i + 1])
+            // Keep test thumbnails out of the real cache.
+            ThumbnailDiskCache.directory = dir.appendingPathComponent("thumbcache", isDirectory: true)
+            try? FileManager.default.removeItem(at: ThumbnailDiskCache.directory)
             let pipelineOK = run(dir: dir)
             var libraryOK = false
             var done = false
@@ -383,6 +386,98 @@ enum SelfTest {
                 check("histogram from the drawn frame is right", false, "no readback")
             }
         }
+
+        // Clipping overlay: pure white turns red, pure black blue, mid gray stays.
+        let clipped = ClippingOverlay.apply(base)
+        let cw = s(clipped, (0.95, 0.95)), ck = s(clipped, (0.05, 0.95)), cg = s(clipped, gray), og = s(base, gray)
+        check("clipping marks blown highlights red", cw.r > 0.9 && cw.g < 0.3, "\(cw)")
+        check("clipping marks crushed shadows blue", ck.b > 0.8 && ck.r < 0.3, "\(ck)")
+        check("clipping leaves midtones alone", abs(cg.luma - og.luma) < 0.01, "\(og) -> \(cg)")
+
+        // White balance: a warm-tinted copy; picking a gray ramp step must make it neutral again.
+        func variant(_ name: String, _ f: (CIImage) -> CIImage) -> ImageSource? {
+            let out = f(CIImage(cgImage: img))
+            guard let cg = Render.background.createCGImage(out, from: out.extent, format: .RGBA8, colorSpace: Render.sRGB) else { return nil }
+            let u = dir.appendingPathComponent(name)
+            write(cg, to: u)
+            return ImageSource(url: u, maxPixelSize: nil)
+        }
+        if let warm = variant("warm.jpg", { $0.applyingFilter("CIColorMatrix", parameters: [
+            "inputRVector": CIVector(x: 1.12, y: 0, z: 0, w: 0), "inputGVector": CIVector(x: 0, y: 1.0, z: 0, w: 0),
+            "inputBVector": CIVector(x: 0, y: 0, z: 0.82, w: 0)]) }) {
+            let pick = CGRect(x: 0.53, y: 0.93, width: 0.04, height: 0.04)   // a mid-gray ramp step
+            let before = AutoAdjust.average(warm.developed(Adjustments()), region: pick)
+            let wb = AutoAdjust.whiteBalance(source: warm, adjustments: Adjustments(), region: pick)
+            var fixed = Adjustments(); fixed.temperature = wb.temperature; fixed.tint = wb.tint
+            let after = AutoAdjust.average(warm.developed(fixed), region: pick)
+            func cast(_ c: (Double, Double, Double)) -> Double { abs(log(c.2 / c.0)) + abs(log(c.1 / (c.0 * c.2).squareRoot())) }
+            check("white balance pick neutralizes a warm cast", wb.temperature < 0 && cast(after) < 0.03 && cast(after) < cast(before) / 4,
+                  String(format: "temp %.0f tint %.0f, cast %.3f -> %.3f", wb.temperature, wb.tint, cast(before), cast(after)))
+        }
+        if let dim = variant("dim.jpg", { $0.applyingFilter("CIExposureAdjust", parameters: [kCIInputEVKey: -1.8]) }) {
+            let t = AutoAdjust.tone(source: dim, adjustments: Adjustments())
+            var a = Adjustments(); a.exposure = t.exposure
+            let lum = AutoAdjust.luminances(dim.developed(a, renderScale: 0.25))
+            let m = lum[lum.count / 2]
+            check("auto tone lifts a dark photo", t.exposure > 0.3 && abs(m - 0.42) < 0.08, String(format: "ev %.2f, median %.2f", t.exposure, m))
+        }
+
+        // Export keeps metadata (optionally without location), and parallel exports never share a name.
+        let exportDir = dir.appendingPathComponent("export-out")
+        try? FileManager.default.removeItem(at: exportDir)
+        try? FileManager.default.createDirectory(at: exportDir, withIntermediateDirectories: true)
+        let tagged = dir.appendingPathComponent("tagged.jpg")
+        if let d = CGImageDestinationCreateWithURL(tagged as CFURL, UTType.jpeg.identifier as CFString, 1, nil) {
+            let props: [CFString: Any] = [
+                kCGImagePropertyExifDictionary: [kCGImagePropertyExifDateTimeOriginal: "2024:06:01 18:30:00", kCGImagePropertyExifLensModel: "Test 35mm"],
+                kCGImagePropertyGPSDictionary: [kCGImagePropertyGPSLatitude: 48.85, kCGImagePropertyGPSLatitudeRef: "N",
+                                                kCGImagePropertyGPSLongitude: 2.35, kCGImagePropertyGPSLongitudeRef: "E"],
+            ]
+            CGImageDestinationAddImage(d, img, props as CFDictionary)
+            CGImageDestinationFinalize(d)
+        }
+        func props(_ u: URL) -> [CFString: Any] {
+            CGImageSourceCreateWithURL(u as CFURL, nil).flatMap { CGImageSourceCopyPropertiesAtIndex($0, 0, nil) as? [CFString: Any] } ?? [:]
+        }
+        var es = ExportSettings(); es.longEdge = 800
+        if let out = try? Exporter.export((tagged, Adjustments()), settings: es, to: exportDir) {
+            let p = props(out), exif = p[kCGImagePropertyExifDictionary] as? [CFString: Any]
+            check("export keeps capture date and lens", exif?[kCGImagePropertyExifDateTimeOriginal] as? String == "2024:06:01 18:30:00"
+                  && exif?[kCGImagePropertyExifLensModel] as? String == "Test 35mm", "\(exif ?? [:])")
+            check("export keeps location by default", p[kCGImagePropertyGPSDictionary] != nil, "")
+            check("export orientation is upright", (p[kCGImagePropertyOrientation] as? Int ?? 1) == 1, "")
+        } else { check("export with metadata", false, "export failed") }
+        es.stripLocation = true
+        if let out = try? Exporter.export((tagged, Adjustments()), settings: es, to: exportDir) {
+            let p = props(out)
+            check("export can remove location", p[kCGImagePropertyGPSDictionary] == nil
+                  && (p[kCGImagePropertyExifDictionary] as? [CFString: Any])?[kCGImagePropertyExifDateTimeOriginal] != nil, "")
+        }
+        let parallelDir = exportDir.appendingPathComponent("parallel")
+        try? FileManager.default.createDirectory(at: parallelDir, withIntermediateDirectories: true)
+        var parallelOut: [URL] = []
+        var parallelDone = false
+        Task {
+            let r = await Exporter.exportAll(Array(repeating: (tagged, Adjustments()), count: 4), settings: es, to: parallelDir, concurrency: 2) { _ in }
+            parallelOut = r.compactMap { try? $0.result.get() }
+            parallelDone = true
+        }
+        while !parallelDone { RunLoop.main.run(until: Date().addingTimeInterval(0.05)) }
+        check("parallel exports get distinct names", Set(parallelOut.map(\.lastPathComponent)).count == 4
+              && parallelOut.allSatisfy { ((try? FileManager.default.attributesOfItem(atPath: $0.path)[.size] as? Int) ?? 0) > 1000 },
+              parallelOut.map(\.lastPathComponent).joined(separator: ", "))
+
+        // Selective paste: all groups together copy everything; one group copies only itself.
+        var full = Adjustments()
+        full.exposure = 1; full.contrast = 10; full.highlights = -20; full.shadows = 20; full.whites = 5; full.blacks = -5
+        full.temperature = 12; full.tint = -3; full.vibrance = 15; full.saturation = -10
+        full.grading.shadows.saturation = 30; full.curve = [CurvePoint(x: 0, y: 0.1), CurvePoint(x: 1, y: 1)]
+        full.hsl[2].hue = 20; full.sharpening = 40; full.noiseReduction = 20; full.vignette = -30
+        full.masks = [Mask(name: "R", kind: .radial)]; full.crop.angle = 3
+        check("paste with every group copies everything", Adjustments().copying(Set(SettingsGroup.allCases), from: full) == full, "")
+        let onlyLight = Adjustments().copying([.light], from: full)
+        check("paste one group copies only it", onlyLight.exposure == 1 && onlyLight.temperature == 0 && onlyLight.masks.isEmpty
+              && onlyLight.crop == CropSettings(), "")
 
         // LUT speed (rebuilt on every curve/HSL/wheel drag).
         let t0 = Date()
@@ -821,7 +916,21 @@ enum LibraryTest {
         } else {
             check("brush mask renders", false)
         }
+        // Sorting (restores the user's choice afterwards: it's remembered in UserDefaults).
+        let (savedSort, savedDesc) = (store.sortOrder, store.sortDescending)
+        store.source = .all; store.filter = .all; store.minRating = 0
+        store.sortOrder = .fileName; store.sortDescending = false
+        let names = store.visiblePhotos.map(\.name)
+        check("sort by file name", names == names.sorted { $0.lowercased().compare($1.lowercased(), options: .numeric) == .orderedAscending }, "\(names)")
+        store.sortDescending = true
+        check("reverse order", store.visiblePhotos.map(\.name) == names.reversed(), "")
+        if let first = store.visiblePhotos.last { store.select(first); store.setRating(5) }
+        store.sortOrder = .rating; store.sortDescending = false
+        check("sort by rating puts the best first", store.visiblePhotos.first?.rating == 5, "")
+        store.sortOrder = savedSort; store.sortDescending = savedDesc
+
         await sidecarChecks(dir: dir.appendingPathComponent("sidecars"), check: check)
+        await scaleChecks(dir: dir.appendingPathComponent("scale"), check: check)
         print(ok ? "LIBRARY PASSED" : "LIBRARY FAILED")
         return ok
     }
@@ -901,5 +1010,54 @@ extension LibraryTest {
         SidecarFiles.write(Sidecar(), for: renamed, history: true)
         check("empty sidecar removes both files", !fm.fileExists(atPath: SidecarFiles.mainURL(for: renamed).path)
               && !fm.fileExists(atPath: SidecarFiles.historyURL(for: renamed).path), "")
+    }
+}
+
+// MARK: - Library scale
+
+extension LibraryTest {
+    /// Thumbnails survive a restart on disk; a change in one folder rescans only that folder.
+    @MainActor
+    static func scaleChecks(dir: URL, check: (String, Bool, String) -> Void) async {
+        let fm = FileManager.default
+        try? fm.removeItem(at: dir)
+        let x = dir.appendingPathComponent("X"), y = dir.appendingPathComponent("Y")
+        try? fm.createDirectory(at: x, withIntermediateDirectories: true)
+        try? fm.createDirectory(at: y, withIntermediateDirectories: true)
+        for (i, folder) in [x, x, y].enumerated() {
+            if let img = SelfTest.scene(width: 900, height: 600, hue: Double(i) / 4, variant: i) {
+                SelfTest.write(img, to: folder.appendingPathComponent("P\(i).jpg"))
+            }
+        }
+
+        // Disk thumbnails: a fresh service (empty memory caches) reads what an earlier one wrote.
+        let photo = x.appendingPathComponent("P0.jpg")
+        var edit = Adjustments(); edit.exposure = 0.5
+        let first = await ThumbnailService().image(url: photo, adjustments: edit)
+        ThumbnailDiskCache.shared.flush()
+        let files = (fm.enumerator(at: ThumbnailDiskCache.directory, includingPropertiesForKeys: nil)?.allObjects as? [URL] ?? [])
+            .filter { $0.pathExtension == "jpg" }
+        check("thumbnails are written to disk", files.count >= 2, "\(files.count) files")
+        let key = ThumbnailDiskCache.shared.key(url: photo, adjustments: edit)
+        let fromDisk = key.flatMap { ThumbnailDiskCache.shared.load($0) }
+        let second = await ThumbnailService().image(url: photo, adjustments: edit)
+        check("thumbnails load back from disk", fromDisk != nil && second?.width == first?.width, "\(first?.width ?? 0) / \(second?.width ?? 0)")
+        try? fm.setAttributes([.modificationDate: Date().addingTimeInterval(60)], ofItemAtPath: photo.path)
+        check("a changed file gets a new thumbnail", ThumbnailDiskCache.shared.key(url: photo, adjustments: edit) != key, "")
+
+        // Per-folder rescans.
+        let store = LibraryStore(catalogURL: dir.appendingPathComponent("catalog.json"), watch: false)
+        store.catalog.folders = [CatalogFolder(path: x.path), CatalogFolder(path: y.path)]
+        await withCheckedContinuation { c in store.reload { c.resume() } }
+        let xID = store.catalog.folders[0].id, yID = store.catalog.folders[1].id
+        let yPhoto = store.photos.first { $0.ref.folder == yID }
+        check("folder events map to their folder", store.foldersContaining([x.appendingPathComponent("P9.jpg").path]) == [xID]
+              && store.foldersContaining(["/somewhere/else.jpg"]) == nil, "")
+        if let img = SelfTest.scene(width: 300, height: 200, hue: 0.7, variant: 3) { SelfTest.write(img, to: x.appendingPathComponent("P9.jpg")) }
+        await withCheckedContinuation { c in store.reload(only: [xID]) { c.resume() } }
+        check("rescanning one folder picks up its new photo", store.photos.count == 4
+              && store.photos.contains { $0.url.lastPathComponent == "P9.jpg" }, "\(store.photos.count)")
+        check("other folders are left as they were", store.photos.first { $0.ref.folder == yID } === yPhoto
+              && store.photos.last?.ref.folder == yID, "")
     }
 }

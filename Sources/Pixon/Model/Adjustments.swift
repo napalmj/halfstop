@@ -323,7 +323,7 @@ struct Mask: Codable, Hashable, Identifiable {
     }
 }
 
-/// Every non-destructive edit applied to a photo. Ranges are Lightroom-like.
+/// Every non-destructive edit applied to a photo. Most sliders run -100...100 around a neutral 0.
 struct Adjustments: Codable, Hashable {
     // White balance, -100...100 (relative to as-shot)
     var temperature: Double = 0
@@ -365,6 +365,29 @@ struct Adjustments: Codable, Hashable {
         var copy = self
         copy.crop = other.crop
         return copy
+    }
+
+    /// These adjustments with the chosen groups taken from `source` (selective paste).
+    func copying(_ groups: Set<SettingsGroup>, from source: Adjustments) -> Adjustments {
+        var a = self
+        for g in groups {
+            switch g {
+            case .light:
+                a.exposure = source.exposure; a.contrast = source.contrast; a.highlights = source.highlights
+                a.shadows = source.shadows; a.whites = source.whites; a.blacks = source.blacks
+            case .color:
+                a.temperature = source.temperature; a.tint = source.tint
+                a.vibrance = source.vibrance; a.saturation = source.saturation
+            case .grading: a.grading = source.grading
+            case .curve: a.curve = source.curve
+            case .hsl: a.hsl = source.hsl
+            case .detail: a.sharpening = source.sharpening; a.noiseReduction = source.noiseReduction
+            case .effects: a.vignette = source.vignette
+            case .masks: a.masks = source.masks
+            case .crop: a.crop = source.crop
+            }
+        }
+        return a
     }
 
     /// Global look only — what presets carry over (keeps the target's crop and masks).
@@ -440,4 +463,25 @@ struct ColorLUTKey: Hashable {
         contrast == 0 && highlights == 0 && whites == 0 && blacks == 0
             && curve == Adjustments.identityCurve && hsl.allSatisfy(\.isNeutral) && grading.isNeutral
     }
+}
+
+/// Groups of settings that can be pasted on their own. Together they cover every field of `Adjustments`.
+enum SettingsGroup: String, CaseIterable, Identifiable, Codable {
+    case light, color, grading, curve, hsl, detail, effects, masks, crop
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .light: "Light (exposure, contrast, highlights, shadows, whites, blacks)"
+        case .color: "Color (white balance, vibrance, saturation)"
+        case .grading: "Color grading"
+        case .curve: "Tone curve"
+        case .hsl: "HSL"
+        case .detail: "Detail (sharpening, noise reduction)"
+        case .effects: "Effects (vignette)"
+        case .masks: "Masks"
+        case .crop: "Crop & straighten"
+        }
+    }
+    /// What a plain paste carries: everything but the crop.
+    static let standard = Set(allCases).subtracting([.crop])
 }

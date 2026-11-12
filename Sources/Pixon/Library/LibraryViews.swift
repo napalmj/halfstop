@@ -236,6 +236,20 @@ struct TopBar: View {
                         .frame(width: 90)
                         .help("Thumbnail size")
                 }
+                if store.mode == .library {
+                    Menu {
+                        Picker("Sort by", selection: $store.sortOrder) {
+                            ForEach(SortOrder.allCases) { Text($0.label).tag($0) }
+                        }
+                        .pickerStyle(.inline)
+                        Toggle("Reverse order", isOn: $store.sortDescending)
+                    } label: {
+                        Label(store.sortOrder.label, systemImage: "arrow.up.arrow.down")
+                    }
+                    .menuStyle(.borderlessButton)
+                    .fixedSize()
+                    .help("Sort photos")
+                }
                 Menu {
                     Picker("Show", selection: $store.filter) {
                         ForEach(LibraryFilter.allCases) { Text($0.label).tag($0) }
@@ -423,6 +437,44 @@ struct SavePresetSheet: View {
     }
 }
 
+// MARK: - Selective paste
+
+struct SelectivePasteSheet: View {
+    @Environment(LibraryStore.self) private var store
+    @Environment(\.dismiss) private var dismiss
+    @State private var groups: Set<SettingsGroup> = []
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(store.targets.count > 1 ? "Paste onto \(store.targets.count) photos" : "Paste settings").font(.headline)
+            VStack(alignment: .leading, spacing: 6) {
+                ForEach(SettingsGroup.allCases) { g in
+                    Toggle(g.label, isOn: Binding(get: { groups.contains(g) }, set: { on in
+                        if on { groups.insert(g) } else { groups.remove(g) }
+                    }))
+                }
+            }
+            .font(.system(size: 12))
+            HStack {
+                Button("All") { groups = Set(SettingsGroup.allCases) }
+                Button("None") { groups = [] }
+                Spacer()
+                Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
+                Button("Paste") {
+                    store.pasteGroups = groups
+                    store.pasteSettings(groups)
+                    dismiss()
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(groups.isEmpty || store.clipboard == nil)
+            }
+        }
+        .padding(20)
+        .frame(width: 380)
+        .onAppear { groups = store.pasteGroups }
+    }
+}
+
 // MARK: - Export
 
 struct ExportSheet: View {
@@ -433,6 +485,7 @@ struct ExportSheet: View {
     @State private var done: [URL] = []
     @State private var errors: [String] = []
     @State private var targets: [(url: URL, adjustments: Adjustments)] = []
+    @State private var job: Task<Void, Never>?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -455,6 +508,10 @@ struct ExportSheet: View {
                     Text("Long edge 1080 px").tag(1080)
                 }
                 Toggle("Display P3 (wide color)", isOn: $settings.useDisplayP3)
+                Toggle("Keep camera info and capture date", isOn: $settings.keepMetadata)
+                if settings.keepMetadata {
+                    Toggle("Remove location", isOn: $settings.stripLocation)
+                }
                 LabeledContent("Folder") {
                     HStack {
                         Text(destination?.path(percentEncoded: false).replacingOccurrences(of: NSHomeDirectory(), with: "~") ?? "Choose…")
@@ -482,7 +539,10 @@ struct ExportSheet: View {
 
             HStack {
                 Spacer()
-                Button(progress == nil || progress! >= 1 ? "Close" : "Cancel") { dismiss() }
+                Button(progress == nil || progress! >= 1 ? "Close" : "Cancel") {
+                    job?.cancel()
+                    dismiss()
+                }
                     .keyboardShortcut(.cancelAction)
                 Button("Export", action: run)
                     .keyboardShortcut(.defaultAction)
@@ -501,6 +561,9 @@ struct ExportSheet: View {
         .onChange(of: settings.quality) { save() }
         .onChange(of: settings.longEdge) { save() }
         .onChange(of: settings.useDisplayP3) { save() }
+        .onChange(of: settings.keepMetadata) { save() }
+        .onChange(of: settings.stripLocation) { save() }
+        .onDisappear { job?.cancel() }
     }
 
     private var destination: URL? { settings.destinationPath.map { URL(fileURLWithPath: $0) } }
@@ -525,16 +588,19 @@ struct ExportSheet: View {
         progress = 0
         done = []
         errors = []
-        Task.detached(priority: .userInitiated) {
+        job = Task.detached(priority: .userInitiated) {
             try? FileManager.default.createDirectory(at: dest, withIntermediateDirectories: true)
-            for (i, job) in jobs.enumerated() {
-                do {
-                    let out = try Exporter.export(job, settings: settings, to: dest)
-                    await MainActor.run { done.append(out) }
-                } catch {
-                    await MainActor.run { errors.append("\(job.url.lastPathComponent): \(error.localizedDescription)") }
+            let results = await Exporter.exportAll(jobs, settings: settings, to: dest, concurrency: 2) { finished in
+                await MainActor.run { progress = Double(finished) / Double(jobs.count) }
+            }
+            await MainActor.run {
+                for r in results {
+                    switch r.result {
+                    case .success(let out): done.append(out)
+                    case .failure(let error): errors.append("\(r.url.lastPathComponent): \(error.localizedDescription)")
+                    }
                 }
-                await MainActor.run { progress = Double(i + 1) / Double(jobs.count) }
+                progress = 1
             }
         }
     }

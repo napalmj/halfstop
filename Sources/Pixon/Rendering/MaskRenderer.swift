@@ -100,7 +100,11 @@ enum MaskRenderer {
     }
 
     /// Bright, blue-ish, upper-frame areas. A heuristic stand-in for a learned sky model.
-    private static func sky(_ base: CIImage, size: CGSize) -> CIImage? {
+    /// Worked out at no more than 512 px (it's blurred soft anyway), then scaled up.
+    private static func sky(_ fullBase: CIImage, size fullSize: CGSize) -> CIImage? {
+        let k = min(1, 512 / max(fullSize.width, fullSize.height, 1))
+        let size = CGSize(width: (fullSize.width * k).rounded(.up), height: (fullSize.height * k).rounded(.up))
+        let base = fullBase.transformed(by: CGAffineTransform(scaleX: k, y: k))
         let extent = CGRect(origin: .zero, size: size)
         let srgb = base.applyingFilter("CILinearToSRGBToneCurve")
         let v = CIVector(x: -0.8 * 1.8, y: 0.6 * 1.8, z: 1.0 * 1.8, w: 0)
@@ -116,9 +120,13 @@ enum MaskRenderer {
         grad.color1 = .black
         guard let g = grad.outputImage else { return nil }
         let combined = score.applyingFilter("CIMultiplyCompositing", parameters: [kCIInputBackgroundImageKey: g])
-        return combined.clampedToExtent()
+        let small = combined.clampedToExtent()
             .applyingGaussianBlur(sigma: Double(max(size.width, size.height)) * 0.006)
             .cropped(to: extent)
+        guard k < 1 else { return small }
+        return small.clampedToExtent()
+            .transformed(by: CGAffineTransform(scaleX: fullSize.width / size.width, y: fullSize.height / size.height))
+            .cropped(to: CGRect(origin: .zero, size: fullSize))
     }
 
     /// Grow (+) / shrink (-) the edge, then soften it. Both scale with the image so preview and export match.

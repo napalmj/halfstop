@@ -12,10 +12,29 @@ enum Theme {
     static let track = Color.white.opacity(0.12)
 }
 
+/// The slider under the pointer, so ↑/↓ can nudge it (see `KeyHandler`).
+@MainActor
+final class SliderFocus {
+    static let shared = SliderFocus()
+    private(set) var id: UUID?
+    private var nudger: ((Double) -> Void)?
+
+    func set(_ id: UUID, nudge: @escaping (Double) -> Void) { self.id = id; nudger = nudge }
+    func clear(_ id: UUID) { if self.id == id { self.id = nil; nudger = nil } }
+
+    /// Moves the hovered slider by `steps` small steps. False when no slider is hovered.
+    func nudge(_ steps: Double) -> Bool {
+        guard let nudger else { return false }
+        nudger(steps)
+        return true
+    }
+}
+
 /// A compact slider tuned for photo editing:
 /// - drag anywhere on the track; hold ⌥ for fine control
 /// - gentle detent at the default value
-/// - double-click the label or value to reset
+/// - double-click the label to reset; click the value to type one
+/// - hover and press ↑/↓ to nudge (⇧ for bigger steps)
 struct AdjustSlider: View {
     let title: String
     let value: Double
@@ -33,6 +52,11 @@ struct AdjustSlider: View {
     @State private var dragging = false
     @State private var dragStart: (value: Double, x: CGFloat)? = nil
     @State private var hovering = false
+    @State private var editing = false
+    @State private var typed = ""
+    @State private var lastNudge = Date.distantPast
+    @State private var focusID = UUID()
+    @FocusState private var fieldFocused: Bool
 
     private var span: Double { range.upperBound - range.lowerBound }
 
@@ -46,9 +70,26 @@ struct AdjustSlider: View {
                 Text(title)
                     .foregroundStyle(value == defaultValue ? Theme.secondary : Theme.text)
                 Spacer()
-                Text(format(value))
-                    .monospacedDigit()
-                    .foregroundStyle(value == defaultValue ? Theme.secondary : Theme.text)
+                if editing {
+                    TextField("", text: $typed)
+                        .textFieldStyle(.plain)
+                        .multilineTextAlignment(.trailing)
+                        .monospacedDigit()
+                        .frame(width: 56)
+                        .padding(.horizontal, 3)
+                        .background(Color.black.opacity(0.35), in: RoundedRectangle(cornerRadius: 3))
+                        .focused($fieldFocused)
+                        .onSubmit(commitTyped)
+                        .onExitCommand { editing = false }
+                        .onChange(of: fieldFocused) { _, focused in if !focused { commitTyped() } }
+                } else {
+                    Text(format(value))
+                        .monospacedDigit()
+                        .foregroundStyle(value == defaultValue ? Theme.secondary : Theme.text)
+                        .contentShape(Rectangle())
+                        .onTapGesture { startTyping() }
+                        .help("Click to type a value")
+                }
             }
             .font(.system(size: 11.5))
             .contentShape(Rectangle())
@@ -109,6 +150,40 @@ struct AdjustSlider: View {
             .frame(height: 16)
         }
         .animation(.easeOut(duration: 0.1), value: dragging)
+        .onHover { inside in
+            if inside { registerNudge() } else { SliderFocus.shared.clear(focusID) }
+        }
+        // Re-register so a nudge starts from the current value (after a drag, undo…).
+        .onChange(of: value) { if SliderFocus.shared.id == focusID { registerNudge() } }
+        .onDisappear { SliderFocus.shared.clear(focusID) }
+    }
+
+    /// One nudge step: 1/200 of the range (1 on a ±100 slider, 0.05 EV on exposure), at least `step`.
+    private var nudgeUnit: Double { max(step, span / 200) }
+
+    private func registerNudge() {
+        let start = value
+        SliderFocus.shared.set(focusID) { steps in
+            // A burst of key presses is one history step.
+            if Date().timeIntervalSince(lastNudge) > LibraryStore.historySettle { onBegin() }
+            lastNudge = Date()
+            commit(start + steps * nudgeUnit)
+        }
+    }
+
+    private func startTyping() {
+        typed = format(value).replacingOccurrences(of: "+", with: "")
+        editing = true
+        DispatchQueue.main.async { fieldFocused = true }
+    }
+
+    private func commitTyped() {
+        guard editing else { return }
+        editing = false
+        let cleaned = typed.replacingOccurrences(of: ",", with: ".").filter { "-0123456789.".contains($0) }
+        guard let v = Double(cleaned) else { return }
+        onBegin()
+        commit(v)
     }
 
     private func update(fromX x: CGFloat, width: CGFloat) {

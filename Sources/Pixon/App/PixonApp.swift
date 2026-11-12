@@ -94,6 +94,7 @@ struct ContentView: View {
         .sheet(isPresented: $store.showExport) { ExportSheet() }
         .sheet(isPresented: $store.showImport) { ImportSheet() }
         .sheet(isPresented: $store.showSavePreset) { SavePresetSheet() }
+        .sheet(isPresented: $store.showSelectivePaste) { SelectivePasteSheet() }
         .alert(TrashText.title(store.trashRequest),
                isPresented: Binding(get: { store.trashRequest != nil }, set: { if !$0 { store.trashRequest = nil } }),
                presenting: store.trashRequest) { request in
@@ -154,7 +155,7 @@ enum TrashText {
     }
 }
 
-/// Single-key shortcuts for culling and editing (Lightroom-style).
+/// Single-key shortcuts for culling and editing.
 @MainActor
 enum KeyHandler {
     static func handle(_ event: NSEvent, store: LibraryStore) -> Bool {
@@ -163,6 +164,12 @@ enum KeyHandler {
         let mods = event.modifierFlags.intersection([.command, .control, .option])
         if !mods.isEmpty { return false }
         guard store.hasLibrary else { return false }
+
+        // ↑/↓ over a slider nudge it (⇧ = 5 steps) instead of changing photos.
+        if store.mode == .edit, event.keyCode == 125 || event.keyCode == 126 {
+            let steps = (event.keyCode == 126 ? 1.0 : -1.0) * (event.modifierFlags.contains(.shift) ? 5 : 1)
+            if SliderFocus.shared.nudge(steps) { return true }
+        }
 
         switch event.keyCode {
         case 123: store.step(-1); return true                                         // ←
@@ -183,7 +190,8 @@ enum KeyHandler {
             }
             return true
         case 53:                                                                      // esc
-            if store.isCropping { store.isCropping = false }
+            if store.pickingWhite { store.pickingWhite = false }
+            else if store.isCropping { store.isCropping = false }
             else if store.refineMode != nil { store.refineMode = nil }
             else if store.activeMaskID != nil { store.activeMaskID = nil }
             else if store.showBefore { store.showBefore = false }
@@ -192,12 +200,21 @@ enum KeyHandler {
         default: break
         }
 
+        // Rating and flags; ⇧ (or Auto Advance) then moves on to the next photo. Digits go by key
+        // code because ⇧1 types "!".
+        let digits: [UInt16: Int] = [29: 0, 18: 1, 19: 2, 20: 3, 21: 4, 23: 5, 82: 0, 83: 1, 84: 2, 85: 3, 86: 4, 87: 5]  // row + keypad
+        let advance = (store.autoAdvance || event.modifierFlags.contains(.shift)) && store.targets.count <= 1
+        if let rating = digits[event.keyCode] {
+            store.setRating(rating)
+            if advance { store.step(1) }
+            return true
+        }
+
         guard let chars = event.charactersIgnoringModifiers?.lowercased(), chars.count == 1 else { return false }
         switch chars {
-        case "0", "1", "2", "3", "4", "5": store.setRating(Int(chars)!)
-        case "p": store.setFlag(.pick)
-        case "x": store.setFlag(.reject)
-        case "u": store.setFlag(.none)
+        case "p": store.setFlag(.pick); if advance { store.step(1) }
+        case "x": store.setFlag(.reject); if advance { store.step(1) }
+        case "u": store.setFlag(.none); if advance { store.step(1) }
         case "g": store.mode = .library
         case "e": if store.current != nil { store.mode = .edit }
         case "c", "r":
@@ -205,6 +222,13 @@ enum KeyHandler {
             store.mode = .edit
             store.isCropping.toggle()
         case "\\": if store.mode == .edit { store.showBefore.toggle() }
+        case "j": if store.mode == .edit { store.showClipping.toggle() }
+        case "w":
+            guard store.current != nil else { return false }
+            store.mode = .edit
+            store.isCropping = false
+            store.activeMaskID = nil
+            store.pickingWhite.toggle()
         case "o": if store.activeMaskID != nil { store.setOverlay(!store.showMaskOverlay) }
         case "[": store.brushSize = max(0.005, store.brushSize / 1.2)
         case "]": store.brushSize = min(0.25, store.brushSize * 1.2)
@@ -248,6 +272,9 @@ struct PixonCommands: Commands {
                 .keyboardShortcut("c", modifiers: [.command, .shift])
             Button("Paste Settings") { store.pasteSettings() }
                 .keyboardShortcut("v", modifiers: [.command, .shift])
+            Button("Paste Selected Settings…") { store.showSelectivePaste = true }
+                .keyboardShortcut("v", modifiers: [.command, .shift, .option])
+                .disabled(store.clipboard == nil)
             Button("Reset All Adjustments") { store.resetAdjustments() }
                 .keyboardShortcut("r", modifiers: [.command, .shift])
             Divider()
@@ -270,6 +297,11 @@ struct PixonCommands: Commands {
                 .keyboardShortcut("s", modifiers: [.command, .shift])
             Button("Library") { store.mode = .library }
             Button("Edit") { store.mode = .edit }
+            Divider()
+            Toggle("Auto Advance After Rating", isOn: Binding(get: { store.autoAdvance }, set: { store.autoAdvance = $0 }))
+            Divider()
+            Button(store.showClipping ? "Hide Clipping (J)" : "Show Clipping (J)") { store.showClipping.toggle() }
+                .disabled(store.mode != .edit)
         }
     }
 }
