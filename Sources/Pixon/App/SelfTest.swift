@@ -195,6 +195,112 @@ enum SelfTest {
             check("export writes resized JPEG", false, error.localizedDescription)
         }
 
+        // Mask refinement: subtract at the center of a radial, add in a corner.
+        let size = CGSize(width: 1500, height: 1000)
+        let grayBase = CIImage(color: .gray).cropped(to: CGRect(origin: .zero, size: size))
+        var r = Mask(name: "R", kind: .radial)
+        r.radiusX = 0.3; r.radiusY = 0.3
+        r.strokes = [BrushStroke(points: [NormPoint(x: 0.5, y: 0.5)], radius: 0.04, feather: 0.2, erase: true),
+                     BrushStroke(points: [NormPoint(x: 0.1, y: 0.1)], radius: 0.04, feather: 0.2)]
+        if let mi = MaskRenderer.image(for: r, size: size, url: url, base: grayBase) {
+            check("refine: subtract clears inside", sample(mi, 0.5, 0.5).g < 0.1, "\(sample(mi, 0.5, 0.5))")
+            check("refine: add paints outside", sample(mi, 0.1, 0.1).g > 0.8, "\(sample(mi, 0.1, 0.1))")
+            check("refine: untouched area keeps mask", sample(mi, 0.5, 0.38).g > 0.5, "\(sample(mi, 0.5, 0.38))")
+        }
+        r.invert = true
+        if let mi = MaskRenderer.image(for: r, size: size, url: url, base: grayBase) {
+            check("refine applies after invert", sample(mi, 0.1, 0.1).g > 0.8 && sample(mi, 0.5, 0.5).g < 0.1,
+                  "\(sample(mi, 0.1, 0.1)) \(sample(mi, 0.5, 0.5))")
+        }
+
+        // Several gradients in one mask: top fades down, an added one fades up from the bottom.
+        var two = Mask(name: "L", kind: .linear)
+        two.start = NormPoint(x: 0.5, y: 0); two.end = NormPoint(x: 0.5, y: 0.3)
+        two.shapes = [MaskShape(kind: .linear, start: NormPoint(x: 0.5, y: 1), end: NormPoint(x: 0.5, y: 0.7))]
+        if let mi = MaskRenderer.image(for: two, size: size, url: url, base: grayBase) {
+            check("two linears: top masked", sample(mi, 0.5, 0.03).g > 0.8, "\(sample(mi, 0.5, 0.03))")
+            check("two linears: bottom masked", sample(mi, 0.5, 0.97).g > 0.8, "\(sample(mi, 0.5, 0.97))")
+            check("two linears: middle clear", sample(mi, 0.5, 0.5).g < 0.05, "\(sample(mi, 0.5, 0.5))")
+        }
+        two.shapes.append(MaskShape(kind: .radial, mode: .subtract, center: NormPoint(x: 0.2, y: 0.03), radiusX: 0.05, radiusY: 0.08, feather: 0.1))
+        if let mi = MaskRenderer.image(for: two, size: size, url: url, base: grayBase) {
+            check("subtract shape cuts a hole", sample(mi, 0.2, 0.03).g < 0.1 && sample(mi, 0.6, 0.03).g > 0.8,
+                  "\(sample(mi, 0.2, 0.03)) \(sample(mi, 0.6, 0.03))")
+        }
+        var inter = Mask(name: "R", kind: .radial)
+        inter.radiusX = 0.4; inter.radiusY = 0.4; inter.feather = 0.1
+        inter.shapes = [MaskShape(kind: .linear, mode: .intersect, start: NormPoint(x: 0, y: 0.5), end: NormPoint(x: 0.1, y: 0.5))]
+        if let mi = MaskRenderer.image(for: inter, size: size, url: url, base: grayBase) {
+            check("intersect keeps only the overlap", sample(mi, 0.3, 0.5).g < 0.05 && sample(mi, 0.03, 0.5).g < 0.05,
+                  "\(sample(mi, 0.3, 0.5)) \(sample(mi, 0.03, 0.5))")
+        }
+        inter.shapes[0].start = NormPoint(x: 0.3, y: 0.5); inter.shapes[0].end = NormPoint(x: 0.6, y: 0.5)
+        if let mi = MaskRenderer.image(for: inter, size: size, url: url, base: grayBase) {
+            check("intersect passes where both cover", sample(mi, 0.32, 0.5).g > 0.8, "\(sample(mi, 0.32, 0.5))")
+        }
+        let legacy = #"{"id":"6C1E0F6A-1A44-4B11-9A55-9E1C2B7E9D10","name":"Old","kind":"linear","local":{"exposure":0.5}}"#
+        let decoded = try? JSONDecoder().decode(Mask.self, from: Data(legacy.utf8))
+        check("older masks still load", decoded?.shapes.isEmpty == true && decoded?.local.exposure == 0.5, "")
+
+        // Subject subsets, picking and grow, using a synthetic detection (left box = 1, right box = 2).
+        let fakeURL = dir.appendingPathComponent("fake-subjects.jpg")
+        func box(_ rect: CGRect) -> CGImage {
+            let ctx = CGContext(data: nil, width: 600, height: 400, bitsPerComponent: 8, bytesPerRow: 0,
+                                space: MaskRenderer.linearGray, bitmapInfo: CGImageAlphaInfo.none.rawValue)!
+            ctx.setFillColor(gray: 0, alpha: 1); ctx.fill(CGRect(x: 0, y: 0, width: 600, height: 400))
+            ctx.setFillColor(gray: 1, alpha: 1); ctx.fill(rect)
+            return ctx.makeImage()!
+        }
+        let left = box(CGRect(x: 60, y: 100, width: 160, height: 200)), right = box(CGRect(x: 380, y: 100, width: 160, height: 200))
+        let both = box(CGRect(x: 0, y: 0, width: 0, height: 0))
+        let allCtx = CGContext(data: nil, width: 600, height: 400, bitsPerComponent: 8, bytesPerRow: 0,
+                               space: MaskRenderer.linearGray, bitmapInfo: CGImageAlphaInfo.none.rawValue)!
+        allCtx.draw(both, in: CGRect(x: 0, y: 0, width: 600, height: 400))
+        allCtx.setFillColor(gray: 1, alpha: 1)
+        allCtx.fill(CGRect(x: 60, y: 100, width: 160, height: 200)); allCtx.fill(CGRect(x: 380, y: 100, width: 160, height: 200))
+        let lookup = [left, right].map { SubjectDetector.downsample($0, width: 256, height: 171) }
+        SubjectDetector.shared.install(.init(all: allCtx.makeImage()!, instances: [left, right], lookup: lookup, lookupSize: (256, 171)), for: fakeURL)
+        var subj = Mask(name: "S", kind: .subject)
+        subj.subjects = [1]
+        if let mi = MaskRenderer.image(for: subj, size: size, url: fakeURL, base: grayBase, canDetect: false) {
+            check("subject subset keeps chosen subject", sample(mi, 140.0 / 600, 0.5).g > 0.8, "\(sample(mi, 140.0 / 600, 0.5))")
+            check("subject subset drops the other", sample(mi, 460.0 / 600, 0.5).g < 0.1, "\(sample(mi, 460.0 / 600, 0.5))")
+        }
+        check("click finds the right subject", SubjectDetector.shared.subject(at: NormPoint(x: 460.0 / 600, y: 0.5), url: fakeURL) == 2
+              && SubjectDetector.shared.subject(at: NormPoint(x: 0.5, y: 0.5), url: fakeURL) == nil, "")
+        subj.subjects = nil
+        // Box edge at x = 60/600; grow ±100 moves it 30 px at 1500 wide (= 12 px at 600).
+        subj.grow = 100
+        if let mi = MaskRenderer.image(for: subj, size: size, url: fakeURL, base: grayBase, canDetect: false) {
+            check("grow expands the edge", sample(mi, 53.0 / 600, 0.5).g > 0.8, "\(sample(mi, 53.0 / 600, 0.5))")
+        }
+        subj.grow = -100
+        if let mi = MaskRenderer.image(for: subj, size: size, url: fakeURL, base: grayBase, canDetect: false) {
+            check("shrink pulls the edge in", sample(mi, 67.0 / 600, 0.5).g < 0.2, "\(sample(mi, 67.0 / 600, 0.5))")
+        }
+
+        // Real Vision run on an off-center subject: the mask must land on it.
+        let visionURL = dir.appendingPathComponent("vision-subject.jpg")
+        if let ctx = CGContext(data: nil, width: 1500, height: 1000, bitsPerComponent: 8, bytesPerRow: 0, space: Render.sRGB,
+                               bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) {
+            ctx.setFillColor(CGColor(srgbRed: 0.82, green: 0.8, blue: 0.76, alpha: 1)); ctx.fill(CGRect(x: 0, y: 0, width: 1500, height: 1000))
+            ctx.setFillColor(CGColor(srgbRed: 0.85, green: 0.15, blue: 0.1, alpha: 1))
+            ctx.fillEllipse(in: CGRect(x: 1050, y: 300, width: 330, height: 330))   // center ≈ (0.81, 0.53) top-left coords
+            if let img = ctx.makeImage() { write(img, to: visionURL) }
+        }
+        if let vsrc = ImageSource(url: visionURL, maxPixelSize: nil) {
+            var vm = Adjustments(); var sm = Mask(name: "S", kind: .subject); sm.local.exposure = 1
+            vm.masks = [sm]
+            _ = vsrc.developed(vm, exporting: true)
+            if let n = SubjectDetector.shared.subjectCount(visionURL), n > 0,
+               let mi = MaskRenderer.image(for: sm, size: vsrc.size, url: visionURL, base: vsrc.developed(Adjustments()), canDetect: false) {
+                let on = sample(mi, 1215.0 / 1500, 1 - 465.0 / 1000), off = sample(mi, 0.2, 0.5)
+                check("vision mask lands on off-center subject", on.g > 0.5 && off.g < 0.2, "on \(on) off \(off)")
+            } else {
+                print("SKIP  vision found no subject in the synthetic image")
+            }
+        }
+
         // LUT speed (rebuilt on every curve/HSL/wheel drag).
         let t0 = Date()
         var key = ColorLUTKey(Adjustments()); key.contrast = 13; key.hsl[2].hue = 20; key.grading.midtones.saturation = 30
@@ -274,6 +380,14 @@ enum Snapshot {
                 try? FileManager.default.removeItem(at: copy)
                 try? FileManager.default.copyItem(at: samples, to: copy)
                 try? FileManager.default.removeItem(at: copy.appendingPathComponent(".pixon"))
+                // A photo with two clear subjects for the subject-mask step.
+                if let ctx = CGContext(data: nil, width: 1800, height: 1200, bitsPerComponent: 8, bytesPerRow: 0, space: Render.sRGB,
+                                       bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) {
+                    ctx.setFillColor(CGColor(srgbRed: 0.8, green: 0.78, blue: 0.72, alpha: 1)); ctx.fill(CGRect(x: 0, y: 0, width: 1800, height: 1200))
+                    ctx.setFillColor(CGColor(srgbRed: 0.85, green: 0.15, blue: 0.1, alpha: 1)); ctx.fillEllipse(in: CGRect(x: 200, y: 350, width: 420, height: 420))
+                    ctx.setFillColor(CGColor(srgbRed: 0.1, green: 0.3, blue: 0.85, alpha: 1)); ctx.fill(CGRect(x: 1200, y: 300, width: 380, height: 520))
+                    if let img = ctx.makeImage() { SelfTest.write(img, to: copy.appendingPathComponent("zz-subjects.jpg")) }
+                }
                 samplesCopy = copy
             }
             if !store.hasLibrary, let samples = samplesCopy {
@@ -322,6 +436,54 @@ enum Snapshot {
             shot("4-brush-mask")
             preview("4-brush-mask-preview")
 
+            store.addMask(.linear)
+            store.editMask { $0.start = NormPoint(x: 0.95, y: 0.5); $0.end = NormPoint(x: 0.7, y: 0.5); $0.local.exposure = -1 }
+            store.addShape(.linear) { $0.start = NormPoint(x: 0.05, y: 0.5); $0.end = NormPoint(x: 0.3, y: 0.5) }
+            store.setOverlay(true)
+            await wait(1.5)
+            shot("4b-two-linears")
+            preview("4b-two-linears")
+            store.setOverlay(false)
+
+            if let subjects = store.visiblePhotos.first(where: { $0.name == "zz-subjects.jpg" }) {
+                store.select(subjects)
+                await wait(2.5)
+                store.addMask(.subject)
+                await wait(4)
+                shot("5-subject-mask")
+                preview("5-subject-all")
+                if let url = store.currentID, let n = SubjectDetector.shared.subjectCount(url) {
+                    print("subjects found: \(n)")
+                    if n > 1 { store.setSubject(2, included: false, count: n) }
+                    store.editMask { $0.strokes = [BrushStroke(points: [NormPoint(x: 0.12, y: 0.15), NormPoint(x: 0.3, y: 0.15)], radius: 0.04, feather: 0.3)] }
+                }
+                await wait(1.5)
+                shot("6-subject-one-refined")
+                preview("6-subject-one-refined")
+                store.editMask { $0.local.exposure = 0.6 }
+                store.checkpoint()
+                store.activeMaskID = nil
+                store.edit { $0.contrast = 18 }
+                store.checkpoint()
+                store.edit { $0.temperature = 25 }
+                store.checkpoint()
+                store.saveSnapshot(named: "Warm version")
+                store.edit { $0.saturation = -20 }
+                store.checkpoint()
+                store.jumpToStep(max(0, (store.current?.history.count ?? 2) - 3))
+                await wait(1.2)
+                shot("9-history")
+            }
+
+            store.mode = .library
+            store.source = .all
+            store.saveNow()
+            await wait(2)
+            shot("7-library-edited")
+            store.editsFilter = .edited
+            await wait(1)
+            shot("8-edited-filter")
+            store.editsFilter = .any
             store.flushSaves()
             print("snapshot done")
             NSApp.terminate(nil)
@@ -433,6 +595,54 @@ enum LibraryTest {
         store.removeFolder(bFolder.id)
         await reloaded(store)
         check("remove folder drops its photos only", store.photos.count == 5 && fm.fileExists(atPath: moved.appendingPathComponent("DSC_3.jpg").path))
+
+        // Edit history.
+        if let photo = store.photos.first {
+            store.mode = .edit
+            store.select(photo)
+            store.resetAdjustments()
+            store.clearHistory()
+            let base = photo.history.count
+            store.edit { $0.exposure = 0.5 }
+            store.edit { $0.exposure = 1 }          // same gesture: merges
+            store.checkpoint()                       // new gesture starts
+            store.edit { $0.contrast = 20 }
+            store.commitPending(photo)
+            check("one gesture = one step", photo.history.count == base + 2, photo.history.map(\.label).joined(separator: " | "))
+            check("step labels read well", photo.history.suffix(2).map(\.label) == ["Exposure +1.00", "Contrast +20"],
+                  photo.history.suffix(2).map(\.label).joined(separator: " | "))
+            store.jumpToStep(base)
+            check("jump back restores that state", photo.adjustments.exposure == 1 && photo.adjustments.contrast == 0
+                  && photo.history.count == base + 2, "")
+            store.edit { $0.saturation = -30 }
+            store.commitPending(photo)
+            check("editing after a jump trims later steps", photo.history.map(\.label).suffix(2) == ["Exposure +1.00", "Saturation -30"],
+                  photo.history.map(\.label).joined(separator: " | "))
+            store.undo()
+            check("undo steps back", photo.adjustments.saturation == 0 && photo.historyIndex == base)
+            store.redo()
+            check("redo steps forward", photo.adjustments.saturation == -30)
+            store.saveSnapshot(named: "Muted")
+            store.edit { $0.saturation = 40 }
+            store.commitPending(photo)
+            if let snap = photo.snapshots.first { store.applySnapshot(snap) }
+            check("snapshot restores and is a step", photo.adjustments.saturation == -30 && photo.history.last?.label == "Snapshot: Muted",
+                  photo.history.last?.label ?? "")
+            store.addMask(.linear)
+            store.commitPending(photo)
+            check("mask steps are labelled", photo.history.last?.label == "Add mask: Linear 1", photo.history.last?.label ?? "")
+            let count = photo.history.count, index = photo.historyIndex
+            store.flushSaves()
+            let reopened = LibraryStore(catalogURL: catalogURL, watch: false)
+            await reloaded(reopened)
+            let again = reopened.photos.first { $0.url == photo.url }
+            check("history and snapshots persist", again?.history.count == count && again?.historyIndex == index
+                  && again?.snapshots.first?.name == "Muted", "\(again?.history.count ?? -1) steps")
+            store.clearHistory()
+            check("clear keeps current edits", photo.history.count == 1 && photo.adjustments.saturation == -30)
+            store.resetAdjustments()
+            store.mode = .library
+        }
 
         // Brush: two separate strokes must both land in the mask.
         var brush = Mask(name: "Brush", kind: .brush)

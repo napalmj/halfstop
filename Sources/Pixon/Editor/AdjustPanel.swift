@@ -323,8 +323,11 @@ private struct MaskList: View {
 
 private struct MaskSettings: View {
     @Environment(LibraryStore.self) private var store
+    @Environment(PreviewRenderer.self) private var renderer
     let mask: Mask
     @State private var open = true
+
+    private let whole: (Double) -> String = { "\(Int($0.rounded()))" }
 
     var body: some View {
         PanelSection(title: "\(mask.kind.label) mask", expanded: $open) {
@@ -332,21 +335,24 @@ private struct MaskSettings: View {
                 .font(.system(size: 11))
                 .foregroundStyle(Theme.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-            if mask.kind == .radial {
-                AdjustSlider(title: "Feather", value: mask.feather * 100, range: 0...100, format: { "\(Int($0.rounded()))" },
-                             onBegin: store.checkpoint, onChange: { v in store.editMask { $0.feather = v / 100 } })
+            if mask.kind == .subject {
+                SubjectPicker(mask: mask, generation: renderer.generation)
+            }
+            ShapeList(mask: mask)
+            if mask.kind.isAutomatic {
+                AdjustSlider(title: "Grow / shrink", value: mask.grow, range: -100...100,
+                             onBegin: store.checkpoint, onChange: { v in store.editMask { $0.grow = v } })
+                AdjustSlider(title: "Softness", value: mask.softness, range: 0...100, format: whole,
+                             onBegin: store.checkpoint, onChange: { v in store.editMask { $0.softness = v } })
             }
             if mask.kind == .brush {
                 @Bindable var s = store
-                AdjustSlider(title: "Size", value: store.brushSize * 1000, range: 5...250, format: { "\(Int($0.rounded()))" },
-                             onBegin: {}, onChange: { store.brushSize = $0 / 1000 })
-                AdjustSlider(title: "Feather", value: store.brushFeather * 100, range: 0...100, format: { "\(Int($0.rounded()))" },
-                             onBegin: {}, onChange: { store.brushFeather = $0 / 100 })
-                AdjustSlider(title: "Flow", value: store.brushFlow * 100, range: 5...100, format: { "\(Int($0.rounded()))" },
-                             onBegin: {}, onChange: { store.brushFlow = $0 / 100 })
+                brushSliders(flow: true)
                 Toggle("Erase (or hold ⌥)", isOn: $s.brushErase)
                     .toggleStyle(.checkbox)
                     .font(.system(size: 11.5))
+            } else {
+                refineControls
             }
             HStack {
                 Toggle("Invert", isOn: Binding(get: { mask.invert }, set: { v in store.checkpoint(); store.editMask { $0.invert = v } }))
@@ -359,13 +365,172 @@ private struct MaskSettings: View {
         }
     }
 
+    @ViewBuilder
+    private func brushSliders(flow: Bool) -> some View {
+        AdjustSlider(title: "Brush size", value: store.brushSize * 1000, range: 5...250, format: whole,
+                     onBegin: {}, onChange: { store.brushSize = $0 / 1000 })
+        AdjustSlider(title: "Brush feather", value: store.brushFeather * 100, range: 0...100, format: whole,
+                     onBegin: {}, onChange: { store.brushFeather = $0 / 100 })
+        if flow {
+            AdjustSlider(title: "Flow", value: store.brushFlow * 100, range: 5...100, format: whole,
+                         onBegin: {}, onChange: { store.brushFlow = $0 / 100 })
+        }
+    }
+
+    @ViewBuilder
+    private var refineControls: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Refine with brush").font(.system(size: 11.5)).foregroundStyle(Theme.secondary)
+                Spacer()
+                if !mask.strokes.isEmpty {
+                    Button("Clear") {
+                        store.checkpoint()
+                        store.editMask { $0.strokes = [] }
+                    }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 11))
+                    .foregroundStyle(Theme.secondary)
+                    .help("Remove all \(mask.strokes.count) refinement strokes")
+                }
+            }
+            HStack(spacing: 4) {
+                Button { store.refineMode = store.refineMode == .add ? nil : .add } label: {
+                    Label("Add", systemImage: "plus.circle")
+                }
+                .buttonStyle(ChipStyle(selected: store.refineMode == .add))
+                Button { store.refineMode = store.refineMode == .subtract ? nil : .subtract } label: {
+                    Label("Subtract", systemImage: "minus.circle")
+                }
+                .buttonStyle(ChipStyle(selected: store.refineMode == .subtract))
+            }
+        }
+        if store.refineMode != nil {
+            brushSliders(flow: false)
+            Text("Paint on the photo. Hold ⌥ to switch between add and subtract. Esc stops painting.")
+                .font(.system(size: 10.5))
+                .foregroundStyle(Theme.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
     private var hint: String {
         switch mask.kind {
-        case .radial: "Drag to move. Drag the edge dots to resize."
-        case .linear: "Drag across the photo to set the gradient. Drag the dots to adjust."
+        case .radial: "Drag to move. Drag the edge dots to resize. ⇧-drag adds another."
+        case .linear: "Drag across the photo to set the gradient. Drag the dots to adjust. ⇧-drag adds another gradient."
         case .brush: "Paint on the photo. Hold ⌥ to erase. [ and ] change size."
-        case .subject: "The main subject, detected automatically."
+        case .subject: "People and objects detected automatically. Click one on the photo to include or exclude it."
         case .sky: "Bright, blue areas toward the top of the frame."
+        }
+    }
+}
+
+/// The mask's gradients: its own shape plus extras, each combined with a mode.
+private struct ShapeList: View {
+    @Environment(LibraryStore.self) private var store
+    let mask: Mask
+
+    var body: some View {
+        let main = mask.mainShape
+        VStack(alignment: .leading, spacing: 4) {
+            if main != nil || !mask.shapes.isEmpty {
+                Text("Shapes").font(.system(size: 11.5)).foregroundStyle(Theme.secondary)
+            }
+            if let main {
+                row(main, title: "\(mask.name)", index: nil)
+            }
+            ForEach(Array(mask.shapes.enumerated()), id: \.element.id) { i, shape in
+                row(shape, title: "\(shape.kind == .linear ? "Linear" : "Radial") \(i + (main == nil ? 1 : 2))", index: i)
+            }
+            Menu {
+                Button { store.addShape(.linear) } label: { Label("Add linear gradient", systemImage: "rectangle.tophalf.filled") }
+                Button { store.addShape(.radial) } label: { Label("Add radial gradient", systemImage: "circle.dashed") }
+                Divider()
+                Button { store.addShape(.linear, mode: .subtract) } label: { Label("Subtract linear gradient", systemImage: "minus.circle") }
+                Button { store.addShape(.radial, mode: .subtract) } label: { Label("Subtract radial gradient", systemImage: "minus.circle") }
+            } label: {
+                Label("Add shape", systemImage: "plus").font(.system(size: 11.5))
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help("Or ⇧-drag on the photo to add another gradient")
+        }
+        if let active = mask.shape(store.activeShapeID), active.kind == .radial {
+            AdjustSlider(title: "Feather", value: active.feather * 100, range: 0...100, format: { "\(Int($0.rounded()))" },
+                         onBegin: store.checkpoint,
+                         onChange: { v in store.editMask { $0.editShape(store.activeShapeID) { $0.feather = v / 100 } } })
+        }
+    }
+
+    private func row(_ shape: MaskShape, title: String, index: Int?) -> some View {
+        let selected = index == nil ? (store.activeShapeID == nil || store.activeShapeID == mask.id) : store.activeShapeID == shape.id
+        return HStack(spacing: 6) {
+            Image(systemName: shape.kind == .linear ? "rectangle.tophalf.filled" : "circle.dashed").frame(width: 14)
+            Text(title).lineLimit(1)
+            Spacer()
+            if index != nil {
+                Menu {
+                    ForEach(CombineMode.allCases) { mode in
+                        Button { store.setShapeMode(shape.id, mode) } label: { Label(mode.label, systemImage: mode.symbol) }
+                    }
+                } label: {
+                    Label(shape.mode.label, systemImage: shape.mode.symbol).font(.system(size: 11))
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                Button { store.deleteShape(shape.id) } label: { Image(systemName: "trash") }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(Theme.secondary)
+                    .help("Delete shape")
+            }
+        }
+        .font(.system(size: 12))
+        .foregroundStyle(selected ? Theme.text : Theme.secondary)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .background(selected ? Theme.panelRaised : .clear, in: RoundedRectangle(cornerRadius: 6))
+        .contentShape(Rectangle())
+        .onTapGesture { store.activeShapeID = index == nil ? nil : shape.id }
+    }
+}
+
+/// Chips for each detected subject.
+private struct SubjectPicker: View {
+    @Environment(LibraryStore.self) private var store
+    let mask: Mask
+    /// Re-read detection state when the renderer reports progress.
+    let generation: Int
+
+    var body: some View {
+        if let url = store.currentID {
+            if let count = SubjectDetector.shared.subjectCount(url) {
+                if count == 0 {
+                    Text("No subject found in this photo.").font(.system(size: 11.5)).foregroundStyle(.orange)
+                } else {
+                    let included = Set(mask.subjects ?? Array(1...count))
+                    LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 4), count: 4), spacing: 4) {
+                        Button("All") {
+                            store.checkpoint()
+                            store.editMask { $0.subjects = nil }
+                        }
+                        .buttonStyle(ChipStyle(selected: mask.subjects == nil))
+                        ForEach(1...count, id: \.self) { n in
+                            Button("\(n)") { store.setSubject(n, included: !included.contains(n), count: count) }
+                                .buttonStyle(ChipStyle(selected: mask.subjects != nil && included.contains(n)))
+                                .help(included.contains(n) ? "Exclude subject \(n)" : "Include subject \(n)")
+                        }
+                    }
+                    Text("\(included.count) of \(count) subjects included")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(Theme.secondary)
+                }
+            } else {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text("Finding subjects…").font(.system(size: 11.5)).foregroundStyle(Theme.secondary)
+                }
+            }
         }
     }
 }

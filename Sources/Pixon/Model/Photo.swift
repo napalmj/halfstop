@@ -5,12 +5,32 @@ enum Flag: String, Codable {
     case none, pick, reject
 }
 
+/// One entry in a photo's edit history: what changed, and the full state after it.
+struct HistoryStep: Codable, Identifiable, Hashable {
+    var id = UUID()
+    var label: String
+    var date = Date()
+    var adjustments: Adjustments
+}
+
+/// A named version of a photo's edits that survives history being trimmed or cleared.
+struct EditSnapshot: Codable, Identifiable, Hashable {
+    var id = UUID()
+    var name: String
+    var date = Date()
+    var adjustments: Adjustments
+}
+
 /// What gets written to `<folder>/.pixon/<filename>.json`.
 struct Sidecar: Codable {
     var version = 1
     var rating = 0
     var flag = Flag.none
     var adjustments = Adjustments()
+    var history: [HistoryStep] = []
+    /// Which history step is current; steps after it can be redone until the next edit trims them.
+    var historyIndex = 0
+    var snapshots: [EditSnapshot] = []
 
     init() {}
 
@@ -20,6 +40,14 @@ struct Sidecar: Codable {
         rating = (try? c.decodeIfPresent(Int.self, forKey: .rating)) ?? 0
         flag = (try? c.decodeIfPresent(Flag.self, forKey: .flag)) ?? .none
         adjustments = (try? c.decodeIfPresent(Adjustments.self, forKey: .adjustments)) ?? Adjustments()
+        history = (try? c.decodeIfPresent([HistoryStep].self, forKey: .history)) ?? []
+        historyIndex = (try? c.decodeIfPresent(Int.self, forKey: .historyIndex)) ?? 0
+        snapshots = (try? c.decodeIfPresent([EditSnapshot].self, forKey: .snapshots)) ?? []
+    }
+
+    /// Nothing worth keeping on disk.
+    var isEmpty: Bool {
+        rating == 0 && flag == .none && adjustments.isDefault && history.count <= 1 && snapshots.isEmpty
     }
 }
 
@@ -30,6 +58,9 @@ final class Photo: Identifiable, Hashable {
     var rating: Int
     var flag: Flag
     var adjustments: Adjustments
+    var history: [HistoryStep]
+    var historyIndex: Int
+    var snapshots: [EditSnapshot]
 
     var id: URL { url }
     var name: String { url.lastPathComponent }
@@ -41,6 +72,15 @@ final class Photo: Identifiable, Hashable {
         self.rating = sidecar.rating
         self.flag = sidecar.flag
         self.adjustments = sidecar.adjustments
+        self.snapshots = sidecar.snapshots
+        if sidecar.history.isEmpty {
+            // Start every photo's history from what's on disk now.
+            self.history = [HistoryStep(label: sidecar.adjustments.isDefault ? "Original" : "Opened", adjustments: sidecar.adjustments)]
+            self.historyIndex = 0
+        } else {
+            self.history = sidecar.history
+            self.historyIndex = min(max(sidecar.historyIndex, 0), sidecar.history.count - 1)
+        }
     }
 
     var sidecar: Sidecar {
@@ -48,6 +88,9 @@ final class Photo: Identifiable, Hashable {
         s.rating = rating
         s.flag = flag
         s.adjustments = adjustments
+        s.history = history
+        s.historyIndex = historyIndex
+        s.snapshots = snapshots
         return s
     }
 

@@ -71,14 +71,8 @@ private struct GridCell: View {
                     .stroke(isCurrent ? Theme.accent : (selected ? Theme.accent.opacity(0.4) : .clear), lineWidth: 2))
                 .overlay(alignment: .bottomLeading) { StarsBadge(rating: photo.rating).padding(6) }
                 .overlay(alignment: .topTrailing) { FlagBadge(flag: photo.flag).padding(4) }
-                .overlay(alignment: .topLeading) {
-                    if !photo.adjustments.isDefault {
-                        Image(systemName: "slider.horizontal.3")
-                            .font(.system(size: 9))
-                            .foregroundStyle(.white)
-                            .shadow(color: .black.opacity(0.8), radius: 1.5)
-                            .padding(10)
-                    }
+                .overlay(alignment: .bottomTrailing) {
+                    if !photo.adjustments.isDefault { EditedBadge().padding(12) }
                 }
                 .opacity(photo.flag == .reject ? 0.35 : 1)
             Text(photo.name)
@@ -135,6 +129,51 @@ private struct GridCell: View {
     }
 }
 
+/// Marks a photo that has edits.
+struct EditedBadge: View {
+    var compact = false
+
+    var body: some View {
+        HStack(spacing: 3) {
+            Image(systemName: "slider.horizontal.3")
+            if !compact { Text("Edited") }
+        }
+        .font(.system(size: compact ? 8.5 : 10, weight: .semibold))
+        .foregroundStyle(.black)
+        .padding(.horizontal, compact ? 4 : 6)
+        .padding(.vertical, compact ? 2 : 3)
+        .background(Theme.accent, in: Capsule())
+        .shadow(color: .black.opacity(0.4), radius: 1.5)
+        .help("This photo has edits")
+    }
+}
+
+/// "Saved" / "Saving…" in the top bar. Edits save automatically next to each photo.
+private struct SaveStatus: View {
+    @Environment(LibraryStore.self) private var store
+
+    var body: some View {
+        let saving = store.unsavedCount > 0
+        HStack(spacing: 4) {
+            Image(systemName: saving ? "arrow.triangle.2.circlepath" : "checkmark.circle.fill")
+            Text(saving ? "Saving…" : "Saved")
+        }
+        .font(.system(size: 11.5, weight: store.savedFlash ? .semibold : .regular))
+        .foregroundStyle(store.savedFlash ? Theme.accent : Theme.secondary)
+        .animation(.easeOut(duration: 0.2), value: store.savedFlash)
+        .help(helpText)
+    }
+
+    private var helpText: String {
+        var t = "Edits save automatically next to your photos (⌘S saves right away)."
+        if let d = store.lastSaved {
+            let f = RelativeDateTimeFormatter()
+            t += " Last saved \(f.localizedString(for: d, relativeTo: Date()))."
+        }
+        return t
+    }
+}
+
 // MARK: - Top bar
 
 struct TopBar: View {
@@ -145,14 +184,15 @@ struct TopBar: View {
         HStack(spacing: 12) {
             Color.clear.frame(width: 64, height: 1) // traffic lights
             if store.hasLibrary {
-                if store.mode == .library {
-                    Button { store.showSidebar.toggle() } label: {
-                        Image(systemName: "sidebar.left")
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(store.showSidebar ? Theme.text : Theme.secondary)
-                    .help("Show or hide sidebar (⇧⌘S)")
+                let leftShown = store.mode == .library ? store.showSidebar : store.showHistory
+                Button {
+                    if store.mode == .library { store.showSidebar.toggle() } else { store.showHistory.toggle() }
+                } label: {
+                    Image(systemName: "sidebar.left")
                 }
+                .buttonStyle(.plain)
+                .foregroundStyle(leftShown ? Theme.text : Theme.secondary)
+                .help(store.mode == .library ? "Show or hide sidebar (⇧⌘S)" : "Show or hide history (⇧⌘S)")
                 HStack(spacing: 6) {
                     Text(store.sourceTitle).fontWeight(.semibold).foregroundStyle(Theme.text)
                     Text("\(store.visiblePhotos.count) photos").foregroundStyle(Theme.secondary)
@@ -175,6 +215,7 @@ struct TopBar: View {
                     .foregroundStyle(Theme.text.opacity(0.85))
                     .help("Add the selection to “\(target.name)” (B)")
                 }
+                SaveStatus()
                 Button { store.showImportSheet() } label: {
                     Label("Import", systemImage: "square.and.arrow.down")
                 }
@@ -195,6 +236,10 @@ struct TopBar: View {
                     Picker("Rating", selection: $store.minRating) {
                         Text("Any rating").tag(0)
                         ForEach(1...5, id: \.self) { Text(String(repeating: "★", count: $0) + " and up").tag($0) }
+                    }
+                    .pickerStyle(.inline)
+                    Picker("Edits", selection: $store.editsFilter) {
+                        ForEach(EditsFilter.allCases) { Text($0.label).tag($0) }
                     }
                     .pickerStyle(.inline)
                     Toggle("Hide rejected", isOn: $store.hideRejected)
@@ -225,6 +270,8 @@ struct TopBar: View {
         var parts: [String] = []
         if store.filter != .all { parts.append(store.filter.label) }
         if store.minRating > 0 { parts.append("\(store.minRating)★+") }
+        if store.editsFilter == .edited { parts.append("Edited") }
+        if store.editsFilter == .unedited { parts.append("Not edited") }
         return parts.isEmpty ? "All" : parts.joined(separator: " · ")
     }
 }

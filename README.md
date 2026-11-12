@@ -25,7 +25,13 @@ Requires macOS 14+ and the Xcode command line tools.
 - **Quick tab**: exposure, contrast, highlights, shadows, temperature, saturation, vignette.
 - **Detailed tab**: full light & color, color grading wheels, tone curve, HSL, detail.
 - **Masks**: brush, linear, radial, subject (Apple Vision) and sky; each with its own sliders.
+  A mask can combine several linear/radial gradients (add, subtract, intersect; ⇧-drag adds one).
+  Subject masks let you pick individual subjects (click them on the photo), and automatic
+  masks can grow/shrink and soften. Any mask can be refined with add/subtract brush strokes.
 - **Crop & straighten** with aspect presets.
+- **Edit history** (left of the editor): every edit is a named step; click one to go back, and
+  editing from there trims the later steps. Snapshots save named versions. Saved per photo.
+- **Saving** is automatic (the top bar shows Saving…/Saved); ⌘S writes immediately.
 - **Presets, copy/paste settings, undo/redo, export** (JPEG / HEIC / 16-bit TIFF).
 - RAW support via Core Image (whatever macOS can decode: CR3, NEF, ARW, DNG, RAF, …).
 
@@ -49,7 +55,8 @@ Requires macOS 14+ and the Xcode command line tools.
 | ⌘I | Import photos |
 | B | Add selection to the target collection |
 | Delete | Remove from the current collection |
-| ⇧⌘S | Show / hide sidebar |
+| ⇧⌘S | Show / hide the sidebar (library) or history (editor) |
+| ⌘S | Save now |
 
 ## Developer checks
 

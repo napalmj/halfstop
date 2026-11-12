@@ -6,10 +6,25 @@ enum ViewMode { case library, edit }
 
 enum PanelTab: String { case quick, detailed }
 
+/// Painting refinements onto a non-brush mask.
+enum RefineMode { case add, subtract }
+
 enum LibrarySource: Hashable {
     case all, lastImport
     case folder(UUID)
     case collection(UUID)
+}
+
+enum EditsFilter: String, CaseIterable, Identifiable {
+    case any, edited, unedited
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .any: "Edited or not"
+        case .edited: "Edited only"
+        case .unedited: "Not edited"
+        }
+    }
 }
 
 enum LibraryFilter: String, CaseIterable, Identifiable {
@@ -38,6 +53,10 @@ final class LibraryStore {
         didSet { if oldValue != source { selection = []; keepCurrentVisible() } }
     }
     var showSidebar = true
+    /// The history panel on the left of the editor.
+    var showHistory = UserDefaults.standard.object(forKey: "showHistory") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(showHistory, forKey: "showHistory") }
+    }
     var showImport = false
     /// Folder to prefill in the import sheet (e.g. from drag and drop).
     var importPrefill: URL?
@@ -55,6 +74,7 @@ final class LibraryStore {
     var filter: LibraryFilter = .all { didSet { keepCurrentVisible() } }
     var minRating = 0 { didSet { keepCurrentVisible() } }
     var hideRejected = false { didSet { keepCurrentVisible() } }
+    var editsFilter: EditsFilter = .any { didSet { keepCurrentVisible() } }
 
     // Editor state
     var isCropping = false { didSet { if isCropping { activeMaskID = nil } } }
@@ -62,7 +82,15 @@ final class LibraryStore {
     var thumbnailSize: Double = 200
     var panelTab: PanelTab = .quick { didSet { if panelTab == .quick { activeMaskID = nil } } }
     /// Mask currently being edited; nil = whole photo.
-    var activeMaskID: UUID? { didSet { if activeMaskID != nil { isCropping = false } } }
+    var activeMaskID: UUID? {
+        didSet {
+            if activeMaskID != nil { isCropping = false }
+            if activeMaskID != oldValue { refineMode = nil; activeShapeID = nil }
+        }
+    }
+    /// Which shape of the active mask the handles edit; nil = the mask's own shape.
+    var activeShapeID: UUID?
+    var refineMode: RefineMode?
     var showMaskOverlay = false
     /// True while a mask is being painted or dragged.
     var maskInteracting = false
@@ -81,11 +109,16 @@ final class LibraryStore {
     private(set) var clipboard: Adjustments?
 
     // Undo (per photo, reset when switching photos)
-    private var undoStack: [Adjustments] = []
-    private var redoStack: [Adjustments] = []
-    private var undoOwner: URL?
+    /// Changes waiting to settle into a history step.
+    @ObservationIgnored private var pendingCommits: [URL: DispatchWorkItem] = [:]
 
     @ObservationIgnored private var pendingSaves: [URL: DispatchWorkItem] = [:]
+    @ObservationIgnored private var pendingTokens: [URL: UUID] = [:]
+    /// Photos with edits not yet written to their sidecar (they save ~0.5 s after a change).
+    private(set) var unsavedCount = 0
+    private(set) var lastSaved: Date?
+    /// Briefly true after ⌘S, to confirm the save.
+    var savedFlash = false
 
     init(catalogURL: URL = Catalog.defaultURL, watch: Bool = true) {
         self.catalogURL = catalogURL
@@ -129,6 +162,11 @@ final class LibraryStore {
         return base.filter { p in
             if p.rating < minRating { return false }
             if hideRejected && p.flag == .reject && filter != .rejected { return false }
+            switch editsFilter {
+            case .any: break
+            case .edited: if p.adjustments.isDefault { return false }
+            case .unedited: if !p.adjustments.isDefault { return false }
+            }
             switch filter {
             case .all: return true
             case .picks: return p.flag == .pick
@@ -384,12 +422,29 @@ final class LibraryStore {
         pendingSaves[photo.url]?.cancel()
         let sidecar = photo.sidecar
         let url = photo.url
-        let work = DispatchWorkItem { LibraryStore.writeSidecar(sidecar, for: url) }
+        let token = UUID()
+        let work = DispatchWorkItem { [weak self] in
+            LibraryStore.writeSidecar(sidecar, for: url)
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { self?.didWrite(url, token: token) }
+            }
+        }
         pendingSaves[url] = work
+        pendingTokens[url] = token
+        unsavedCount = pendingSaves.count
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.5, execute: work)
     }
 
+    private func didWrite(_ url: URL, token: UUID) {
+        guard pendingTokens[url] == token else { return }
+        pendingTokens[url] = nil
+        pendingSaves[url] = nil
+        unsavedCount = pendingSaves.count
+        lastSaved = Date()
+    }
+
     func flushSaves() {
+        commitAllPending()
         for (url, work) in pendingSaves {
             work.cancel()
             if let photo = photos.first(where: { $0.url == url }) {
@@ -397,12 +452,23 @@ final class LibraryStore {
             }
         }
         pendingSaves = [:]
+        pendingTokens = [:]
+        if unsavedCount != 0 { unsavedCount = 0; lastSaved = Date() }
+    }
+
+    /// ⌘S: everything is saved automatically, but this writes it out right now and says so.
+    func saveNow() {
+        flushSaves()
+        saveCatalog()
+        lastSaved = Date()
+        savedFlash = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in self?.savedFlash = false }
     }
 
     nonisolated static func writeSidecar(_ sidecar: Sidecar, for url: URL) {
         let dest = sidecarURL(for: url)
         let fm = FileManager.default
-        if sidecar.rating == 0 && sidecar.flag == .none && sidecar.adjustments.isDefault {
+        if sidecar.isEmpty {
             try? fm.removeItem(at: dest)
             return
         }
@@ -446,7 +512,10 @@ final class LibraryStore {
     func stepRow(_ delta: Int, columns: Int) { step(delta * max(columns, 1)) }
 
     private func setCurrent(_ url: URL?) {
-        if currentID != url { isCropping = false; showBefore = false; activeMaskID = nil }
+        if currentID != url {
+            if let previous = current { commitPending(previous) }
+            isCropping = false; showBefore = false; activeMaskID = nil
+        }
         currentID = url
     }
 
@@ -468,15 +537,16 @@ final class LibraryStore {
         for p in targets { p.flag = flag; scheduleSave(p) }
     }
 
-    // MARK: - Editing
+    // MARK: - Editing & history
 
-    /// Call before a change that should be one undo step (e.g. when a slider drag begins).
+    static let historyLimit = 100
+    /// Pause after the last change before it becomes a history step (one slider drag = one step).
+    static let historySettle: TimeInterval = 0.6
+
+    /// Call when a new gesture starts (slider grab, handle drag…): closes off the previous
+    /// change as its own history step so two gestures never merge.
     func checkpoint() {
-        guard let photo = current else { return }
-        if undoOwner != photo.url { undoStack = []; redoStack = []; undoOwner = photo.url }
-        if undoStack.last != photo.adjustments { undoStack.append(photo.adjustments) }
-        if undoStack.count > 200 { undoStack.removeFirst() }
-        redoStack = []
+        if let photo = current { commitPending(photo) }
     }
 
     func edit(_ change: (inout Adjustments) -> Void) {
@@ -486,6 +556,7 @@ final class LibraryStore {
         guard a != photo.adjustments else { return }
         photo.adjustments = a
         scheduleSave(photo)
+        scheduleCommit(photo)
     }
 
     /// Binding-friendly accessor for a single slider value.
@@ -497,26 +568,133 @@ final class LibraryStore {
         edit { $0[keyPath: keyPath] = value }
     }
 
-    var canUndo: Bool { undoOwner == currentID && !undoStack.isEmpty }
-    var canRedo: Bool { undoOwner == currentID && !redoStack.isEmpty }
+    private func scheduleCommit(_ photo: Photo) {
+        pendingCommits[photo.url]?.cancel()
+        let work = DispatchWorkItem { [weak self, weak photo] in
+            guard let self, let photo else { return }
+            MainActor.assumeIsolated { self.commitPending(photo) }
+        }
+        pendingCommits[photo.url] = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.historySettle, execute: work)
+    }
 
-    func undo() {
-        guard let photo = current, canUndo, let previous = undoStack.popLast() else { return }
-        redoStack.append(photo.adjustments)
-        photo.adjustments = previous
+    /// Turns any not-yet-recorded change into a history step now.
+    func commitPending(_ photo: Photo) {
+        pendingCommits[photo.url]?.cancel()
+        pendingCommits[photo.url] = nil
+        recordStep(photo)
+    }
+
+    func commitAllPending() {
+        for p in photos where pendingCommits[p.url] != nil { commitPending(p) }
+    }
+
+    /// Adds a step for the photo's current state if it differs from the current step.
+    /// Steps after the current one (struck out in the panel) are trimmed: this is where you "cull down".
+    func recordStep(_ photo: Photo, label: String? = nil) {
+        let index = min(photo.historyIndex, photo.history.count - 1)
+        let previous = photo.history.indices.contains(index) ? photo.history[index].adjustments : Adjustments()
+        guard photo.adjustments != previous else { return }
+        var history = Array(photo.history.prefix(index + 1))
+        history.append(HistoryStep(label: label ?? HistoryLabel.describe(from: previous, to: photo.adjustments),
+                                   adjustments: photo.adjustments))
+        if history.count > Self.historyLimit {
+            // Keep the first step (the original) and the most recent ones.
+            history = [history[0]] + history.suffix(Self.historyLimit - 1)
+        }
+        photo.history = history
+        photo.historyIndex = history.count - 1
         scheduleSave(photo)
     }
 
+    /// Sets a photo's edits as one labelled step (paste, presets, snapshots, reset).
+    private func applyStep(_ photo: Photo, _ adjustments: Adjustments, label: String) {
+        commitPending(photo)
+        photo.adjustments = adjustments
+        recordStep(photo, label: label)
+        scheduleSave(photo)
+    }
+
+    /// Jump to a history step. Later steps stay visible (and redoable) until the next edit.
+    func jumpToStep(_ index: Int) {
+        guard let photo = current else { return }
+        commitPending(photo)
+        guard photo.history.indices.contains(index) else { return }
+        photo.historyIndex = index
+        photo.adjustments = photo.history[index].adjustments
+        scheduleSave(photo)
+    }
+
+    /// Drops the steps after the current one right away.
+    func trimHistoryAfterCurrent() {
+        guard let photo = current else { return }
+        commitPending(photo)
+        photo.history = Array(photo.history.prefix(photo.historyIndex + 1))
+        scheduleSave(photo)
+    }
+
+    /// Forgets the history, keeping the current edits as the new starting point.
+    func clearHistory() {
+        guard let photo = current else { return }
+        commitPending(photo)
+        photo.history = [HistoryStep(label: "History cleared", adjustments: photo.adjustments)]
+        photo.historyIndex = 0
+        scheduleSave(photo)
+    }
+
+    var canUndo: Bool {
+        guard let p = current else { return false }
+        return p.historyIndex > 0 || pendingCommits[p.url] != nil
+    }
+    var canRedo: Bool {
+        guard let p = current else { return false }
+        return p.historyIndex < p.history.count - 1
+    }
+
+    func undo() {
+        guard let photo = current else { return }
+        commitPending(photo)
+        guard photo.historyIndex > 0 else { return }
+        jumpToStep(photo.historyIndex - 1)
+    }
+
     func redo() {
-        guard let photo = current, canRedo, let next = redoStack.popLast() else { return }
-        undoStack.append(photo.adjustments)
-        photo.adjustments = next
+        guard let photo = current, canRedo else { return }
+        jumpToStep(photo.historyIndex + 1)
+    }
+
+    // MARK: Snapshots
+
+    func saveSnapshot(named name: String) {
+        guard let photo = current else { return }
+        let trimmed = name.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return }
+        commitPending(photo)
+        photo.snapshots.append(EditSnapshot(name: trimmed, adjustments: photo.adjustments))
+        scheduleSave(photo)
+    }
+
+    func applySnapshot(_ snapshot: EditSnapshot) {
+        guard let photo = current else { return }
+        applyStep(photo, snapshot.adjustments, label: "Snapshot: \(snapshot.name)")
+    }
+
+    func renameSnapshot(_ id: UUID, to name: String) {
+        guard let photo = current, let i = photo.snapshots.firstIndex(where: { $0.id == id }) else { return }
+        let trimmed = name.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return }
+        photo.snapshots[i].name = trimmed
+        scheduleSave(photo)
+    }
+
+    func deleteSnapshot(_ id: UUID) {
+        guard let photo = current else { return }
+        photo.snapshots.removeAll { $0.id == id }
         scheduleSave(photo)
     }
 
     func resetAdjustments() {
-        checkpoint()
-        for p in targets { p.adjustments = Adjustments(); scheduleSave(p) }
+        for p in targets { applyStep(p, Adjustments(), label: "Reset all") }
     }
 
     func resetSection(_ apply: (inout Adjustments) -> Void) {
@@ -542,6 +720,54 @@ final class LibraryStore {
         panelTab = .detailed
         activeMaskID = mask.id
         flashOverlay()
+    }
+
+    /// Click on the photo with a subject mask: include or exclude the subject under the pointer.
+    func toggleSubject(at p: NormPoint) {
+        guard let mask = activeMask, mask.kind == .subject, let url = currentID,
+              let count = SubjectDetector.shared.subjectCount(url), count > 0,
+              let hit = SubjectDetector.shared.subject(at: p, url: url) else { return }
+        setSubject(hit, included: !(mask.subjects ?? Array(1...count)).contains(hit), count: count)
+    }
+
+    func setSubject(_ n: Int, included: Bool, count: Int) {
+        guard let mask = activeMask else { return }
+        var set = Set(mask.subjects ?? Array(1...count))
+        if included { set.insert(n) } else { set.remove(n) }
+        checkpoint()
+        editMask { $0.subjects = set.count == count ? nil : set.sorted() }
+    }
+
+    /// Adds a linear or radial shape to the active mask and selects it.
+    @discardableResult
+    func addShape(_ kind: ShapeKind, mode: CombineMode = .add, configure: ((inout MaskShape) -> Void)? = nil) -> UUID? {
+        guard activeMask != nil else { return nil }
+        var shape = MaskShape(kind: kind, mode: mode)
+        if kind == .linear {
+            shape.start = NormPoint(x: 0.5, y: 0.85)
+            shape.end = NormPoint(x: 0.5, y: 0.55)
+        } else {
+            shape.radiusX = 0.18; shape.radiusY = 0.18
+        }
+        configure?(&shape)
+        checkpoint()
+        editMask { $0.shapes.append(shape) }
+        activeShapeID = shape.id
+        refineMode = nil
+        return shape.id
+    }
+
+    func deleteShape(_ id: UUID) {
+        checkpoint()
+        editMask { $0.shapes.removeAll { $0.id == id } }
+        if activeShapeID == id { activeShapeID = nil }
+    }
+
+    func setShapeMode(_ id: UUID, _ mode: CombineMode) {
+        checkpoint()
+        editMask { m in
+            if let i = m.shapes.firstIndex(where: { $0.id == id }) { m.shapes[i].mode = mode }
+        }
     }
 
     func deleteMask(_ id: UUID) {
@@ -596,19 +822,11 @@ final class LibraryStore {
 
     func pasteSettings() {
         guard let clipboard else { return }
-        checkpoint()
-        for p in targets {
-            p.adjustments = clipboard.withCrop(from: p.adjustments)
-            scheduleSave(p)
-        }
+        for p in targets { applyStep(p, clipboard.withCrop(from: p.adjustments), label: "Paste settings") }
     }
 
     func apply(_ preset: Preset) {
-        checkpoint()
-        for p in targets {
-            p.adjustments = preset.adjustments.asPreset(onto: p.adjustments)
-            scheduleSave(p)
-        }
+        for p in targets { applyStep(p, preset.adjustments.asPreset(onto: p.adjustments), label: "Preset: \(preset.name)") }
     }
 
     func saveCurrentAsPreset(named name: String) {

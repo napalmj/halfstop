@@ -19,6 +19,8 @@ enum GeometryMode {
 final class ImageSource {
     let url: URL
     let isRAW: Bool
+    /// A stand-in decoded from the thumbnail; its geometry may not match the real photo.
+    let isProxy: Bool
     private let raw: CIRAWFilter?
     private let base: CIImage?
     private let asShotTemperature: Float
@@ -41,6 +43,7 @@ final class ImageSource {
             self.raw = raw
             self.base = nil
             self.isRAW = true
+            self.isProxy = false
             self.asShotTemperature = raw.neutralTemperature
             self.asShotTint = raw.neutralTint
             self.defaultNoiseReduction = raw.luminanceNoiseReductionAmount
@@ -58,6 +61,7 @@ final class ImageSource {
             self.raw = nil
             self.base = normalized
             self.isRAW = false
+            self.isProxy = false
             self.asShotTemperature = 6500
             self.asShotTint = 0
             self.defaultNoiseReduction = 0
@@ -71,6 +75,7 @@ final class ImageSource {
         self.raw = nil
         self.base = CIImage(cgImage: image)
         self.isRAW = false
+        self.isProxy = true
         self.asShotTemperature = 6500
         self.asShotTint = 0
         self.defaultNoiseReduction = 0
@@ -161,8 +166,8 @@ final class ImageSource {
             let needsApply = !mask.local.isNeutral
             let wantsOverlay = mask.id == overlayMask
             guard needsApply || wantsOverlay else { continue }
-            if exporting && mask.kind == .subject { _ = SubjectDetector.shared.maskSync(for: url, size: extent.size) }
-            guard let m = MaskRenderer.image(for: mask, size: extent.size, url: url, base: img) else { continue }
+            guard let m = MaskRenderer.image(for: mask, size: extent.size, url: url, base: img,
+                                             canDetect: !isProxy, exporting: exporting) else { continue }
             if needsApply {
                 let local = ImageSource.applyLocal(mask.local, to: img, longEdge: longEdge)
                 img = local.applyingFilter("CIBlendWithMask", parameters: [

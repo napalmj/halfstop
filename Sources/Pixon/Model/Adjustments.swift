@@ -155,6 +155,17 @@ struct LocalAdjustments: Codable, Hashable {
     var saturation: Double = 0
 
     var isNeutral: Bool { self == LocalAdjustments() }
+
+    init() {}
+
+    // Tolerant decoding: a missing field keeps its default instead of dropping the whole set.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        func v(_ key: CodingKeys) -> Double { (try? c.decodeIfPresent(Double.self, forKey: key)) ?? 0 }
+        exposure = v(.exposure); contrast = v(.contrast); highlights = v(.highlights); shadows = v(.shadows)
+        whites = v(.whites); blacks = v(.blacks); temperature = v(.temperature); tint = v(.tint)
+        vibrance = v(.vibrance); saturation = v(.saturation)
+    }
 }
 
 enum MaskKind: String, Codable, CaseIterable, Identifiable {
@@ -187,6 +198,35 @@ struct BrushStroke: Codable, Hashable {
     var erase = false
 }
 
+enum ShapeKind: String, Codable { case linear, radial }
+
+enum CombineMode: String, Codable, CaseIterable, Identifiable {
+    case add, subtract, intersect
+    var id: String { rawValue }
+    var label: String { rawValue.capitalized }
+    var symbol: String {
+        switch self {
+        case .add: "plus.circle"
+        case .subtract: "minus.circle"
+        case .intersect: "circle.circle"
+        }
+    }
+}
+
+/// A gradient shape. Masks keep their own (first) shape in their fields, plus any number of
+/// extra shapes combined into the mask with a mode.
+struct MaskShape: Codable, Hashable, Identifiable {
+    var id = UUID()
+    var kind: ShapeKind
+    var mode: CombineMode = .add
+    var center = NormPoint(x: 0.5, y: 0.5)
+    var radiusX = 0.25
+    var radiusY = 0.25
+    var feather = 0.5
+    var start = NormPoint(x: 0.5, y: 0.25)
+    var end = NormPoint(x: 0.5, y: 0.6)
+}
+
 /// A local adjustment area. Geometry is normalized (top-left origin) to the oriented,
 /// uncropped image, so crops never move masks.
 struct Mask: Codable, Hashable, Identifiable {
@@ -203,10 +243,84 @@ struct Mask: Codable, Hashable, Identifiable {
     // Linear: fully applied at `start`, fading to nothing at `end`.
     var start = NormPoint(x: 0.5, y: 0.25)
     var end = NormPoint(x: 0.5, y: 0.6)
-    // Brush
+    /// Brush masks: the mask itself. Other kinds: add/subtract refinements painted on top.
     var strokes: [BrushStroke] = []
+    /// Extra linear/radial shapes combined into this mask, in order.
+    var shapes: [MaskShape] = []
+    // Subject: which detected subjects to include (1-based); nil = all of them.
+    var subjects: [Int]?
+    // Automatic masks: expand (+) or shrink (-) the edge, -100...100; and soften it, 0...100.
+    var grow: Double = 0
+    var softness: Double = 0
 
     var local = LocalAdjustments()
+
+    init(name: String, kind: MaskKind) {
+        self.name = name
+        self.kind = kind
+    }
+
+    /// Everything that shapes the mask (not what it does), for caching.
+    var shapeKey: Int {
+        var h = Hasher()
+        h.combine(kind); h.combine(invert); h.combine(center); h.combine(radiusX); h.combine(radiusY)
+        h.combine(feather); h.combine(start); h.combine(end); h.combine(strokes); h.combine(subjects)
+        h.combine(grow); h.combine(softness); h.combine(shapes)
+        return h.finalize()
+    }
+
+    /// The mask's own shape (only for linear and radial masks).
+    var mainShape: MaskShape? {
+        let k: ShapeKind
+        switch kind {
+        case .linear: k = .linear
+        case .radial: k = .radial
+        default: return nil
+        }
+        return MaskShape(id: id, kind: k, center: center, radiusX: radiusX, radiusY: radiusY, feather: feather, start: start, end: end)
+    }
+
+    /// The shape with this id: the mask's own (id == mask id) or one of the extras.
+    func shape(_ shapeID: UUID?) -> MaskShape? {
+        guard let shapeID, shapeID != id else { return mainShape }
+        return shapes.first { $0.id == shapeID }
+    }
+
+    mutating func editShape(_ shapeID: UUID?, _ change: (inout MaskShape) -> Void) {
+        if let shapeID, shapeID != id {
+            guard let i = shapes.firstIndex(where: { $0.id == shapeID }) else { return }
+            change(&shapes[i])
+        } else if var s = mainShape {
+            change(&s)
+            center = s.center; radiusX = s.radiusX; radiusY = s.radiusY; feather = s.feather; start = s.start; end = s.end
+        }
+    }
+
+    // Tolerant decoding: older sidecars lack the newer fields.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let d = Mask(name: "", kind: .radial)
+        func v<T: Decodable>(_ key: CodingKeys, _ fallback: T) -> T {
+            (try? c.decodeIfPresent(T.self, forKey: key)) ?? fallback
+        }
+        id = v(.id, UUID())
+        name = v(.name, "Mask")
+        kind = v(.kind, .radial)
+        enabled = v(.enabled, d.enabled)
+        invert = v(.invert, d.invert)
+        center = v(.center, d.center)
+        radiusX = v(.radiusX, d.radiusX)
+        radiusY = v(.radiusY, d.radiusY)
+        feather = v(.feather, d.feather)
+        start = v(.start, d.start)
+        end = v(.end, d.end)
+        strokes = v(.strokes, d.strokes)
+        shapes = v(.shapes, d.shapes)
+        subjects = try? c.decodeIfPresent([Int].self, forKey: .subjects)
+        grow = v(.grow, d.grow)
+        softness = v(.softness, d.softness)
+        local = v(.local, d.local)
+    }
 }
 
 /// Every non-destructive edit applied to a photo. Ranges are Lightroom-like.

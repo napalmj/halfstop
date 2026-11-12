@@ -122,6 +122,7 @@ enum KeyHandler {
             return false
         case 53:                                                                      // esc
             if store.isCropping { store.isCropping = false }
+            else if store.refineMode != nil { store.refineMode = nil }
             else if store.activeMaskID != nil { store.activeMaskID = nil }
             else if store.showBefore { store.showBefore = false }
             else if store.mode == .edit { store.mode = .library }
@@ -161,6 +162,10 @@ struct PixonCommands: Commands {
             Button("Import Photos…") { store.showImportSheet() }
                 .keyboardShortcut("i")
         }
+        CommandGroup(replacing: .saveItem) {
+            Button("Save") { store.saveNow() }
+                .keyboardShortcut("s")
+        }
         CommandGroup(after: .newItem) {
             Button("Export…") { store.showExport = true }
                 .keyboardShortcut("e", modifiers: [.command, .shift])
@@ -184,7 +189,9 @@ struct PixonCommands: Commands {
             Button("Add to Target Collection") { store.addSelectionToTarget() }
                 .disabled(store.targetCollection == nil)
             Divider()
-            Button("Show or Hide Sidebar") { store.showSidebar.toggle() }
+            Button("Show or Hide Sidebar / History") {
+                if store.mode == .library { store.showSidebar.toggle() } else { store.showHistory.toggle() }
+            }
                 .keyboardShortcut("s", modifiers: [.command, .shift])
             Button("Library") { store.mode = .library }
             Button("Edit") { store.mode = .edit }

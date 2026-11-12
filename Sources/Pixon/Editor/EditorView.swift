@@ -5,6 +5,10 @@ struct EditorView: View {
 
     var body: some View {
         HStack(spacing: 0) {
+            if store.showHistory {
+                HistoryPanel()
+                Rectangle().fill(Theme.hairline).frame(width: 1)
+            }
             VStack(spacing: 0) {
                 PreviewArea()
                 Rectangle().fill(Theme.hairline).frame(height: 1)
@@ -144,12 +148,22 @@ struct MaskOverlay: View {
     let mask: Mask
     let imageRect: CGRect
 
-    private enum Drag { case center, radiusX, radiusY, start, end, newGradient, paint }
+    private enum Drag: Equatable {
+        case center(UUID), radiusX(UUID), radiusY(UUID), start(UUID), end(UUID)
+        case redefine(UUID), newShape(UUID), paint, pickSubject
+    }
+
+    /// Brush masks always paint; other masks paint while Add/Subtract is on.
+    private var painting: Bool { mask.kind == .brush || store.refineMode != nil }
     @State private var drag: Drag?
     @State private var dragStart: CGPoint?
     @State private var hover: CGPoint?
     /// Resets even when SwiftUI cancels a gesture without calling onEnded.
     @GestureState private var gestureActive = false
+
+    private var allShapes: [MaskShape] { (mask.mainShape.map { [$0] } ?? []) + mask.shapes }
+    /// The shape the handles edit: the selected extra shape, else the mask's own.
+    private var activeShape: MaskShape? { mask.shape(store.activeShapeID) }
 
     private func view(_ p: NormPoint) -> CGPoint {
         CGPoint(x: imageRect.minX + p.x * imageRect.width, y: imageRect.minY + p.y * imageRect.height)
@@ -165,7 +179,7 @@ struct MaskOverlay: View {
         ZStack {
             Canvas { ctx, _ in draw(&ctx) }
                 .allowsHitTesting(false)
-            if mask.kind.isAutomatic {
+            if mask.kind == .sky && mask.shapes.isEmpty && !painting && !NSEvent.modifierFlags.contains(.shift) {
                 Color.clear
             } else {
                 Color.clear
@@ -184,22 +198,43 @@ struct MaskOverlay: View {
         }
     }
 
+    // MARK: Drawing
+
     private func draw(_ ctx: inout GraphicsContext) {
-        let white = Color.white.opacity(0.9)
-        switch mask.kind {
+        let activeID = activeShape?.id
+        // Inactive shapes first, faint and without handles; the active one on top.
+        for shape in allShapes where shape.id != activeID { drawShape(&ctx, shape, active: false) }
+        if let active = activeShape { drawShape(&ctx, active, active: !painting) }
+        if painting, let hover {
+            let white = Color.white.opacity(0.9)
+            let r = store.brushSize * longEdge
+            ctx.stroke(Path(ellipseIn: CGRect(x: hover.x - r, y: hover.y - r, width: r * 2, height: r * 2)), with: .color(white), lineWidth: 1)
+            let ri = r * (1 - store.brushFeather)
+            if ri > 1 {
+                ctx.stroke(Path(ellipseIn: CGRect(x: hover.x - ri, y: hover.y - ri, width: ri * 2, height: ri * 2)),
+                           with: .color(white.opacity(0.4)), lineWidth: 1)
+            }
+        }
+    }
+
+    private func drawShape(_ ctx: inout GraphicsContext, _ shape: MaskShape, active: Bool) {
+        let alpha = active ? 0.9 : 0.35
+        let white = Color.white.opacity(alpha)
+        switch shape.kind {
         case .radial:
-            let c = view(mask.center)
-            let rx = mask.radiusX * imageRect.width, ry = mask.radiusY * imageRect.height
-            let outer = CGRect(x: c.x - rx, y: c.y - ry, width: rx * 2, height: ry * 2)
-            ctx.stroke(Path(ellipseIn: outer), with: .color(white), lineWidth: 1.2)
-            let k = 1 - mask.feather
-            let inner = CGRect(x: c.x - rx * k, y: c.y - ry * k, width: rx * k * 2, height: ry * k * 2)
-            ctx.stroke(Path(ellipseIn: inner), with: .color(white.opacity(0.5)), style: StrokeStyle(lineWidth: 1, dash: [4, 4]))
-            dot(&ctx, c, 5)
-            dot(&ctx, CGPoint(x: c.x + rx, y: c.y), 4)
-            dot(&ctx, CGPoint(x: c.x, y: c.y - ry), 4)
+            let c = view(shape.center)
+            let rx = shape.radiusX * imageRect.width, ry = shape.radiusY * imageRect.height
+            ctx.stroke(Path(ellipseIn: CGRect(x: c.x - rx, y: c.y - ry, width: rx * 2, height: ry * 2)), with: .color(white), lineWidth: 1.2)
+            let k = 1 - shape.feather
+            ctx.stroke(Path(ellipseIn: CGRect(x: c.x - rx * k, y: c.y - ry * k, width: rx * k * 2, height: ry * k * 2)),
+                       with: .color(white.opacity(0.5)), style: StrokeStyle(lineWidth: 1, dash: [4, 4]))
+            if active {
+                dot(&ctx, c, 5)
+                dot(&ctx, CGPoint(x: c.x + rx, y: c.y), 4)
+                dot(&ctx, CGPoint(x: c.x, y: c.y - ry), 4)
+            }
         case .linear:
-            let s = view(mask.start), e = view(mask.end)
+            let s = view(shape.start), e = view(shape.end)
             let dx = e.x - s.x, dy = e.y - s.y
             let len = max(hypot(dx, dy), 1)
             let px = -dy / len * 4000, py = dx / len * 4000
@@ -207,24 +242,14 @@ struct MaskOverlay: View {
                 var path = Path()
                 path.move(to: CGPoint(x: p.x - px, y: p.y - py))
                 path.addLine(to: CGPoint(x: p.x + px, y: p.y + py))
-                ctx.stroke(path, with: .color(white.opacity(solid ? 0.9 : 0.5)),
-                           style: StrokeStyle(lineWidth: 1, dash: solid ? [] : [5, 4]))
+                ctx.stroke(path, with: .color(white.opacity(solid ? 1 : 0.55)), style: StrokeStyle(lineWidth: 1, dash: solid ? [] : [5, 4]))
             }
-            dot(&ctx, s, 5)
-            dot(&ctx, e, 4)
-        case .brush:
-            if let hover {
-                let r = store.brushSize * longEdge
-                ctx.stroke(Path(ellipseIn: CGRect(x: hover.x - r, y: hover.y - r, width: r * 2, height: r * 2)),
-                           with: .color(white), lineWidth: 1)
-                let ri = r * (1 - store.brushFeather)
-                if ri > 1 {
-                    ctx.stroke(Path(ellipseIn: CGRect(x: hover.x - ri, y: hover.y - ri, width: ri * 2, height: ri * 2)),
-                               with: .color(white.opacity(0.4)), lineWidth: 1)
-                }
+            if active {
+                dot(&ctx, s, 5)
+                dot(&ctx, e, 4)
+            } else {
+                ctx.fill(Path(ellipseIn: CGRect(x: s.x - 3, y: s.y - 3, width: 6, height: 6)), with: .color(white))
             }
-        case .subject, .sky:
-            break
         }
     }
 
@@ -234,69 +259,112 @@ struct MaskOverlay: View {
         ctx.stroke(Path(ellipseIn: rect), with: .color(.black.opacity(0.4)), lineWidth: 1)
     }
 
+    // MARK: Interaction
+
+    private func edit(_ shapeID: UUID, _ change: @escaping (inout MaskShape) -> Void) {
+        store.editMask(mask.id) { $0.editShape(shapeID, change) }
+    }
+
     private func changed(_ g: DragGesture.Value) {
         hover = g.location
         // A new start location means a new gesture, even if the last one never reported its end.
         if drag == nil || dragStart != g.startLocation {
             dragStart = g.startLocation
-            drag = pick(g.startLocation)
             store.maskInteracting = true
-            store.checkpoint()
+            let picked = pick(g.startLocation, shift: NSEvent.modifierFlags.contains(.shift))
+            if case .newShape = picked {
+                // addShape records its own undo step.
+            } else {
+                store.checkpoint()
+            }
+            drag = picked
             if drag == .paint {
+                let option = NSEvent.modifierFlags.contains(.option)
+                let erase = mask.kind == .brush ? (store.brushErase || option) : ((store.refineMode == .subtract) != option)
                 let stroke = BrushStroke(points: [norm(g.startLocation)], radius: store.brushSize, feather: store.brushFeather,
-                                         flow: store.brushFlow, erase: store.brushErase || NSEvent.modifierFlags.contains(.option))
+                                         flow: store.brushFlow, erase: erase)
                 store.editMask(mask.id) { $0.strokes.append(stroke) }
                 return
             }
         }
         let p = norm(g.location)
+        let s = norm(g.startLocation)
+        let moved = hypot(g.translation.width, g.translation.height) > 4
         switch drag {
-        case .center:
-            store.editMask(mask.id) { $0.center = p }
-        case .radiusX:
-            store.editMask(mask.id) { $0.radiusX = max(0.01, abs(p.x - $0.center.x)) }
-        case .radiusY:
-            store.editMask(mask.id) { $0.radiusY = max(0.01, abs(p.y - $0.center.y)) }
-        case .start:
-            store.editMask(mask.id) { $0.start = p }
-        case .end:
-            store.editMask(mask.id) { $0.end = p }
-        case .newGradient:
-            let s = norm(g.startLocation)
-            if hypot(g.translation.width, g.translation.height) > 4 {
-                store.editMask(mask.id) { $0.start = s; $0.end = p }
+        case .center(let id): edit(id) { $0.center = p }
+        case .radiusX(let id): edit(id) { $0.radiusX = max(0.01, abs(p.x - $0.center.x)) }
+        case .radiusY(let id): edit(id) { $0.radiusY = max(0.01, abs(p.y - $0.center.y)) }
+        case .start(let id): edit(id) { $0.start = p }
+        case .end(let id): edit(id) { $0.end = p }
+        case .redefine(let id), .newShape(let id):
+            guard moved else { break }
+            edit(id) { shape in
+                if shape.kind == .linear {
+                    shape.start = s; shape.end = p
+                } else {
+                    shape.center = s
+                    shape.radiusX = max(0.01, abs(p.x - s.x)); shape.radiusY = max(0.01, abs(p.y - s.y))
+                }
             }
+        case .pickSubject, nil:
+            break
         case .paint:
             store.editMask(mask.id) { m in
                 guard !m.strokes.isEmpty else { return }
                 m.strokes[m.strokes.count - 1].points.append(p)
             }
-        case nil:
-            break
         }
     }
 
     private func endDrag() {
+        if drag == .pickSubject, let start = dragStart, let hover, hypot(hover.x - start.x, hover.y - start.y) < 5 {
+            store.toggleSubject(at: norm(start))
+        }
         drag = nil
         dragStart = nil
         store.maskInteracting = false
     }
 
-    private func pick(_ loc: CGPoint) -> Drag {
+    private func pick(_ loc: CGPoint, shift: Bool) -> Drag? {
+        if painting { return .paint }
         let near: (CGPoint) -> Bool = { hypot($0.x - loc.x, $0.y - loc.y) < 14 }
-        switch mask.kind {
-        case .radial:
-            let c = view(mask.center)
-            if near(CGPoint(x: c.x + mask.radiusX * imageRect.width, y: c.y)) { return .radiusX }
-            if near(CGPoint(x: c.x, y: c.y - mask.radiusY * imageRect.height)) { return .radiusY }
-            return .center
-        case .linear:
-            if near(view(mask.start)) { return .start }
-            if near(view(mask.end)) { return .end }
-            return .newGradient
-        default:
-            return .paint
+
+        // ⇧-drag: start a new shape (same kind as the one being edited, else linear).
+        if shift {
+            let kind = activeShape?.kind ?? .linear
+            let start = norm(loc)
+            if let id = store.addShape(kind, configure: { shape in
+                shape.start = start; shape.end = start
+                shape.center = start; shape.radiusX = 0.01; shape.radiusY = 0.01
+            }) {
+                return .newShape(id)
+            }
         }
+
+        // Handles: the active shape first, then any other shape (which also selects it).
+        let ordered = (activeShape.map { [$0] } ?? []) + allShapes.filter { $0.id != activeShape?.id }
+        for shape in ordered {
+            var hit: Drag?
+            switch shape.kind {
+            case .radial:
+                let c = view(shape.center)
+                if near(CGPoint(x: c.x + shape.radiusX * imageRect.width, y: c.y)) { hit = .radiusX(shape.id) }
+                else if near(CGPoint(x: c.x, y: c.y - shape.radiusY * imageRect.height)) { hit = .radiusY(shape.id) }
+                else if near(c) { hit = .center(shape.id) }
+            case .linear:
+                if near(view(shape.start)) { hit = .start(shape.id) }
+                else if near(view(shape.end)) { hit = .end(shape.id) }
+            }
+            if let hit {
+                store.activeShapeID = shape.id == mask.id ? nil : shape.id
+                return hit
+            }
+        }
+
+        if mask.kind == .subject && store.activeShapeID == nil { return .pickSubject }
+        guard let active = activeShape else { return nil }
+        // Empty space: a linear is redrawn from here; a radial moves here.
+        return active.kind == .linear ? .redefine(active.id) : .center(active.id)
     }
 }
 
@@ -318,6 +386,9 @@ struct Filmstrip: View {
                                     .stroke(photo.url == store.currentID ? Theme.accent : .clear, lineWidth: 2)
                             )
                             .overlay(alignment: .bottomLeading) { StarsBadge(rating: photo.rating, size: 7) }
+                            .overlay(alignment: .topTrailing) {
+                                if !photo.adjustments.isDefault { EditedBadge(compact: true).padding(3) }
+                            }
                             .contentShape(Rectangle())
                             .onTapGesture { store.select(photo) }
                             .id(photo.url)
