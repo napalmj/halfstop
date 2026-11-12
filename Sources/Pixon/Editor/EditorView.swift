@@ -303,14 +303,26 @@ struct MaskOverlay: View {
         case .pickSubject, nil:
             break
         case .paint:
-            store.editMask(mask.id) { m in
-                guard !m.strokes.isEmpty else { return }
-                m.strokes[m.strokes.count - 1].points.append(p)
-            }
+            addPaintPoint(p, force: false)
+        }
+    }
+
+    /// Adds a point to the stroke being painted, skipping ones too close to the last to change
+    /// anything (dabs are spaced 0.2 × radius apart). Keeps strokes, history and sidecars small.
+    private func addPaintPoint(_ p: NormPoint, force: Bool) {
+        guard let stroke = store.activeMask?.strokes.last, let last = stroke.points.last else { return }
+        let dx = (p.x - last.x) * imageRect.width, dy = (p.y - last.y) * imageRect.height
+        let d = hypot(dx, dy)
+        guard d > 0, force || d >= stroke.radius * longEdge * 0.1 else { return }
+        store.editMask(mask.id) { m in
+            guard !m.strokes.isEmpty else { return }
+            m.strokes[m.strokes.count - 1].points.append(p)
         }
     }
 
     private func endDrag() {
+        // End the stroke exactly where the pointer stopped.
+        if drag == .paint, let hover { addPaintPoint(norm(hover), force: true) }
         if drag == .pickSubject, let start = dragStart, let hover, hypot(hover.x - start.x, hover.y - start.y) < 5 {
             store.toggleSubject(at: norm(start))
         }

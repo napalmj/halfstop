@@ -30,9 +30,12 @@ Image / Metal pipeline.
 
 Pixon never writes to the photo files themselves.
 
-- **Sidecars:** `<folder>/.pixon/<filename>.json` holds a photo's `Adjustments`, rating, flag and edit
-  history. Decoding is tolerant, so older sidecars still load when new fields are added. Keep it that way
-  when you add settings: give new fields defaults.
+- **Sidecars:** `<folder>/.pixon/<filename>.json` holds a photo's `Adjustments`, rating, flag and
+  snapshots, written ~0.5 s after any change. The edit history is in `<filename>.history.json`, written
+  only when the history changes, with each brush stroke stored once however many steps share it
+  (`Model/SidecarFiles.swift`). Sidecars from before the split (history inline) still load and move their
+  history out on the next save. Decoding is tolerant, so older sidecars still load when new fields are
+  added. Keep it that way when you add settings: give new fields defaults.
 - **Catalog:** `~/Library/Application Support/Pixon/catalog.json` lists imported folders and
   collections. A photo is identified by `PhotoRef` (folder identity plus relative path), so moving a
   folder only changes the folder's stored path. An unreadable catalog is copied aside rather than

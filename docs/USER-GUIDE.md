@@ -88,7 +88,7 @@ the `.pixon` folder too if you want to keep its edits.
 
 ## Where Pixon keeps things
 
-- Edits, ratings, flags and history: `<photo folder>/.pixon/<filename>.json`
+- Edits, ratings and flags: `<photo folder>/.pixon/<filename>.json`; edit history: `<filename>.history.json` next to it
 - Library index (folders, collections): `~/Library/Application Support/Pixon/catalog.json`
 - Presets: `~/Library/Application Support/Pixon/presets.json`
 

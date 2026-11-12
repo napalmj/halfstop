@@ -769,6 +769,8 @@ enum LibraryTest {
                 store.flushSaves()
                 let sidecar = LibraryStore.sidecarURL(for: doomed.url)
                 let hadSidecar = fm.fileExists(atPath: sidecar.path)
+                let historyFile = SidecarFiles.historyURL(for: doomed.url)
+                let hadHistory = fm.fileExists(atPath: historyFile.path)
                 if let c = store.catalog.collections.first { store.addToCollection(c.id, [doomed]) }
                 let before = store.photos.count
 
@@ -784,6 +786,7 @@ enum LibraryTest {
                 let failed = store.moveToTrash([doomed.url])
                 check("photo file moved to trash", failed.isEmpty && !fm.fileExists(atPath: doomed.url.path))
                 check("sidecar moved too", hadSidecar && !fm.fileExists(atPath: sidecar.path), "had \(hadSidecar)")
+                check("history file moved too", hadHistory && !fm.fileExists(atPath: historyFile.path), "had \(hadHistory)")
                 check("removed from library and collections", store.photos.count == before - 1
                       && !store.catalog.collections.contains { $0.members.contains(doomed.ref) }
                       && store.catalog.fingerprints[doomed.ref.key] == nil)
@@ -818,7 +821,85 @@ enum LibraryTest {
         } else {
             check("brush mask renders", false)
         }
+        await sidecarChecks(dir: dir.appendingPathComponent("sidecars"), check: check)
         print(ok ? "LIBRARY PASSED" : "LIBRARY FAILED")
         return ok
+    }
+}
+
+// MARK: - Sidecar files
+
+extension LibraryTest {
+    /// History lives in its own file with strokes pooled; older inline-history sidecars still load.
+    @MainActor
+    static func sidecarChecks(dir: URL, check: (String, Bool, String) -> Void) async {
+        let fm = FileManager.default
+        try? fm.removeItem(at: dir)
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        let photo = dir.appendingPathComponent("brushy.jpg")
+        if let img = SelfTest.scene(width: 300, height: 200, hue: 0.5, variant: 1) { SelfTest.write(img, to: photo) }
+
+        // A brush-heavy history: 60 steps, each adding a 150-point stroke to the same mask.
+        var a = Adjustments()
+        var mask = Mask(name: "Brush", kind: .brush)
+        mask.local.exposure = 0.5
+        var history = [HistoryStep(label: "Original", adjustments: a)]
+        for i in 0..<60 {
+            let y = Double(i) / 60
+            mask.strokes.append(BrushStroke(points: (0..<150).map { NormPoint(x: Double($0) / 150, y: y + 0.01 * sin(Double($0))) }, radius: 0.03))
+            a.masks = [mask]
+            history.append(HistoryStep(label: "Brush \(i)", adjustments: a))
+        }
+        var sidecar = Sidecar()
+        sidecar.rating = 3
+        sidecar.adjustments = a
+        sidecar.history = history
+        sidecar.historyIndex = history.count - 1
+
+        SidecarFiles.write(sidecar, for: photo, history: true)
+        let back = SidecarFiles.read(for: photo)
+        check("history round-trips", back?.history == history && back?.historyIndex == history.count - 1 && back?.rating == 3, "")
+        let mainSize = (try? fm.attributesOfItem(atPath: SidecarFiles.mainURL(for: photo).path)[.size] as? Int) ?? 0
+        let histSize = (try? fm.attributesOfItem(atPath: SidecarFiles.historyURL(for: photo).path)[.size] as? Int) ?? 0
+        let oldSize = (try? JSONEncoder().encode(sidecar).count) ?? 0
+        check("pooled history is small", histSize > 0 && histSize * 10 < oldSize, "\(histSize / 1024) KB vs \(oldSize / 1024) KB inline")
+        let mainJSON = (try? String(contentsOf: SidecarFiles.mainURL(for: photo), encoding: .utf8)) ?? ""
+        check("main sidecar has no history", !mainJSON.contains("\"history\""), "\(mainSize / 1024) KB")
+
+        // A rating change doesn't rewrite the history file.
+        var rated = sidecar
+        rated.rating = 5
+        rated.history = Array(history.prefix(2))
+        SidecarFiles.write(rated, for: photo, history: false)
+        let afterRating = SidecarFiles.read(for: photo)
+        check("rating save leaves history alone", afterRating?.rating == 5 && afterRating?.history.count == history.count, "")
+
+        // An older sidecar (history inline) loads, and moves its history out on the next save.
+        let legacy = dir.appendingPathComponent("legacy.jpg")
+        try? fm.copyItem(at: photo, to: legacy)
+        let encoder = JSONEncoder()
+        try? encoder.encode(sidecar).write(to: SidecarFiles.mainURL(for: legacy))
+        let legacyBack = SidecarFiles.read(for: legacy)
+        check("older inline-history sidecar loads", legacyBack?.history == history, "")
+        if var lb = legacyBack {
+            lb.rating = 1
+            SidecarFiles.write(lb, for: legacy, history: false)
+            let migrated = SidecarFiles.read(for: legacy)
+            check("older history moves to its own file", fm.fileExists(atPath: SidecarFiles.historyURL(for: legacy).path)
+                  && migrated?.history == history && migrated?.rating == 1, "")
+        }
+
+        // Renames carry both files.
+        let (done, errors) = LibraryStore.applyRenames(["brushy.jpg": "renamed.jpg"], in: dir.path)
+        let renamed = dir.appendingPathComponent("renamed.jpg")
+        check("rename moves both sidecar files", done.count == 1 && errors.isEmpty
+              && fm.fileExists(atPath: SidecarFiles.historyURL(for: renamed).path)
+              && !fm.fileExists(atPath: SidecarFiles.historyURL(for: photo).path)
+              && SidecarFiles.read(for: renamed)?.history.count == history.count, "")
+
+        // Nothing left to keep: both files go.
+        SidecarFiles.write(Sidecar(), for: renamed, history: true)
+        check("empty sidecar removes both files", !fm.fileExists(atPath: SidecarFiles.mainURL(for: renamed).path)
+              && !fm.fileExists(atPath: SidecarFiles.historyURL(for: renamed).path), "")
     }
 }

@@ -127,11 +127,10 @@ extension LibraryStore {
         if let preset = options.preset {
             let urls = newFiles.map { URL(fileURLWithPath: root).appendingPathComponent($0) }
             await Task.detached(priority: .userInitiated) {
-                let decoder = JSONDecoder()
                 for url in urls {
-                    var sidecar = (try? Data(contentsOf: LibraryStore.sidecarURL(for: url))).flatMap { try? decoder.decode(Sidecar.self, from: $0) } ?? Sidecar()
+                    var sidecar = SidecarFiles.read(for: url) ?? Sidecar()
                     sidecar.adjustments = preset.adjustments.asPreset(onto: sidecar.adjustments)
-                    LibraryStore.writeSidecar(sidecar, for: url)
+                    LibraryStore.writeSidecar(sidecar, for: url, history: false)
                 }
             }.value
         }
@@ -181,9 +180,9 @@ extension LibraryStore {
             }
             do {
                 try fm.moveItem(at: item.tmp, to: dest)
-                let oldSidecar = sidecarURL(for: URL(fileURLWithPath: root).appendingPathComponent(item.from))
-                if fm.fileExists(atPath: oldSidecar.path) {
-                    try? fm.moveItem(at: oldSidecar, to: sidecarURL(for: dest))
+                let old = URL(fileURLWithPath: root).appendingPathComponent(item.from)
+                for (from, to) in zip(SidecarFiles.all(for: old), SidecarFiles.all(for: dest)) where fm.fileExists(atPath: from.path) {
+                    try? fm.moveItem(at: from, to: to)
                 }
                 done.append(RenameRecord(from: item.from, to: to))
             } catch {

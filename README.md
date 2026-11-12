@@ -100,7 +100,7 @@ Press **⌘?** (Help ▸ Pixon Help) for a searchable list of every shortcut. Mo
 | What | Where |
 | --- | --- |
 | Your photos | Wherever they already are. Pixon never copies them or changes their contents (export writes new files). |
-| Edits, ratings, flags, history | `<photo folder>/.pixon/<filename>.json`, a small JSON sidecar per photo |
+| Edits, ratings, flags, history | `<photo folder>/.pixon/<filename>.json` plus `<filename>.history.json`, small JSON sidecars per photo |
 | Library index (folders, collections) | `~/Library/Application Support/Pixon/catalog.json` |
 | Presets | `~/Library/Application Support/Pixon/presets.json` |
 

@@ -126,6 +126,8 @@ final class LibraryStore {
 
     @ObservationIgnored private var pendingSaves: [URL: DispatchWorkItem] = [:]
     @ObservationIgnored private var pendingTokens: [URL: UUID] = [:]
+    /// Photos whose history changed since their last save.
+    @ObservationIgnored private var historyDirty: Set<URL> = []
     /// Photos with edits not yet written to their sidecar (they save ~0.5 s after a change).
     private(set) var unsavedCount = 0
     private(set) var lastSaved: Date?
@@ -281,7 +283,6 @@ final class LibraryStore {
     }
 
     nonisolated static func scanCatalog(_ catalog: Catalog, known: Set<URL>) -> [ScannedPhoto] {
-        let decoder = JSONDecoder()
         var seen = Set<String>()
         var out: [ScannedPhoto] = []
         for folder in catalog.folders where folder.exists {
@@ -290,7 +291,7 @@ final class LibraryStore {
                 guard seen.insert(url.path).inserted else { continue }
                 var sidecar: Sidecar?
                 if !known.contains(url) {
-                    sidecar = (try? Data(contentsOf: sidecarURL(for: url))).flatMap { try? decoder.decode(Sidecar.self, from: $0) }
+                    sidecar = SidecarFiles.read(for: url)
                 }
                 out.append(ScannedPhoto(url: url, ref: PhotoRef(folder: folder.id, path: rel), sidecar: sidecar))
             }
@@ -298,11 +299,7 @@ final class LibraryStore {
         return out
     }
 
-    nonisolated static func sidecarURL(for photo: URL) -> URL {
-        photo.deletingLastPathComponent()
-            .appendingPathComponent(".pixon", isDirectory: true)
-            .appendingPathComponent(photo.lastPathComponent + ".json")
-    }
+    nonisolated static func sidecarURL(for photo: URL) -> URL { SidecarFiles.mainURL(for: photo) }
 
     /// Computes fingerprints for library photos that don't have one yet (in the background).
     @ObservationIgnored private var fingerprinting = false
@@ -432,13 +429,17 @@ final class LibraryStore {
 
     // MARK: - Persistence
 
-    func scheduleSave(_ photo: Photo) {
+    /// - Parameter history: the edit history changed too, so write its file (it's skipped otherwise).
+    ///   Sticks until a save goes through, so a later rating or slider save still includes it.
+    func scheduleSave(_ photo: Photo, history: Bool = false) {
         pendingSaves[photo.url]?.cancel()
         let sidecar = photo.sidecar
         let url = photo.url
+        if history { historyDirty.insert(url) }
+        let withHistory = historyDirty.contains(url)
         let token = UUID()
         let work = DispatchWorkItem { [weak self] in
-            LibraryStore.writeSidecar(sidecar, for: url)
+            LibraryStore.writeSidecar(sidecar, for: url, history: withHistory)
             DispatchQueue.main.async {
                 MainActor.assumeIsolated { self?.didWrite(url, token: token) }
             }
@@ -452,6 +453,7 @@ final class LibraryStore {
     private func didWrite(_ url: URL, token: UUID) {
         guard pendingTokens[url] == token else { return }
         pendingTokens[url] = nil
+        historyDirty.remove(url)
         pendingSaves[url] = nil
         unsavedCount = pendingSaves.count
         lastSaved = Date()
@@ -462,11 +464,12 @@ final class LibraryStore {
         for (url, work) in pendingSaves {
             work.cancel()
             if let photo = photoByURL[url] {
-                LibraryStore.writeSidecar(photo.sidecar, for: url)
+                LibraryStore.writeSidecar(photo.sidecar, for: url, history: historyDirty.contains(url))
             }
         }
         pendingSaves = [:]
         pendingTokens = [:]
+        historyDirty = []
         if unsavedCount != 0 { unsavedCount = 0; lastSaved = Date() }
     }
 
@@ -479,17 +482,8 @@ final class LibraryStore {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in self?.savedFlash = false }
     }
 
-    nonisolated static func writeSidecar(_ sidecar: Sidecar, for url: URL) {
-        let dest = sidecarURL(for: url)
-        let fm = FileManager.default
-        if sidecar.isEmpty {
-            try? fm.removeItem(at: dest)
-            return
-        }
-        try? fm.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        if let data = try? encoder.encode(sidecar) { try? data.write(to: dest, options: .atomic) }
+    nonisolated static func writeSidecar(_ sidecar: Sidecar, for url: URL, history: Bool) {
+        SidecarFiles.write(sidecar, for: url, history: history)
     }
 
     // MARK: - Navigation & selection
@@ -579,12 +573,11 @@ final class LibraryStore {
         let fm = FileManager.default
         for p in items {
             // Don't let a pending save or history step recreate the sidecar afterwards.
-            pendingSaves[p.url]?.cancel(); pendingSaves[p.url] = nil; pendingTokens[p.url] = nil
+            pendingSaves[p.url]?.cancel(); pendingSaves[p.url] = nil; pendingTokens[p.url] = nil; historyDirty.remove(p.url)
             pendingCommits[p.url]?.cancel(); pendingCommits[p.url] = nil
             do {
                 try Self.trashFile(p.url)
-                let sidecar = Self.sidecarURL(for: p.url)
-                if fm.fileExists(atPath: sidecar.path) { try? Self.trashFile(sidecar) }
+                for sidecar in SidecarFiles.all(for: p.url) where fm.fileExists(atPath: sidecar.path) { try? Self.trashFile(sidecar) }
                 moved.append(p)
             } catch {
                 failed.append(p.url.lastPathComponent)
@@ -693,7 +686,7 @@ final class LibraryStore {
         }
         photo.history = history
         photo.historyIndex = history.count - 1
-        scheduleSave(photo)
+        scheduleSave(photo, history: true)
     }
 
     /// Sets a photo's edits as one labelled step (paste, presets, snapshots, reset).
@@ -711,7 +704,7 @@ final class LibraryStore {
         guard photo.history.indices.contains(index) else { return }
         photo.historyIndex = index
         photo.adjustments = photo.history[index].adjustments
-        scheduleSave(photo)
+        scheduleSave(photo, history: true)
     }
 
     /// Drops the steps after the current one right away.
@@ -719,7 +712,7 @@ final class LibraryStore {
         guard let photo = current else { return }
         commitPending(photo)
         photo.history = Array(photo.history.prefix(photo.historyIndex + 1))
-        scheduleSave(photo)
+        scheduleSave(photo, history: true)
     }
 
     /// Forgets the history, keeping the current edits as the new starting point.
@@ -728,7 +721,7 @@ final class LibraryStore {
         commitPending(photo)
         photo.history = [HistoryStep(label: "History cleared", adjustments: photo.adjustments)]
         photo.historyIndex = 0
-        scheduleSave(photo)
+        scheduleSave(photo, history: true)
     }
 
     var canUndo: Bool {
