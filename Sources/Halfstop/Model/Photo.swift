@@ -11,6 +11,18 @@ struct HistoryStep: Codable, Identifiable, Hashable {
     var label: String
     var date = Date()
     var adjustments: Adjustments
+
+    init(id: UUID = UUID(), label: String, date: Date = Date(), adjustments: Adjustments) {
+        self.id = id; self.label = label; self.date = date; self.adjustments = adjustments
+    }
+
+    init(from decoder: Decoder) throws {
+        let t = try TolerantContainer(decoder, keyedBy: CodingKeys.self)
+        id = t.value(.id, UUID())
+        label = t.value(.label, "Edit")
+        date = t.value(.date, Date())
+        adjustments = try t.required(.adjustments)
+    }
 }
 
 /// A named version of a photo's edits that survives history being trimmed or cleared.
@@ -19,9 +31,21 @@ struct EditSnapshot: Codable, Identifiable, Hashable {
     var name: String
     var date = Date()
     var adjustments: Adjustments
+
+    init(id: UUID = UUID(), name: String, date: Date = Date(), adjustments: Adjustments) {
+        self.id = id; self.name = name; self.date = date; self.adjustments = adjustments
+    }
+
+    init(from decoder: Decoder) throws {
+        let t = try TolerantContainer(decoder, keyedBy: CodingKeys.self)
+        id = t.value(.id, UUID())
+        name = t.value(.name, "Snapshot")
+        date = t.value(.date, Date())
+        adjustments = try t.required(.adjustments)
+    }
 }
 
-/// What gets written to `<folder>/.pixon/<filename>.json`.
+/// What gets written to `<folder>/.halfstop/<filename>.json`.
 struct Sidecar: Codable {
     var version = 1
     var rating = 0
@@ -35,14 +59,14 @@ struct Sidecar: Codable {
     init() {}
 
     init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        version = (try? c.decodeIfPresent(Int.self, forKey: .version)) ?? 1
-        rating = (try? c.decodeIfPresent(Int.self, forKey: .rating)) ?? 0
-        flag = (try? c.decodeIfPresent(Flag.self, forKey: .flag)) ?? .none
-        adjustments = (try? c.decodeIfPresent(Adjustments.self, forKey: .adjustments)) ?? Adjustments()
-        history = (try? c.decodeIfPresent([HistoryStep].self, forKey: .history)) ?? []
-        historyIndex = (try? c.decodeIfPresent(Int.self, forKey: .historyIndex)) ?? 0
-        snapshots = (try? c.decodeIfPresent([EditSnapshot].self, forKey: .snapshots)) ?? []
+        let t = try TolerantContainer(decoder, keyedBy: CodingKeys.self)
+        version = t.value(.version, 1)
+        rating = t.value(.rating, 0)
+        flag = t.value(.flag, .none)
+        adjustments = t.value(.adjustments, Adjustments())
+        history = t.array(.history, default: [])
+        historyIndex = t.value(.historyIndex, 0)
+        snapshots = t.array(.snapshots, default: [])
     }
 
     /// Nothing worth keeping on disk.
@@ -116,6 +140,17 @@ struct Preset: Codable, Identifiable, Hashable {
     var id = UUID()
     var name: String
     var adjustments: Adjustments
+
+    init(id: UUID = UUID(), name: String, adjustments: Adjustments) {
+        self.id = id; self.name = name; self.adjustments = adjustments
+    }
+
+    init(from decoder: Decoder) throws {
+        let t = try TolerantContainer(decoder, keyedBy: CodingKeys.self)
+        id = t.value(.id, UUID())
+        name = t.value(.name, "Preset")
+        adjustments = try t.required(.adjustments)
+    }
 
     static func == (lhs: Preset, rhs: Preset) -> Bool { lhs.id == rhs.id }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }

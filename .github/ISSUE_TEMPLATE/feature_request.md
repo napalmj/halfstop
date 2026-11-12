@@ -13,4 +13,4 @@ Your proposed solution. A sketch or mockup helps for interface changes.
 **Alternatives you considered**
 
 **Anything else**
-Pixon aims for responsive sliders, an uncluttered interface and fast imports. Say how your idea fits that.
+Halfstop aims for responsive sliders, an uncluttered interface and fast imports. Say how your idea fits that.

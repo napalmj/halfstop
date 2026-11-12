@@ -74,6 +74,9 @@ private struct GridCell: View {
                 .overlay(alignment: .bottomTrailing) {
                     if !photo.adjustments.isDefault { EditedBadge().padding(12) }
                 }
+                .overlay(alignment: .topLeading) {
+                    if store.failedSaves[photo.url] != nil { UnsavedDot().padding(14) }
+                }
                 .opacity(photo.flag == .reject ? 0.35 : 1)
             Text(photo.name)
                 .font(.system(size: 10.5))
@@ -152,20 +155,49 @@ struct EditedBadge: View {
     }
 }
 
+/// Marks a photo whose edits couldn't be saved.
+struct UnsavedDot: View {
+    var body: some View {
+        Circle()
+            .fill(Theme.accent)
+            .frame(width: 8, height: 8)
+            .overlay(Circle().stroke(.black.opacity(0.5), lineWidth: 1))
+            .help("Edits to this photo aren’t saved")
+    }
+}
+
 /// "Saved" / "Saving…" in the top bar. Edits save automatically next to each photo.
+/// When saves fail, a warning that opens the details instead.
 private struct SaveStatus: View {
     @Environment(LibraryStore.self) private var store
 
     var body: some View {
-        let saving = store.unsavedCount > 0
-        HStack(spacing: 4) {
-            Image(systemName: saving ? "arrow.triangle.2.circlepath" : "checkmark.circle.fill")
-            Text(saving ? "Saving…" : "Saved")
+        @Bindable var store = store
+        if store.hasSaveProblems {
+            let photos = store.saveProblems.reduce(0) { $0 + $1.photoCount }
+            Button { store.showSaveProblems.toggle() } label: {
+                Label(photos > 0 ? "\(photos) photo\(photos == 1 ? "" : "s") not saved" : "Library not saved",
+                      systemImage: "exclamationmark.triangle.fill")
+                    .font(.system(size: 11.5, weight: .medium))
+                    .foregroundStyle(Theme.accent)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(Theme.accent.opacity(0.16), in: RoundedRectangle(cornerRadius: 6))
+            }
+            .buttonStyle(.plain)
+            .help("Some edits can’t be saved. Click for details.")
+            .popover(isPresented: $store.showSaveProblems, arrowEdge: .bottom) { SaveProblemsView() }
+        } else {
+            let saving = store.unsavedCount > 0
+            HStack(spacing: 4) {
+                Image(systemName: saving ? "arrow.triangle.2.circlepath" : "checkmark.circle.fill")
+                Text(saving ? "Saving…" : "Saved")
+            }
+            .font(.system(size: 11.5, weight: store.savedFlash ? .semibold : .regular))
+            .foregroundStyle(store.savedFlash ? Theme.accent : Theme.secondary)
+            .animation(.easeOut(duration: 0.2), value: store.savedFlash)
+            .help(helpText)
         }
-        .font(.system(size: 11.5, weight: store.savedFlash ? .semibold : .regular))
-        .foregroundStyle(store.savedFlash ? Theme.accent : Theme.secondary)
-        .animation(.easeOut(duration: 0.2), value: store.savedFlash)
-        .help(helpText)
     }
 
     private var helpText: String {
@@ -175,6 +207,52 @@ private struct SaveStatus: View {
             t += " Last saved \(f.localizedString(for: d, relativeTo: Date()))."
         }
         return t
+    }
+}
+
+/// Where edits can't be saved, and why.
+private struct SaveProblemsView: View {
+    @Environment(LibraryStore.self) private var store
+
+    var body: some View {
+        let problems = store.saveProblems
+        let photos = problems.reduce(0) { $0 + $1.photoCount }
+        VStack(alignment: .leading, spacing: 8) {
+            Text(photos > 0 ? "Edits to \(photos) photo\(photos == 1 ? "" : "s") aren’t saved" : "Your library isn’t saved")
+                .font(.system(size: 13, weight: .semibold))
+            Text("They’re kept while Halfstop is open and saved as soon as the folder can be written to. Halfstop tries again every 30 seconds and on every change.")
+                .font(.system(size: 11.5))
+                .foregroundStyle(Theme.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            ForEach(problems) { p in
+                Divider()
+                HStack(alignment: .center) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 4) {
+                            Text(p.title)
+                            if p.photoCount > 0 {
+                                Text("· \(p.photoCount) photo\(p.photoCount == 1 ? "" : "s")").foregroundStyle(Theme.secondary)
+                            }
+                        }
+                        .font(.system(size: 12))
+                        Text(p.reason).font(.system(size: 11)).foregroundStyle(Theme.secondary)
+                    }
+                    Spacer()
+                    if let folder = p.folder {
+                        Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([folder]) }
+                            .controlSize(.small)
+                    }
+                }
+            }
+            HStack {
+                Spacer()
+                Button("Try Again") { store.retryFailedSaves() }
+                    .keyboardShortcut(.defaultAction)
+            }
+            .padding(.top, 4)
+        }
+        .padding(14)
+        .frame(width: 360)
     }
 }
 
@@ -235,6 +313,20 @@ struct TopBar: View {
                         .controlSize(.mini)
                         .frame(width: 90)
                         .help("Thumbnail size")
+                }
+                if store.mode == .library {
+                    Menu {
+                        Picker("Sort by", selection: $store.sortOrder) {
+                            ForEach(SortOrder.allCases) { Text($0.label).tag($0) }
+                        }
+                        .pickerStyle(.inline)
+                        Toggle("Reverse order", isOn: $store.sortDescending)
+                    } label: {
+                        Label(store.sortOrder.label, systemImage: "arrow.up.arrow.down")
+                    }
+                    .menuStyle(.borderlessButton)
+                    .fixedSize()
+                    .help("Sort photos")
                 }
                 Menu {
                     Picker("Show", selection: $store.filter) {
@@ -372,7 +464,7 @@ struct WelcomeView: View {
             Text("Import your photos")
                 .font(.system(size: 18, weight: .medium))
                 .foregroundStyle(Theme.text)
-            Text("Photos stay where they are on disk. Edits are saved next to them in a hidden .pixon folder.")
+            Text("Photos stay where they are on disk. Edits are saved next to them in a hidden .halfstop folder.")
                 .font(.system(size: 12.5))
                 .foregroundStyle(Theme.secondary)
                 .multilineTextAlignment(.center)
@@ -423,6 +515,44 @@ struct SavePresetSheet: View {
     }
 }
 
+// MARK: - Selective paste
+
+struct SelectivePasteSheet: View {
+    @Environment(LibraryStore.self) private var store
+    @Environment(\.dismiss) private var dismiss
+    @State private var groups: Set<SettingsGroup> = []
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(store.targets.count > 1 ? "Paste onto \(store.targets.count) photos" : "Paste settings").font(.headline)
+            VStack(alignment: .leading, spacing: 6) {
+                ForEach(SettingsGroup.allCases) { g in
+                    Toggle(g.label, isOn: Binding(get: { groups.contains(g) }, set: { on in
+                        if on { groups.insert(g) } else { groups.remove(g) }
+                    }))
+                }
+            }
+            .font(.system(size: 12))
+            HStack {
+                Button("All") { groups = Set(SettingsGroup.allCases) }
+                Button("None") { groups = [] }
+                Spacer()
+                Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
+                Button("Paste") {
+                    store.pasteGroups = groups
+                    store.pasteSettings(groups)
+                    dismiss()
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(groups.isEmpty || store.clipboard == nil)
+            }
+        }
+        .padding(20)
+        .frame(width: 380)
+        .onAppear { groups = store.pasteGroups }
+    }
+}
+
 // MARK: - Export
 
 struct ExportSheet: View {
@@ -433,6 +563,7 @@ struct ExportSheet: View {
     @State private var done: [URL] = []
     @State private var errors: [String] = []
     @State private var targets: [(url: URL, adjustments: Adjustments)] = []
+    @State private var job: Task<Void, Never>?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -455,6 +586,10 @@ struct ExportSheet: View {
                     Text("Long edge 1080 px").tag(1080)
                 }
                 Toggle("Display P3 (wide color)", isOn: $settings.useDisplayP3)
+                Toggle("Keep camera info and capture date", isOn: $settings.keepMetadata)
+                if settings.keepMetadata {
+                    Toggle("Remove location", isOn: $settings.stripLocation)
+                }
                 LabeledContent("Folder") {
                     HStack {
                         Text(destination?.path(percentEncoded: false).replacingOccurrences(of: NSHomeDirectory(), with: "~") ?? "Choose…")
@@ -482,7 +617,10 @@ struct ExportSheet: View {
 
             HStack {
                 Spacer()
-                Button(progress == nil || progress! >= 1 ? "Close" : "Cancel") { dismiss() }
+                Button(progress == nil || progress! >= 1 ? "Close" : "Cancel") {
+                    job?.cancel()
+                    dismiss()
+                }
                     .keyboardShortcut(.cancelAction)
                 Button("Export", action: run)
                     .keyboardShortcut(.defaultAction)
@@ -501,6 +639,9 @@ struct ExportSheet: View {
         .onChange(of: settings.quality) { save() }
         .onChange(of: settings.longEdge) { save() }
         .onChange(of: settings.useDisplayP3) { save() }
+        .onChange(of: settings.keepMetadata) { save() }
+        .onChange(of: settings.stripLocation) { save() }
+        .onDisappear { job?.cancel() }
     }
 
     private var destination: URL? { settings.destinationPath.map { URL(fileURLWithPath: $0) } }
@@ -525,16 +666,19 @@ struct ExportSheet: View {
         progress = 0
         done = []
         errors = []
-        Task.detached(priority: .userInitiated) {
+        job = Task.detached(priority: .userInitiated) {
             try? FileManager.default.createDirectory(at: dest, withIntermediateDirectories: true)
-            for (i, job) in jobs.enumerated() {
-                do {
-                    let out = try Exporter.export(job, settings: settings, to: dest)
-                    await MainActor.run { done.append(out) }
-                } catch {
-                    await MainActor.run { errors.append("\(job.url.lastPathComponent): \(error.localizedDescription)") }
+            let results = await Exporter.exportAll(jobs, settings: settings, to: dest, concurrency: 2) { finished in
+                await MainActor.run { progress = Double(finished) / Double(jobs.count) }
+            }
+            await MainActor.run {
+                for r in results {
+                    switch r.result {
+                    case .success(let out): done.append(out)
+                    case .failure(let error): errors.append("\(r.url.lastPathComponent): \(error.localizedDescription)")
+                    }
                 }
-                await MainActor.run { progress = Double(i + 1) / Double(jobs.count) }
+                progress = 1
             }
         }
     }

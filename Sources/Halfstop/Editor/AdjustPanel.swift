@@ -107,6 +107,7 @@ private struct QuickPanel: View {
             store.resetSection { $0.exposure = 0; $0.contrast = 0; $0.highlights = 0; $0.shadows = 0
                 $0.temperature = 0; $0.saturation = 0; $0.vignette = 0 }
         }) {
+            AutoRow()
             ScopedSlider(title: "Exposure", global: \.exposure, range: -5...5, step: 0.05, format: ev)
             ScopedSlider(title: "Contrast", global: \.contrast)
             ScopedSlider(title: "Highlights", global: \.highlights)
@@ -127,6 +128,28 @@ private struct QuickPanel: View {
                 .foregroundStyle(Theme.accent)
         }
         .padding(16)
+    }
+}
+
+/// Auto tone, auto white balance and the white-balance picker.
+private struct AutoRow: View {
+    @Environment(LibraryStore.self) private var store
+    @Environment(PreviewRenderer.self) private var renderer
+
+    var body: some View {
+        let source = store.current.flatMap { renderer.source(for: $0.url) }
+        HStack(spacing: 4) {
+            Button("Auto tone") { if let source { store.autoTone(using: source) } }
+                .help("Set exposure, contrast, highlights and shadows from the photo")
+            Button("Auto WB") { if let source { store.autoWhiteBalance(using: source) } }
+                .help("Neutral white balance from the whole frame")
+            Button { store.pickingWhite.toggle() } label: { Image(systemName: "eyedropper") }
+                .buttonStyle(ChipStyle(selected: store.pickingWhite))
+                .frame(width: 34)
+                .help("Pick white balance: click something gray (W)")
+        }
+        .buttonStyle(ChipStyle(selected: false))
+        .disabled(source == nil)
     }
 }
 
@@ -183,6 +206,10 @@ private struct DetailedPanel: View {
             if let mask { let l = mask.local; return l.exposure != 0 || l.contrast != 0 || l.highlights != 0 || l.shadows != 0 || l.whites != 0 || l.blacks != 0 }
             return a.exposure != 0 || a.contrast != 0 || a.highlights != 0 || a.shadows != 0 || a.whites != 0 || a.blacks != 0
         }()
+        if mask == nil {
+            AutoRow().padding(.horizontal, 16).padding(.vertical, 10)
+            Rectangle().fill(Theme.hairline).frame(height: 1)
+        }
         PanelSection(title: mask == nil ? "Light" : "Light · \(mask!.name)", expanded: $lightOpen, isModified: lightModified, onReset: {
             if mask != nil {
                 store.checkpoint()
@@ -714,7 +741,9 @@ private struct PanelFooter: View {
             .fixedSize()
             Spacer()
             footerButton("doc.on.doc", "Copy settings (⇧⌘C)") { store.copySettings() }
-            footerButton("doc.on.clipboard", "Paste settings (⇧⌘V)") { store.pasteSettings() }
+            footerButton("doc.on.clipboard", "Paste settings (⇧⌘V). ⌥-click to choose which (⌥⇧⌘V)") {
+                if NSEvent.modifierFlags.contains(.option) { store.showSelectivePaste = true } else { store.pasteSettings() }
+            }
                 .disabled(store.clipboard == nil)
             footerButton("arrow.counterclockwise", "Reset all (⇧⌘R)") { store.resetAdjustments() }
         }

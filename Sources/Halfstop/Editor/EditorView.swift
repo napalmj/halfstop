@@ -26,6 +26,7 @@ private struct PreviewToken: Hashable {
     let url: URL
     let revision: Int
     let before: Bool
+    let clipping: Bool
     let geometry: String
     let overlay: UUID?
     let generation: Int
@@ -71,22 +72,30 @@ struct PreviewArea: View {
         // adjustments yet (otherwise fresh brush strokes would be invisible).
         let wantsOverlay = store.showMaskOverlay || store.maskInteracting || (store.activeMask?.local.isNeutral ?? false)
         let overlayID = wantsOverlay && !store.showBefore ? store.activeMaskID : nil
-        let token = PreviewToken(url: url, revision: photo.revision, before: store.showBefore, geometry: "\(mode)", overlay: overlayID, generation: renderer.generation)
+        let clipping = store.showClipping && overlayID == nil
+        let token = PreviewToken(url: url, revision: photo.revision, before: store.showBefore, clipping: clipping,
+                                 geometry: "\(mode)", overlay: overlayID, generation: renderer.generation)
 
         PreviewImageView(
             token: token,
             provider: { drawable, scale in
                 renderer.source(for: url).map {
-                    PreviewRenderer.previewImage($0, shown, geometry: mode, overlayMask: overlayID, drawableSize: drawable, scale: scale)
+                    let img = PreviewRenderer.previewImage($0, shown, geometry: mode, overlayMask: overlayID, drawableSize: drawable, scale: scale)
+                    return clipping ? ClippingOverlay.apply(img) : img
                 }
             },
-            onHistogram: overlayID == nil ? { renderer.receiveHistogram($0) } : nil
+            // The histogram reads the drawn pixels, so skip it while overlays are drawn on them.
+            onHistogram: overlayID == nil && !clipping ? { renderer.receiveHistogram($0) } : nil
         )
 
         if let source = renderer.source(for: url) {
             let contentSize = PreviewLayout.contentSize(source.size, a, mode)
             let rect = PreviewLayout.fit(contentSize, in: size)
-            if store.isCropping {
+            if store.pickingWhite && !store.isCropping && store.activeMaskID == nil {
+                WhitePicker(imageRect: rect) { p in
+                    if let s = renderer.source(for: url) { store.pickWhiteBalance(at: p, using: s) }
+                }
+            } else if store.isCropping {
                 CropOverlay(
                     imageRect: rect,
                     crop: a.crop.rect,
@@ -101,7 +110,9 @@ struct PreviewArea: View {
 
         VStack {
             HStack {
-                if store.showBefore { badge("Before") }
+                if store.pickingWhite { badge("Click something that should be neutral gray · Esc cancels") }
+                else if store.showBefore { badge("Before") }
+                else if clipping { badge("Clipping: red = blown, blue = crushed (J)") }
                 else if let mask = store.activeMask { badge("Editing \(mask.name)") }
                 else if store.isCropping { badge("Crop") }
                 Spacer()
@@ -125,10 +136,11 @@ struct PreviewArea: View {
     private func prepare() {
         guard let url = store.currentID else { return }
         let list = store.visiblePhotos
+        // Two ahead in the direction you're browsing, one behind (the decoded-source cache holds five).
         var neighbors: [URL] = []
         if let i = list.firstIndex(where: { $0.url == url }) {
-            if i + 1 < list.count { neighbors.append(list[i + 1].url) }
-            if i > 0 { neighbors.append(list[i - 1].url) }
+            let d = store.browseDirection
+            for offset in [d, 2 * d, -d] where list.indices.contains(i + offset) { neighbors.append(list[i + offset].url) }
         }
         renderer.prepare(url, neighbors: neighbors)
     }
@@ -303,14 +315,26 @@ struct MaskOverlay: View {
         case .pickSubject, nil:
             break
         case .paint:
-            store.editMask(mask.id) { m in
-                guard !m.strokes.isEmpty else { return }
-                m.strokes[m.strokes.count - 1].points.append(p)
-            }
+            addPaintPoint(p, force: false)
+        }
+    }
+
+    /// Adds a point to the stroke being painted, skipping ones too close to the last to change
+    /// anything (dabs are spaced 0.2 × radius apart). Keeps strokes, history and sidecars small.
+    private func addPaintPoint(_ p: NormPoint, force: Bool) {
+        guard let stroke = store.activeMask?.strokes.last, let last = stroke.points.last else { return }
+        let dx = (p.x - last.x) * imageRect.width, dy = (p.y - last.y) * imageRect.height
+        let d = hypot(dx, dy)
+        guard d > 0, force || d >= stroke.radius * longEdge * 0.1 else { return }
+        store.editMask(mask.id) { m in
+            guard !m.strokes.isEmpty else { return }
+            m.strokes[m.strokes.count - 1].points.append(p)
         }
     }
 
     private func endDrag() {
+        // End the stroke exactly where the pointer stopped.
+        if drag == .paint, let hover { addPaintPoint(norm(hover), force: true) }
         if drag == .pickSubject, let start = dragStart, let hover, hypot(hover.x - start.x, hover.y - start.y) < 5 {
             store.toggleSubject(at: norm(start))
         }
@@ -408,5 +432,25 @@ private struct FilmstripCell: View {
             }
             .contentShape(Rectangle())
             .onTapGesture { store.select(photo) }
+    }
+}
+
+/// Crosshair over the photo; a click reports the spot (normalized, top-left origin).
+private struct WhitePicker: View {
+    let imageRect: CGRect
+    let onPick: (NormPoint) -> Void
+
+    var body: some View {
+        Color.clear
+            .contentShape(Rectangle())
+            .onContinuousHover { phase in
+                if case .active = phase { NSCursor.crosshair.set() } else { NSCursor.arrow.set() }
+            }
+            .onTapGesture(coordinateSpace: .local) { loc in
+                guard imageRect.contains(loc) else { return }
+                NSCursor.arrow.set()
+                onPick(NormPoint(x: Double((loc.x - imageRect.minX) / imageRect.width),
+                                 y: Double((loc.y - imageRect.minY) / imageRect.height)))
+            }
     }
 }

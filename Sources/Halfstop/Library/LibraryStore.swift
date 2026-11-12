@@ -15,6 +15,19 @@ enum LibrarySource: Hashable {
     case collection(UUID)
 }
 
+enum SortOrder: String, CaseIterable, Identifiable {
+    case folder, fileName, captureTime, rating
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .folder: "Folder order"
+        case .fileName: "File name"
+        case .captureTime: "Capture time"
+        case .rating: "Rating"
+        }
+    }
+}
+
 enum EditsFilter: String, CaseIterable, Identifiable {
     case any, edited, unedited
     var id: String { rawValue }
@@ -46,13 +59,25 @@ final class LibraryStore {
     // Library contents
     /// Mutated only by the store and its Importer extension.
     var catalog = Catalog()
+    /// Kept in the chosen sort order (see `sorted`); assign through `sorted(_:)` when replacing.
     var photos: [Photo] = [] {
         didSet {
+            photoPosition = Dictionary(photos.enumerated().map { ($1.ref, $0) }, uniquingKeysWith: { a, _ in a })
             photoByRef = Dictionary(photos.map { ($0.ref, $0) }, uniquingKeysWith: { a, _ in a })
             photoByURL = Dictionary(photos.map { ($0.url, $0) }, uniquingKeysWith: { a, _ in a })
         }
     }
     @ObservationIgnored private var photoByRef: [PhotoRef: Photo] = [:]
+    /// Index in `photos`, to put collections in the same order.
+    @ObservationIgnored private var photoPosition: [PhotoRef: Int] = [:]
+    /// Position of each photo in the last folder scan (folders in turn, Finder path order).
+    @ObservationIgnored private var scanOrder: [URL: Int] = [:]
+    var sortOrder = SortOrder(rawValue: UserDefaults.standard.string(forKey: "sortOrder") ?? "") ?? .folder {
+        didSet { UserDefaults.standard.set(sortOrder.rawValue, forKey: "sortOrder"); resort() }
+    }
+    var sortDescending = UserDefaults.standard.bool(forKey: "sortDescending") {
+        didSet { UserDefaults.standard.set(sortDescending, forKey: "sortDescending"); resort() }
+    }
     /// Lookup for `current`, which every slider reads on every tick (a scan was O(library)).
     /// Observed, so views reading `current` still update when the library changes.
     private var photoByURL: [URL: Photo] = [:]
@@ -91,6 +116,14 @@ final class LibraryStore {
     // Editor state
     var isCropping = false { didSet { if isCropping { activeMaskID = nil } } }
     var showBefore = false
+    /// Paints blown highlights red and crushed shadows blue on the preview (J).
+    var showClipping = false
+    /// The next click on the photo sets white balance from that spot (W).
+    var pickingWhite = false
+    /// Move to the next photo after rating or flagging one (⇧ with the key does it once).
+    var autoAdvance = UserDefaults.standard.bool(forKey: "autoAdvance") {
+        didSet { UserDefaults.standard.set(autoAdvance, forKey: "autoAdvance") }
+    }
     var thumbnailSize: Double = 200
     var panelTab: PanelTab = .quick { didSet { if panelTab == .quick { activeMaskID = nil } } }
     /// Mask currently being edited; nil = whole photo.
@@ -126,11 +159,26 @@ final class LibraryStore {
 
     @ObservationIgnored private var pendingSaves: [URL: DispatchWorkItem] = [:]
     @ObservationIgnored private var pendingTokens: [URL: UUID] = [:]
+    /// Photos whose history changed since their last save.
+    @ObservationIgnored private var historyDirty: Set<URL> = []
     /// Photos with edits not yet written to their sidecar (they save ~0.5 s after a change).
     private(set) var unsavedCount = 0
     private(set) var lastSaved: Date?
     /// Briefly true after ⌘S, to confirm the save.
     var savedFlash = false
+    /// Photos whose last save failed → why. Their edits stay in memory, still count as unsaved,
+    /// and are retried (every 30 s, on any change to them, on ⌘S and on "Try again").
+    private(set) var failedSaves: [URL: String] = [:]
+    /// Library files ("Library index", "Presets") whose last save failed → why.
+    private(set) var failedLibraryFiles: [String: String] = [:]
+    /// The save problems popover in the top bar.
+    var showSaveProblems = false
+    /// What each failed save tried to write, so it can be retried even after its photo left the
+    /// list (its card was ejected, say).
+    @ObservationIgnored private var failedSnapshots: [URL: (sidecar: Sidecar, history: Bool)] = [:]
+    @ObservationIgnored private var retryTimer: Timer?
+    /// The app's own store (the self-test makes others), for the quit check.
+    static weak var appStore: LibraryStore?
 
     init(catalogURL: URL = Catalog.defaultURL, watch: Bool = true) {
         self.catalogURL = catalogURL
@@ -146,8 +194,8 @@ final class LibraryStore {
             saveCatalog()
         }
         if watch {
-            watcher = FolderWatcher { [weak self] _ in
-                MainActor.assumeIsolated { self?.scheduleReload() }
+            watcher = FolderWatcher { [weak self] paths in
+                MainActor.assumeIsolated { self?.scheduleReload(changed: paths) }
             }
         }
         reload()
@@ -155,7 +203,15 @@ final class LibraryStore {
 
     var hasLibrary: Bool { !catalog.folders.isEmpty }
 
-    func saveCatalog() { catalog.save(to: catalogURL) }
+    func saveCatalog() {
+        do {
+            try catalog.save(to: catalogURL)
+            failedLibraryFiles["Library index"] = nil
+        } catch {
+            failedLibraryFiles["Library index"] = Self.describeSaveError(error)
+        }
+        updateRetryTimer()
+    }
 
     // MARK: - Derived
 
@@ -165,12 +221,61 @@ final class LibraryStore {
         case .all:
             photos
         case .lastImport:
-            (catalog.lastImport?.refs ?? []).compactMap { photoByRef[$0] }
+            inSortOrder((catalog.lastImport?.refs ?? []).compactMap { photoByRef[$0] })
         case .folder(let id):
             photos.filter { $0.ref.folder == id }
         case .collection(let id):
-            (catalog.collections.first { $0.id == id }?.members ?? []).compactMap { photoByRef[$0] }
+            inSortOrder((catalog.collections.first { $0.id == id }?.members ?? []).compactMap { photoByRef[$0] })
         }
+    }
+
+    /// Collections keep the order photos were added in, unless a sort is chosen.
+    private func inSortOrder(_ list: [Photo]) -> [Photo] {
+        guard sortOrder != .folder || sortDescending else { return list }
+        return list.sorted { (photoPosition[$0.ref] ?? 0) < (photoPosition[$1.ref] ?? 0) }
+    }
+
+    /// `list` in the chosen order. Done once per reload or sort change rather than on every
+    /// access, so a rating change doesn't make photos jump while culling.
+    func sorted(_ list: [Photo]) -> [Photo] {
+        // Folder order is the scan order: imported folders in turn, each in Finder's path order.
+        // That's what a scan produces already, so keep it rather than re-comparing strings.
+        let scanRank = scanOrder
+        let folderRank = Dictionary(catalog.folders.enumerated().map { ($1.id, $0) }, uniquingKeysWith: { a, _ in a })
+        let pathKeys = Dictionary(list.map { ($0.url, $0.ref.path) }, uniquingKeysWith: { a, _ in a })
+        func pathLess(_ a: Photo, _ b: Photo) -> Bool {
+            let fa = folderRank[a.ref.folder] ?? 0, fb = folderRank[b.ref.folder] ?? 0
+            if fa != fb { return fa < fb }
+            if sortOrder == .folder, let ra = scanRank[a.url], let rb = scanRank[b.url] { return ra < rb }
+            return pathKeys[a.url]!.localizedStandardCompare(pathKeys[b.url]!) == .orderedAscending
+        }
+        var out: [Photo]
+        switch sortOrder {
+        case .folder:
+            out = list.sorted(by: pathLess)
+        case .fileName:
+            let keys = Dictionary(list.map { ($0.url, $0.name.lowercased()) }, uniquingKeysWith: { a, _ in a })
+            out = list.sorted { a, b in
+                let ka = keys[a.url]!, kb = keys[b.url]!
+                if ka != kb { return ka.compare(kb, options: [.numeric]) == .orderedAscending }
+                return pathLess(a, b)
+            }
+        case .captureTime:
+            let dates = catalog.captureDates
+            out = list.sorted { a, b in
+                let da = dates[a.ref.key] ?? .distantFuture, db = dates[b.ref.key] ?? .distantFuture
+                return da != db ? da < db : pathLess(a, b)
+            }
+        case .rating:
+            // Best first reads naturally; descending flips to worst first.
+            out = list.sorted { a, b in a.rating != b.rating ? a.rating > b.rating : pathLess(a, b) }
+        }
+        return sortDescending ? out.reversed() : out
+    }
+
+    private func resort() {
+        let next = sorted(photos)
+        if next.map(\.url) != photos.map(\.url) { photos = next }
     }
 
     var visiblePhotos: [Photo] {
@@ -237,35 +342,68 @@ final class LibraryStore {
         showImport = true
     }
 
-    private func scheduleReload() {
+    @ObservationIgnored private var changedPaths: [String] = []
+
+    private func scheduleReload(changed paths: [String] = []) {
+        changedPaths += paths
         guard !reloadPending else { return }
         reloadPending = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
             guard let self else { return }
             self.reloadPending = false
-            self.reload()
+            let changed = self.changedPaths
+            self.changedPaths = []
+            self.reload(only: self.foldersContaining(changed))
         }
     }
 
-    /// Rescans every imported folder. Keeps existing Photo objects (and their unsaved state) for files still present.
-    func reload(completion: (() -> Void)? = nil) {
+    /// The imported folders the changed paths are in; nil (rescan everything) when a path is outside
+    /// all of them or folders overlap (then which folder owns a file depends on the others).
+    func foldersContaining(_ paths: [String]) -> Set<UUID>? {
+        guard !paths.isEmpty else { return nil }
+        let folders = catalog.folders
+        for a in folders {
+            for b in folders where a.id != b.id && (b.path + "/").hasPrefix(a.path + "/") { return nil }
+        }
+        var ids = Set<UUID>()
+        for raw in paths {
+            let path = raw.hasSuffix("/") ? String(raw.dropLast()) : raw
+            guard let f = folders.first(where: { path == $0.path || path.hasPrefix($0.path + "/") }) else { return nil }
+            ids.insert(f.id)
+        }
+        return ids
+    }
+
+    /// Rescans the imported folders (only `only`, when given). Keeps existing Photo objects
+    /// (and their unsaved state) for files still present.
+    func reload(only: Set<UUID>? = nil, completion: (() -> Void)? = nil) {
         let catalog = self.catalog
         let existing = Dictionary(photos.map { ($0.url, $0) }, uniquingKeysWith: { a, _ in a })
         let known = Set(existing.keys)
+        let previousOrder = scanOrder
         if photos.isEmpty { isLoading = true }
-        watcher?.watch(catalog.folders.filter(\.exists).map(\.path))
+        if only == nil { watcher?.watch(catalog.folders.filter(\.exists).map(\.path)) }
         Task.detached(priority: .userInitiated) {
-            let found = LibraryStore.scanCatalog(catalog, known: known)
+            let found = LibraryStore.scanCatalog(catalog, known: known, only: only)
             await MainActor.run {
-                var list: [Photo] = []
+                var scanned: [UUID: [Photo]] = [:]
                 for item in found {
-                    if let p = existing[item.url], p.ref == item.ref {
-                        list.append(p)
+                    let p = existing[item.url].flatMap { $0.ref == item.ref ? $0 : nil }
+                        ?? Photo(url: item.url, ref: item.ref, sidecar: item.sidecar ?? Sidecar())
+                    scanned[item.ref.folder, default: []].append(p)
+                }
+                // Folders in catalog order; untouched ones keep the photos (and order) they had.
+                var list: [Photo] = []
+                for folder in catalog.folders {
+                    if only == nil || only!.contains(folder.id) {
+                        list += scanned[folder.id] ?? []
                     } else {
-                        list.append(Photo(url: item.url, ref: item.ref, sidecar: item.sidecar ?? Sidecar()))
+                        list += self.photos.filter { $0.ref.folder == folder.id }
+                            .sorted { (previousOrder[$0.url] ?? .max) < (previousOrder[$1.url] ?? .max) }
                     }
                 }
-                self.photos = list
+                self.scanOrder = Dictionary(list.enumerated().map { ($1.url, $0) }, uniquingKeysWith: { a, _ in a })
+                self.photos = self.sorted(list)
                 self.isLoading = false
                 self.keepCurrentVisible()
                 self.backfillFingerprints()
@@ -280,47 +418,59 @@ final class LibraryStore {
         let sidecar: Sidecar?
     }
 
-    nonisolated static func scanCatalog(_ catalog: Catalog, known: Set<URL>) -> [ScannedPhoto] {
-        let decoder = JSONDecoder()
+    nonisolated static func scanCatalog(_ catalog: Catalog, known: Set<URL>, only: Set<UUID>? = nil) -> [ScannedPhoto] {
         var seen = Set<String>()
-        var out: [ScannedPhoto] = []
-        for folder in catalog.folders where folder.exists {
+        var entries: [(url: URL, ref: PhotoRef)] = []
+        for folder in catalog.folders where folder.exists && (only?.contains(folder.id) ?? true) {
+            LibraryFiles.recoverInterruptedRenames(in: folder.url, recursive: folder.includeSubfolders)
             for rel in LibraryFiles.enumerate(folder.url, recursive: folder.includeSubfolders) where !folder.excluded.contains(rel) {
                 let url = URL(fileURLWithPath: folder.path).appendingPathComponent(rel)
                 guard seen.insert(url.path).inserted else { continue }
-                var sidecar: Sidecar?
-                if !known.contains(url) {
-                    sidecar = (try? Data(contentsOf: sidecarURL(for: url))).flatMap { try? decoder.decode(Sidecar.self, from: $0) }
-                }
-                out.append(ScannedPhoto(url: url, ref: PhotoRef(folder: folder.id, path: rel), sidecar: sidecar))
+                entries.append((url, PhotoRef(folder: folder.id, path: rel)))
             }
         }
-        return out
+        // Sidecars for photos not loaded yet, read in parallel (JSON decoding dominates a first scan).
+        let need = entries.indices.filter { !known.contains(entries[$0].url) }
+        let box = SidecarBox(count: entries.count)
+        DispatchQueue.concurrentPerform(iterations: need.count) { k in
+            let i = need[k]
+            box.set(i, SidecarFiles.read(for: entries[i].url))
+        }
+        return entries.indices.map { ScannedPhoto(url: entries[$0].url, ref: entries[$0].ref, sidecar: box.get($0)) }
     }
 
-    nonisolated static func sidecarURL(for photo: URL) -> URL {
-        photo.deletingLastPathComponent()
-            .appendingPathComponent(".pixon", isDirectory: true)
-            .appendingPathComponent(photo.lastPathComponent + ".json")
+    private final class SidecarBox: @unchecked Sendable {
+        private var items: [Sidecar?]
+        private let lock = NSLock()
+        init(count: Int) { items = Array(repeating: nil, count: count) }
+        func set(_ i: Int, _ s: Sidecar?) { lock.lock(); items[i] = s; lock.unlock() }
+        func get(_ i: Int) -> Sidecar? { lock.lock(); defer { lock.unlock() }; return items[i] }
     }
 
-    /// Computes fingerprints for library photos that don't have one yet (in the background).
+    nonisolated static func sidecarURL(for photo: URL) -> URL { SidecarFiles.mainURL(for: photo) }
+
+    /// Computes fingerprints (duplicate detection) and capture dates (sorting) for library photos
+    /// that don't have them yet, in the background.
     @ObservationIgnored private var fingerprinting = false
     private func backfillFingerprints() {
         guard !fingerprinting else { return }
-        let missing = photos.filter { catalog.fingerprints[$0.ref.key] == nil }.map { ($0.ref, $0.url) }
-        guard !missing.isEmpty else { return }
+        let needPrint = photos.filter { catalog.fingerprints[$0.ref.key] == nil }.map { ($0.ref.key, $0.url) }
+        let needDate = photos.filter { catalog.captureDates[$0.ref.key] == nil }.map { ($0.ref.key, $0.url) }
+        guard !needPrint.isEmpty || !needDate.isEmpty else { return }
         fingerprinting = true
         Task.detached(priority: .utility) {
-            var found: [String: String] = [:]
-            for (ref, url) in missing {
-                if let fp = LibraryFiles.fingerprint(url) { found[ref.key] = fp }
+            var prints: [String: String] = [:], dates: [String: Date] = [:]
+            for (key, url) in needPrint {
+                if let fp = LibraryFiles.fingerprint(url) { prints[key] = fp }
             }
-            let computed = found
+            for (key, url) in needDate { dates[key] = LibraryFiles.captureDate(url) }
+            let (p, d) = (prints, dates)
             await MainActor.run {
-                self.catalog.fingerprints.merge(computed) { _, new in new }
+                self.catalog.fingerprints.merge(p) { _, new in new }
+                self.catalog.captureDates.merge(d) { _, new in new }
                 self.saveCatalog()
                 self.fingerprinting = false
+                if self.sortOrder == .captureTime && !d.isEmpty { self.resort() }
             }
         }
     }
@@ -329,6 +479,9 @@ final class LibraryStore {
 
     func removeFolder(_ id: UUID) {
         flushSaves()
+        if let path = catalog.folder(id)?.path {
+            forgetFailedSaves { LibraryFiles.isInside($0, LibraryFiles.canonical(URL(fileURLWithPath: path))) || $0.path.hasPrefix(path + "/") }
+        }
         catalog.folders.removeAll { $0.id == id }
         for i in catalog.collections.indices {
             catalog.collections[i].members.removeAll { $0.folder == id }
@@ -432,64 +585,171 @@ final class LibraryStore {
 
     // MARK: - Persistence
 
-    func scheduleSave(_ photo: Photo) {
-        pendingSaves[photo.url]?.cancel()
-        let sidecar = photo.sidecar
-        let url = photo.url
+    /// - Parameter history: the edit history changed too, so write its file (it's skipped otherwise).
+    ///   Sticks until a save goes through, so a later rating or slider save still includes it.
+    func scheduleSave(_ photo: Photo, history: Bool = false) {
+        if history { historyDirty.insert(photo.url) }
+        scheduleWrite(photo.url, sidecar: photo.sidecar, delay: 0.5)
+    }
+
+    private func scheduleWrite(_ url: URL, sidecar: Sidecar, delay: Double) {
+        pendingSaves[url]?.cancel()
+        let withHistory = historyDirty.contains(url)
         let token = UUID()
         let work = DispatchWorkItem { [weak self] in
-            LibraryStore.writeSidecar(sidecar, for: url)
+            let failure = LibraryStore.writeSidecar(sidecar, for: url, history: withHistory)
             DispatchQueue.main.async {
-                MainActor.assumeIsolated { self?.didWrite(url, token: token) }
+                MainActor.assumeIsolated { self?.didWrite(url, token: token, sidecar: sidecar, failure: failure) }
             }
         }
         pendingSaves[url] = work
         pendingTokens[url] = token
         unsavedCount = pendingSaves.count
-        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.5, execute: work)
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay, execute: work)
     }
 
-    private func didWrite(_ url: URL, token: UUID) {
+    private func didWrite(_ url: URL, token: UUID, sidecar: Sidecar, failure: String?) {
         guard pendingTokens[url] == token else { return }
         pendingTokens[url] = nil
         pendingSaves[url] = nil
+        recordSave(url, sidecar: sidecar, failure: failure)
         unsavedCount = pendingSaves.count
-        lastSaved = Date()
     }
 
+    /// Notes how a save went. A failure keeps the history marked dirty, so the retry writes it.
+    private func recordSave(_ url: URL, sidecar: Sidecar, failure: String?) {
+        if let failure {
+            failedSaves[url] = failure
+            failedSnapshots[url] = (sidecar, historyDirty.contains(url) || failedSnapshots[url]?.history == true)
+        } else {
+            historyDirty.remove(url)
+            failedSaves[url] = nil
+            failedSnapshots[url] = nil
+            lastSaved = Date()
+        }
+        updateRetryTimer()
+    }
+
+    /// Stops retrying saves for these photos (trashed, or their folder left the library).
+    private func forgetFailedSaves(where drop: (URL) -> Bool) {
+        for url in failedSaves.keys where drop(url) {
+            failedSaves[url] = nil
+            failedSnapshots[url] = nil
+        }
+        updateRetryTimer()
+    }
+
+    /// Writes every pending and failed save now, on this thread. Failures stay recorded.
     func flushSaves() {
         commitAllPending()
-        for (url, work) in pendingSaves {
-            work.cancel()
-            if let photo = photoByURL[url] {
-                LibraryStore.writeSidecar(photo.sidecar, for: url)
-            }
-        }
+        let urls = Set(pendingSaves.keys).union(failedSaves.keys)
+        for (_, work) in pendingSaves { work.cancel() }
         pendingSaves = [:]
         pendingTokens = [:]
-        if unsavedCount != 0 { unsavedCount = 0; lastSaved = Date() }
+        for url in urls {
+            guard let sidecar = photoByURL[url]?.sidecar ?? failedSnapshots[url]?.sidecar else { continue }
+            if failedSnapshots[url]?.history == true { historyDirty.insert(url) }
+            let failure = LibraryStore.writeSidecar(sidecar, for: url, history: historyDirty.contains(url))
+            recordSave(url, sidecar: sidecar, failure: failure)
+        }
+        unsavedCount = 0
+        updateRetryTimer()
     }
 
     /// ⌘S: everything is saved automatically, but this writes it out right now and says so.
+    /// If anything can't be saved, shows why instead.
     func saveNow() {
         flushSaves()
         saveCatalog()
+        if failedLibraryFiles["Presets"] != nil { savePresets() }
+        guard !hasSaveProblems else {
+            showSaveProblems = true
+            return
+        }
         lastSaved = Date()
         savedFlash = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in self?.savedFlash = false }
     }
 
-    nonisolated static func writeSidecar(_ sidecar: Sidecar, for url: URL) {
-        let dest = sidecarURL(for: url)
-        let fm = FileManager.default
-        if sidecar.isEmpty {
-            try? fm.removeItem(at: dest)
-            return
+    /// "Try again" in the save problems popover, and the 30 s timer.
+    func retryFailedSaves() {
+        for url in failedSaves.keys where pendingSaves[url] == nil {
+            guard let sidecar = photoByURL[url]?.sidecar ?? failedSnapshots[url]?.sidecar else { continue }
+            if failedSnapshots[url]?.history == true { historyDirty.insert(url) }
+            scheduleWrite(url, sidecar: sidecar, delay: 0)
         }
-        try? fm.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        if let data = try? encoder.encode(sidecar) { try? data.write(to: dest, options: .atomic) }
+        if failedLibraryFiles["Library index"] != nil { saveCatalog() }
+        if failedLibraryFiles["Presets"] != nil { savePresets() }
+        updateRetryTimer()
+    }
+
+    var hasSaveProblems: Bool { !failedSaves.isEmpty || !failedLibraryFiles.isEmpty }
+
+    /// One line per place that can't be saved: photos grouped by imported folder, then library files.
+    var saveProblems: [SaveProblem] {
+        var groups: [String: (folder: URL?, reason: String, count: Int)] = [:]
+        for (url, reason) in failedSaves {
+            let name = photoByURL[url].flatMap { catalog.folder($0.ref.folder)?.name } ?? url.deletingLastPathComponent().lastPathComponent
+            let folder = photoByURL[url].flatMap { catalog.folder($0.ref.folder)?.url } ?? url.deletingLastPathComponent()
+            var g = groups[name] ?? (folder, reason, 0)
+            g.count += 1
+            groups[name] = g
+        }
+        var out = groups.map { SaveProblem(title: $0.key, photoCount: $0.value.count, reason: $0.value.reason, folder: $0.value.folder) }
+            .sorted { $0.title.localizedStandardCompare($1.title) == .orderedAscending }
+        for (name, reason) in failedLibraryFiles.sorted(by: { $0.key < $1.key }) {
+            out.append(SaveProblem(title: name, photoCount: 0, reason: reason, folder: nil))
+        }
+        return out
+    }
+
+    private func updateRetryTimer() {
+        if hasSaveProblems {
+            guard retryTimer == nil else { return }
+            retryTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated { self?.retryFailedSaves() }
+            }
+        } else {
+            retryTimer?.invalidate()
+            retryTimer = nil
+            showSaveProblems = false
+        }
+    }
+
+    /// Writes the sidecar; returns why it couldn't be, or nil when it was saved.
+    nonisolated static func writeSidecar(_ sidecar: Sidecar, for url: URL, history: Bool) -> String? {
+        do {
+            try SidecarFiles.write(sidecar, for: url, history: history)
+            return nil
+        } catch {
+            return describeSaveError(error)
+        }
+    }
+
+    /// A short, plain reason for a failed save.
+    nonisolated static func describeSaveError(_ error: Error) -> String {
+        if error is SidecarFiles.Failure { return "The edits folder is a link, so it isn’t used" }
+        let ns = error as NSError
+        var posix: Int32?
+        if ns.domain == NSPOSIXErrorDomain { posix = Int32(ns.code) }
+        if let under = ns.userInfo[NSUnderlyingErrorKey] as? NSError, under.domain == NSPOSIXErrorDomain { posix = Int32(under.code) }
+        switch posix {
+        case EROFS: return "The disk is read-only"
+        case ENOSPC, EDQUOT: return "The disk is full"
+        case EACCES, EPERM: return "The folder is read-only (locked card?)"
+        case ENOENT, ENXIO, ENODEV: return "The folder isn’t available (disconnected?)"
+        default: break
+        }
+        if ns.domain == NSCocoaErrorDomain {
+            switch ns.code {
+            case NSFileWriteVolumeReadOnlyError: return "The disk is read-only"
+            case NSFileWriteOutOfSpaceError: return "The disk is full"
+            case NSFileWriteNoPermissionError: return "The folder is read-only (locked card?)"
+            case NSFileNoSuchFileError, NSFileReadNoSuchFileError: return "The folder isn’t available (disconnected?)"
+            default: break
+            }
+        }
+        return ns.localizedDescription
     }
 
     // MARK: - Navigation & selection
@@ -515,9 +775,13 @@ final class LibraryStore {
         mode = .edit
     }
 
+    /// Which way the last step went (+1 / -1), so the editor preloads ahead of you.
+    @ObservationIgnored private(set) var browseDirection = 1
+
     func step(_ delta: Int) {
         let list = visiblePhotos
         guard !list.isEmpty else { return }
+        if delta != 0 { browseDirection = delta > 0 ? 1 : -1 }
         let index = list.firstIndex { $0.url == currentID } ?? 0
         let next = list[min(max(index + delta, 0), list.count - 1)]
         select(next)
@@ -562,7 +826,7 @@ final class LibraryStore {
         trashRequest = TrashRequest(urls: items.map(\.url), rejectedOnly: true)
     }
 
-    /// Moves the photo files (and their `.pixon` sidecars) to the Trash, where Finder can put them back,
+    /// Moves the photo files (and their `.halfstop` sidecars) to the Trash, where Finder can put them back,
     /// and drops them from the library, collections and last import. Returns the files that couldn't be moved.
     @discardableResult
     func moveToTrash(_ urls: [URL]) -> [String] {
@@ -579,12 +843,13 @@ final class LibraryStore {
         let fm = FileManager.default
         for p in items {
             // Don't let a pending save or history step recreate the sidecar afterwards.
-            pendingSaves[p.url]?.cancel(); pendingSaves[p.url] = nil; pendingTokens[p.url] = nil
+            pendingSaves[p.url]?.cancel(); pendingSaves[p.url] = nil; pendingTokens[p.url] = nil; historyDirty.remove(p.url)
             pendingCommits[p.url]?.cancel(); pendingCommits[p.url] = nil
             do {
                 try Self.trashFile(p.url)
-                let sidecar = Self.sidecarURL(for: p.url)
-                if fm.fileExists(atPath: sidecar.path) { try? Self.trashFile(sidecar) }
+                for sidecar in SidecarFiles.all(for: p.url) where fm.fileExists(atPath: sidecar.path) && SidecarFiles.isSafe(sidecar, for: p.url) {
+                    try? Self.trashFile(sidecar)
+                }
                 moved.append(p)
             } catch {
                 failed.append(p.url.lastPathComponent)
@@ -592,6 +857,8 @@ final class LibraryStore {
         }
         unsavedCount = pendingSaves.count
         guard !moved.isEmpty else { return failed }
+        let trashed = Set(moved.map(\.url))
+        forgetFailedSaves { trashed.contains($0) }
 
         catalog.forget(Set(moved.map(\.ref)))
         saveCatalog()
@@ -693,10 +960,40 @@ final class LibraryStore {
         }
         photo.history = history
         photo.historyIndex = history.count - 1
-        scheduleSave(photo)
+        scheduleSave(photo, history: true)
     }
 
     /// Sets a photo's edits as one labelled step (paste, presets, snapshots, reset).
+    // MARK: - Auto adjustments
+
+    /// White balance that makes the clicked spot neutral gray (`p` normalized in the cropped photo).
+    func pickWhiteBalance(at p: NormPoint, using source: ImageSource) {
+        pickingWhite = false
+        guard let photo = current else { return }
+        let half = 0.008
+        let region = CGRect(x: p.x - half, y: p.y - half, width: half * 2, height: half * 2)
+        let wb = AutoAdjust.whiteBalance(source: source, adjustments: photo.adjustments, region: region)
+        var a = photo.adjustments
+        a.temperature = wb.temperature; a.tint = wb.tint
+        applyStep(photo, a, label: "White balance (picked)")
+    }
+
+    func autoWhiteBalance(using source: ImageSource) {
+        guard let photo = current else { return }
+        let wb = AutoAdjust.whiteBalance(source: source, adjustments: photo.adjustments, region: nil)
+        var a = photo.adjustments
+        a.temperature = wb.temperature; a.tint = wb.tint
+        applyStep(photo, a, label: "Auto white balance")
+    }
+
+    func autoTone(using source: ImageSource) {
+        guard let photo = current else { return }
+        let t = AutoAdjust.tone(source: source, adjustments: photo.adjustments)
+        var a = photo.adjustments
+        a.exposure = t.exposure; a.contrast = t.contrast; a.highlights = t.highlights; a.shadows = t.shadows
+        applyStep(photo, a, label: "Auto tone")
+    }
+
     private func applyStep(_ photo: Photo, _ adjustments: Adjustments, label: String) {
         commitPending(photo)
         photo.adjustments = adjustments
@@ -711,7 +1008,7 @@ final class LibraryStore {
         guard photo.history.indices.contains(index) else { return }
         photo.historyIndex = index
         photo.adjustments = photo.history[index].adjustments
-        scheduleSave(photo)
+        scheduleSave(photo, history: true)
     }
 
     /// Drops the steps after the current one right away.
@@ -719,7 +1016,7 @@ final class LibraryStore {
         guard let photo = current else { return }
         commitPending(photo)
         photo.history = Array(photo.history.prefix(photo.historyIndex + 1))
-        scheduleSave(photo)
+        scheduleSave(photo, history: true)
     }
 
     /// Forgets the history, keeping the current edits as the new starting point.
@@ -728,7 +1025,7 @@ final class LibraryStore {
         commitPending(photo)
         photo.history = [HistoryStep(label: "History cleared", adjustments: photo.adjustments)]
         photo.historyIndex = 0
-        scheduleSave(photo)
+        scheduleSave(photo, history: true)
     }
 
     var canUndo: Bool {
@@ -914,6 +1211,21 @@ final class LibraryStore {
         for p in targets { applyStep(p, clipboard.withCrop(from: p.adjustments), label: "Paste settings") }
     }
 
+    /// Groups ticked in the last selective paste.
+    var pasteGroups: Set<SettingsGroup> = {
+        let saved = (UserDefaults.standard.array(forKey: "pasteGroups") as? [String])?.compactMap(SettingsGroup.init(rawValue:))
+        return saved.map(Set.init) ?? SettingsGroup.standard
+    }() {
+        didSet { UserDefaults.standard.set(pasteGroups.map(\.rawValue), forKey: "pasteGroups") }
+    }
+    var showSelectivePaste = false
+
+    func pasteSettings(_ groups: Set<SettingsGroup>) {
+        guard let clipboard, !groups.isEmpty else { return }
+        let label = groups == Set(SettingsGroup.allCases) ? "Paste all settings" : "Paste settings (\(groups.count) of \(SettingsGroup.allCases.count))"
+        for p in targets { applyStep(p, p.adjustments.copying(groups, from: clipboard), label: label) }
+    }
+
     func apply(_ preset: Preset) {
         for p in targets { applyStep(p, preset.adjustments.asPreset(onto: p.adjustments), label: "Preset: \(preset.name)") }
     }
@@ -941,22 +1253,49 @@ final class LibraryStore {
 
     private static var presetsURL: URL {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("Pixon", isDirectory: true)
+            .appendingPathComponent("Halfstop", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir.appendingPathComponent("presets.json")
     }
 
     private func loadPresets() {
-        guard let data = try? Data(contentsOf: Self.presetsURL),
-              let list = try? JSONDecoder().decode([Preset].self, from: data) else { return }
-        presets = list
+        presets = Self.loadPresets(from: Self.presetsURL)
+    }
+
+    /// Every preset that can be read. If any can't, the file is copied aside first so the next
+    /// save doesn't lose them; an unreadable file is copied aside too.
+    nonisolated static func loadPresets(from url: URL) -> [Preset] {
+        guard let data = try? Data(contentsOf: url) else { return [] }
+        let report = DecodeReport()
+        guard let list = try? JSONDecoder.reporting(into: report).decode(TolerantList<Preset>.self, from: data) else {
+            FileBackup.keepPartiallyLoaded(url, data: data)
+            return []
+        }
+        if report.dropped > 0 { FileBackup.keepPartiallyLoaded(url, data: data) }
+        return list.items
     }
 
     private func savePresets() {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted]
-        if let data = try? encoder.encode(presets) { try? data.write(to: Self.presetsURL, options: .atomic) }
+        do {
+            try encoder.encode(presets).write(to: Self.presetsURL, options: .atomic)
+            failedLibraryFiles["Presets"] = nil
+        } catch {
+            failedLibraryFiles["Presets"] = Self.describeSaveError(error)
+        }
+        updateRetryTimer()
     }
+}
+
+/// A place edits can't be saved to, for the save problems popover.
+struct SaveProblem: Identifiable, Hashable {
+    var id: String { title }
+    let title: String
+    /// 0 for library files.
+    let photoCount: Int
+    let reason: String
+    let folder: URL?
 }
 
 struct TrashRequest: Identifiable {

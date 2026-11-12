@@ -14,6 +14,8 @@ struct ImportScan: Sendable {
     var fingerprints: [String: String]
     /// Folder lies inside a folder already imported with subfolders.
     var coveredBy: String?
+    /// Ratings and edits can be saved there (false on a locked card or read-only share).
+    var writable = true
 
     func newFiles(skipDuplicates: Bool) -> [String] {
         files.filter { !alreadyInLibrary.contains($0) && !(skipDuplicates && duplicates.contains($0)) }
@@ -54,6 +56,7 @@ extension LibraryStore {
                 if let fp = LibraryFiles.fingerprint(url) { prints[key] = fp; computed[key] = fp }
             }
             let libraryValues = Set(prints.values)
+            LibraryFiles.recoverInterruptedRenames(in: URL(fileURLWithPath: root), recursive: includeSubfolders)
             let files = LibraryFiles.enumerate(URL(fileURLWithPath: root), recursive: includeSubfolders)
             var already = Set<String>(), dups = Set<String>(), seen = Set<String>()
             var fps: [String: String] = [:]
@@ -66,7 +69,8 @@ extension LibraryStore {
                 seen.insert(fp)
             }
             let scan = ImportScan(folder: URL(fileURLWithPath: root), includeSubfolders: includeSubfolders, files: files,
-                                  alreadyInLibrary: already, duplicates: dups, fingerprints: fps, coveredBy: nil)
+                                  alreadyInLibrary: already, duplicates: dups, fingerprints: fps, coveredBy: nil,
+                                  writable: FileManager.default.isWritableFile(atPath: root))
             return (scan, computed)
         }.value
         catalog.fingerprints.merge(computed) { _, new in new }
@@ -127,11 +131,10 @@ extension LibraryStore {
         if let preset = options.preset {
             let urls = newFiles.map { URL(fileURLWithPath: root).appendingPathComponent($0) }
             await Task.detached(priority: .userInitiated) {
-                let decoder = JSONDecoder()
                 for url in urls {
-                    var sidecar = (try? Data(contentsOf: LibraryStore.sidecarURL(for: url))).flatMap { try? decoder.decode(Sidecar.self, from: $0) } ?? Sidecar()
+                    var sidecar = SidecarFiles.read(for: url) ?? Sidecar()
                     sidecar.adjustments = preset.adjustments.asPreset(onto: sidecar.adjustments)
-                    LibraryStore.writeSidecar(sidecar, for: url)
+                    LibraryStore.writeSidecar(sidecar, for: url, history: false)
                 }
             }.value
         }
@@ -157,11 +160,31 @@ extension LibraryStore {
         let fm = FileManager.default
         var done: [RenameRecord] = []
         var errors: [String] = []
-        // Two phases through temporary names so swaps (a→b, b→a) can't collide.
-        var staged: [(tmp: URL, from: String, to: String)] = []
+        LibraryFiles.renameStarted()
+        defer { LibraryFiles.renameEnded() }
+        // A file whose new name is another file's current name (a swap, a→b and b→a, or a change of
+        // letter case only) first moves to a temporary name; the rest move directly. Temporary names
+        // keep the original name and extension, so if the app stops halfway the photos stay visible
+        // and the next scan puts them back (`LibraryFiles.recoverInterruptedRenames`).
+        let moving = plan.filter { $0.key != $0.value }
+        let sources = Set(moving.keys.map { $0.lowercased() })
+        var staged: [(current: URL, from: String, to: String)] = []
+        // Paths can come from the catalog file: never move anything from or to outside the folder.
+        let base = LibraryFiles.canonical(URL(fileURLWithPath: root))
+        func inside(_ rel: String) -> Bool {
+            LibraryFiles.isInside(URL(fileURLWithPath: root).appendingPathComponent(rel), base)
+        }
         for (from, to) in plan.sorted(by: { $0.key < $1.key }) where from != to {
+            guard inside(from), inside(to) else {
+                errors.append("\(from): outside the imported folder")
+                continue
+            }
             let src = URL(fileURLWithPath: root).appendingPathComponent(from)
-            let tmp = src.deletingLastPathComponent().appendingPathComponent(".pixon-rename-\(UUID().uuidString)")
+            guard sources.contains(to.lowercased()) else {
+                staged.append((src, from, to))
+                continue
+            }
+            let tmp = src.deletingLastPathComponent().appendingPathComponent(LibraryFiles.temporaryRenameName(for: src.lastPathComponent))
             do {
                 try fm.moveItem(at: src, to: tmp)
                 staged.append((tmp, from, to))
@@ -173,22 +196,25 @@ extension LibraryStore {
             var to = item.to
             var dest = URL(fileURLWithPath: root).appendingPathComponent(to)
             var n = 2
-            while fm.fileExists(atPath: dest.path) {
+            while LibraryFiles.kind(dest) != nil {
                 let base = (item.to as NSString).deletingPathExtension, ext = (item.to as NSString).pathExtension
                 to = "\(base)-\(n)" + (ext.isEmpty ? "" : ".\(ext)")
                 dest = URL(fileURLWithPath: root).appendingPathComponent(to)
                 n += 1
             }
             do {
-                try fm.moveItem(at: item.tmp, to: dest)
-                let oldSidecar = sidecarURL(for: URL(fileURLWithPath: root).appendingPathComponent(item.from))
-                if fm.fileExists(atPath: oldSidecar.path) {
-                    try? fm.moveItem(at: oldSidecar, to: sidecarURL(for: dest))
+                try fm.moveItem(at: item.current, to: dest)
+                let old = URL(fileURLWithPath: root).appendingPathComponent(item.from)
+                for (from, to) in zip(SidecarFiles.all(for: old), SidecarFiles.all(for: dest))
+                    where LibraryFiles.kind(from) == .file && SidecarFiles.isSafe(from, for: old) && SidecarFiles.isSafe(to, for: dest)
+                    && LibraryFiles.kind(to) == nil {
+                    try? fm.moveItem(at: from, to: to)
                 }
                 done.append(RenameRecord(from: item.from, to: to))
             } catch {
                 // Put it back where it was.
-                try? fm.moveItem(at: item.tmp, to: URL(fileURLWithPath: root).appendingPathComponent(item.from))
+                let original = URL(fileURLWithPath: root).appendingPathComponent(item.from)
+                if item.current != original { try? fm.moveItem(at: item.current, to: original) }
                 errors.append("\(item.from): \(error.localizedDescription)")
             }
         }

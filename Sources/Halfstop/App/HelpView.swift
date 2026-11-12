@@ -1,7 +1,7 @@
 import SwiftUI
 
-/// Help ▸ Pixon Help (⌘?): every shortcut and gesture, searchable, plus a few how-it-works notes.
-/// Keep this in step with `KeyHandler` and `PixonCommands`.
+/// Help ▸ Halfstop Help (⌘?): every shortcut and gesture, searchable, plus a few how-it-works notes.
+/// Keep this in step with `KeyHandler` and `HalfstopCommands`.
 struct HelpView: View {
     @State private var query = ""
 
@@ -35,20 +35,28 @@ struct HelpView: View {
             Item(keys: ["P"], what: "Pick"),
             Item(keys: ["X"], what: "Reject"),
             Item(keys: ["U"], what: "Unflag"),
+            Item(keys: ["⇧ with any of these"], what: "Rate or flag, then go to the next photo"),
+            Item(keys: ["Photo ▸ Auto Advance After Rating"], what: "Always go to the next photo after rating or flagging"),
             Item(keys: ["Stars in the top bar"], what: "Rate and flag while editing"),
         ]),
         Section(title: "Deleting", icon: "trash", items: [
             Item(keys: ["⌘⌫"], what: "Move the selected photos to the Trash (asks first)"),
             Item(keys: ["Photo ▸ Delete Rejected Photos…"], what: "Trash every rejected photo in the current folder or collection"),
-            Item(keys: ["Finder ▸ Put Back"], what: "Restore a trashed photo. Put back its matching .json too to keep its edits"),
+            Item(keys: ["Finder ▸ Put Back"], what: "Restore a trashed photo. Put back its matching .json files too to keep its edits and history"),
         ]),
         Section(title: "Editing", icon: "slider.horizontal.3", items: [
             Item(keys: ["\\"], what: "Before / after"),
+            Item(keys: ["J"], what: "Show clipping: red = blown highlights, blue = crushed shadows"),
+            Item(keys: ["W"], what: "Pick white balance: click something that should be gray"),
+            Item(keys: ["Auto tone", "Auto WB"], what: "One-click starting points (top of the panel)"),
+            Item(keys: ["Hover a slider + ↑ ↓"], what: "Nudge it (⇧ for bigger steps)"),
+            Item(keys: ["Click a slider's value"], what: "Type an exact number"),
             Item(keys: ["D"], what: "Switch between Quick and Detailed panels"),
             Item(keys: ["C", "R"], what: "Crop & straighten"),
             Item(keys: ["Double-click a slider"], what: "Reset it"),
             Item(keys: ["Esc"], what: "Back out: crop → refine → mask → before/after → library"),
             Item(keys: ["⇧⌘C", "⇧⌘V"], what: "Copy / paste settings (to the whole selection)"),
+            Item(keys: ["⌥⇧⌘V"], what: "Paste only some settings (light, color, masks, crop…)"),
             Item(keys: ["⇧⌘R"], what: "Reset all adjustments"),
         ]),
         Section(title: "History", icon: "clock.arrow.circlepath", items: [
@@ -73,8 +81,8 @@ struct HelpView: View {
     ]
 
     private static let notes: [(String, String)] = [
-        ("Your files are never changed", "Edits, ratings and history live in a small .pixon folder next to your photos. Export to get edited copies."),
-        ("Deleting goes to the Trash", "Pixon never erases files. Trashed photos come back with Finder's Put Back until you empty the Trash."),
+        ("Your files are never changed", "Edits, ratings and history live in a small .halfstop folder next to your photos. Export to get edited copies."),
+        ("Deleting goes to the Trash", "Halfstop never erases files. Trashed photos come back with Finder's Put Back until you empty the Trash."),
         ("Each photo keeps its own crop", "Paste settings copies everything except the crop. Presets carry only the global look, never crop or masks."),
     ]
 
@@ -91,7 +99,7 @@ struct HelpView: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 10) {
-                Text("Pixon Help").font(.system(size: 15, weight: .semibold)).foregroundStyle(Theme.text)
+                Text("Halfstop Help").font(.system(size: 15, weight: .semibold)).foregroundStyle(Theme.text)
                 Spacer()
                 HStack(spacing: 6) {
                     Image(systemName: "magnifyingglass").foregroundStyle(Theme.secondary)

@@ -7,8 +7,8 @@ import UniformTypeIdentifiers
 import AppKit
 import Metal
 
-/// Headless checks for the develop pipeline: `Pixon --selftest <output-dir>`.
-/// Also `Pixon --make-samples <dir>` writes synthetic test photos.
+/// Headless checks for the develop pipeline: `Halfstop --selftest <output-dir>`.
+/// Also `Halfstop --make-samples <dir>` writes synthetic test photos.
 enum SelfTest {
     static func runIfRequested() {
         let args = CommandLine.arguments
@@ -18,6 +18,14 @@ enum SelfTest {
         }
         if let i = args.firstIndex(of: "--selftest"), i + 1 < args.count {
             let dir = URL(fileURLWithPath: args[i + 1])
+            // The test deletes and recreates folders inside `dir`: never let it loose on one it didn't make.
+            guard TestOutput.claim(dir) else {
+                print("--selftest: \(dir.path) isn't empty and wasn't made by a test run. Choose a new or empty folder.")
+                exit(2)
+            }
+            // Keep test thumbnails out of the real cache.
+            ThumbnailDiskCache.directory = dir.appendingPathComponent("thumbcache", isDirectory: true)
+            try? FileManager.default.removeItem(at: ThumbnailDiskCache.directory)
             let pipelineOK = run(dir: dir)
             var libraryOK = false
             var done = false
@@ -340,6 +348,28 @@ enum SelfTest {
         check("undoing a stroke repaints from scratch",
               LiveRaster.extend(maskID: liveID, width: 600, height: 400, baseKey: nil, strokes: [strokesFull[0]]) == nil, "")
 
+        // Hostile strokes: rendering cost stays bounded by the raster, whatever the stroke says.
+        func seconds(_ body: () -> Void) -> Double { let t = Date(); body(); return Date().timeIntervalSince(t) }
+        let farStroke = BrushStroke(points: [NormPoint(x: 0, y: 0), NormPoint(x: 1e8, y: 0)], radius: 0, feather: 0.6, flow: 1)
+        var farImage: CGImage?
+        let farTime = seconds { farImage = MaskRenderer.rasterize([farStroke], width: 1024, height: 683) }
+        check("a stroke 1e8 widths long renders quickly", farTime < 1 && farImage != nil, String(format: "%.2fs", farTime))
+        let zigzag = BrushStroke(points: (0..<50_000).map { NormPoint(x: $0 % 2 == 0 ? -0.2 : 1.2, y: Double($0 % 97) / 97) }, radius: 0.0005)
+        let zigzagTime = seconds { _ = MaskRenderer.rasterize([zigzag], width: 1024, height: 683) }
+        check("a 50,000-point zigzag stroke renders in bounded time", zigzagTime < 3, String(format: "%.2fs", zigzagTime))
+        // A stroke from far off the image still paints where it crosses it, like a short one does.
+        let across = MaskRenderer.rasterize([BrushStroke(points: [NormPoint(x: -40, y: 0.5), NormPoint(x: 40, y: 0.5)], radius: 0.05)], width: 600, height: 400)
+        let short = MaskRenderer.rasterize([BrushStroke(points: [NormPoint(x: -0.5, y: 0.5), NormPoint(x: 1.5, y: 0.5)], radius: 0.05)], width: 600, height: 400)
+        if let across, let short {
+            let a = bytes(across), b = bytes(short)
+            let row = 200 * 600
+            check("off-image stroke still paints across the image", a[row + 10] > 250 && a[row + 300] > 250 && a[row + 590] > 250
+                  && a[20 * 600 + 300] == 0 && b[row + 300] > 250, "\(a[row + 10]) \(a[row + 300]) \(a[row + 590])")
+        }
+        var badCrop = CropSettings(); badCrop.rect = NormRect(x: 0.5, y: 0.5, width: -1, height: 0)
+        let badCropped = ImageSource.applyGeometry(CIImage(color: .gray).cropped(to: CGRect(x: 0, y: 0, width: 600, height: 400)), crop: badCrop, mode: .full)
+        check("a degenerate crop renders the full frame", !badCropped.extent.isEmpty && !badCropped.extent.isInfinite, "\(badCropped.extent)")
+
         // Preview develops at screen resolution: same look at a lower scale.
         var scaledA = Adjustments(); scaledA.highlights = -50; scaledA.shadows = 40; scaledA.hsl[5].saturation = 50; scaledA.vignette = -30
         let fullDev = src.developed(scaledA), halfDev = src.developed(scaledA, renderScale: 0.5)
@@ -384,6 +414,98 @@ enum SelfTest {
             }
         }
 
+        // Clipping overlay: pure white turns red, pure black blue, mid gray stays.
+        let clipped = ClippingOverlay.apply(base)
+        let cw = s(clipped, (0.95, 0.95)), ck = s(clipped, (0.05, 0.95)), cg = s(clipped, gray), og = s(base, gray)
+        check("clipping marks blown highlights red", cw.r > 0.9 && cw.g < 0.3, "\(cw)")
+        check("clipping marks crushed shadows blue", ck.b > 0.8 && ck.r < 0.3, "\(ck)")
+        check("clipping leaves midtones alone", abs(cg.luma - og.luma) < 0.01, "\(og) -> \(cg)")
+
+        // White balance: a warm-tinted copy; picking a gray ramp step must make it neutral again.
+        func variant(_ name: String, _ f: (CIImage) -> CIImage) -> ImageSource? {
+            let out = f(CIImage(cgImage: img))
+            guard let cg = Render.background.createCGImage(out, from: out.extent, format: .RGBA8, colorSpace: Render.sRGB) else { return nil }
+            let u = dir.appendingPathComponent(name)
+            write(cg, to: u)
+            return ImageSource(url: u, maxPixelSize: nil)
+        }
+        if let warm = variant("warm.jpg", { $0.applyingFilter("CIColorMatrix", parameters: [
+            "inputRVector": CIVector(x: 1.12, y: 0, z: 0, w: 0), "inputGVector": CIVector(x: 0, y: 1.0, z: 0, w: 0),
+            "inputBVector": CIVector(x: 0, y: 0, z: 0.82, w: 0)]) }) {
+            let pick = CGRect(x: 0.53, y: 0.93, width: 0.04, height: 0.04)   // a mid-gray ramp step
+            let before = AutoAdjust.average(warm.developed(Adjustments()), region: pick)
+            let wb = AutoAdjust.whiteBalance(source: warm, adjustments: Adjustments(), region: pick)
+            var fixed = Adjustments(); fixed.temperature = wb.temperature; fixed.tint = wb.tint
+            let after = AutoAdjust.average(warm.developed(fixed), region: pick)
+            func cast(_ c: (Double, Double, Double)) -> Double { abs(log(c.2 / c.0)) + abs(log(c.1 / (c.0 * c.2).squareRoot())) }
+            check("white balance pick neutralizes a warm cast", wb.temperature < 0 && cast(after) < 0.03 && cast(after) < cast(before) / 4,
+                  String(format: "temp %.0f tint %.0f, cast %.3f -> %.3f", wb.temperature, wb.tint, cast(before), cast(after)))
+        }
+        if let dim = variant("dim.jpg", { $0.applyingFilter("CIExposureAdjust", parameters: [kCIInputEVKey: -1.8]) }) {
+            let t = AutoAdjust.tone(source: dim, adjustments: Adjustments())
+            var a = Adjustments(); a.exposure = t.exposure
+            let lum = AutoAdjust.luminances(dim.developed(a, renderScale: 0.25))
+            let m = lum[lum.count / 2]
+            check("auto tone lifts a dark photo", t.exposure > 0.3 && abs(m - 0.42) < 0.08, String(format: "ev %.2f, median %.2f", t.exposure, m))
+        }
+
+        // Export keeps metadata (optionally without location), and parallel exports never share a name.
+        let exportDir = dir.appendingPathComponent("export-out")
+        try? FileManager.default.removeItem(at: exportDir)
+        try? FileManager.default.createDirectory(at: exportDir, withIntermediateDirectories: true)
+        let tagged = dir.appendingPathComponent("tagged.jpg")
+        if let d = CGImageDestinationCreateWithURL(tagged as CFURL, UTType.jpeg.identifier as CFString, 1, nil) {
+            let props: [CFString: Any] = [
+                kCGImagePropertyExifDictionary: [kCGImagePropertyExifDateTimeOriginal: "2024:06:01 18:30:00", kCGImagePropertyExifLensModel: "Test 35mm"],
+                kCGImagePropertyGPSDictionary: [kCGImagePropertyGPSLatitude: 48.85, kCGImagePropertyGPSLatitudeRef: "N",
+                                                kCGImagePropertyGPSLongitude: 2.35, kCGImagePropertyGPSLongitudeRef: "E"],
+            ]
+            CGImageDestinationAddImage(d, img, props as CFDictionary)
+            CGImageDestinationFinalize(d)
+        }
+        func props(_ u: URL) -> [CFString: Any] {
+            CGImageSourceCreateWithURL(u as CFURL, nil).flatMap { CGImageSourceCopyPropertiesAtIndex($0, 0, nil) as? [CFString: Any] } ?? [:]
+        }
+        var es = ExportSettings(); es.longEdge = 800
+        if let out = try? Exporter.export((tagged, Adjustments()), settings: es, to: exportDir) {
+            let p = props(out), exif = p[kCGImagePropertyExifDictionary] as? [CFString: Any]
+            check("export keeps capture date and lens", exif?[kCGImagePropertyExifDateTimeOriginal] as? String == "2024:06:01 18:30:00"
+                  && exif?[kCGImagePropertyExifLensModel] as? String == "Test 35mm", "\(exif ?? [:])")
+            check("export keeps location by default", p[kCGImagePropertyGPSDictionary] != nil, "")
+            check("export orientation is upright", (p[kCGImagePropertyOrientation] as? Int ?? 1) == 1, "")
+        } else { check("export with metadata", false, "export failed") }
+        es.stripLocation = true
+        if let out = try? Exporter.export((tagged, Adjustments()), settings: es, to: exportDir) {
+            let p = props(out)
+            check("export can remove location", p[kCGImagePropertyGPSDictionary] == nil
+                  && (p[kCGImagePropertyExifDictionary] as? [CFString: Any])?[kCGImagePropertyExifDateTimeOriginal] != nil, "")
+        }
+        let parallelDir = exportDir.appendingPathComponent("parallel")
+        try? FileManager.default.createDirectory(at: parallelDir, withIntermediateDirectories: true)
+        var parallelOut: [URL] = []
+        var parallelDone = false
+        Task {
+            let r = await Exporter.exportAll(Array(repeating: (tagged, Adjustments()), count: 4), settings: es, to: parallelDir, concurrency: 2) { _ in }
+            parallelOut = r.compactMap { try? $0.result.get() }
+            parallelDone = true
+        }
+        while !parallelDone { RunLoop.main.run(until: Date().addingTimeInterval(0.05)) }
+        check("parallel exports get distinct names", Set(parallelOut.map(\.lastPathComponent)).count == 4
+              && parallelOut.allSatisfy { ((try? FileManager.default.attributesOfItem(atPath: $0.path)[.size] as? Int) ?? 0) > 1000 },
+              parallelOut.map(\.lastPathComponent).joined(separator: ", "))
+
+        // Selective paste: all groups together copy everything; one group copies only itself.
+        var full = Adjustments()
+        full.exposure = 1; full.contrast = 10; full.highlights = -20; full.shadows = 20; full.whites = 5; full.blacks = -5
+        full.temperature = 12; full.tint = -3; full.vibrance = 15; full.saturation = -10
+        full.grading.shadows.saturation = 30; full.curve = [CurvePoint(x: 0, y: 0.1), CurvePoint(x: 1, y: 1)]
+        full.hsl[2].hue = 20; full.sharpening = 40; full.noiseReduction = 20; full.vignette = -30
+        full.masks = [Mask(name: "R", kind: .radial)]; full.crop.angle = 3
+        check("paste with every group copies everything", Adjustments().copying(Set(SettingsGroup.allCases), from: full) == full, "")
+        let onlyLight = Adjustments().copying([.light], from: full)
+        check("paste one group copies only it", onlyLight.exposure == 1 && onlyLight.temperature == 0 && onlyLight.masks.isEmpty
+              && onlyLight.crop == CropSettings(), "")
+
         // LUT speed (rebuilt on every curve/HSL/wheel drag).
         let t0 = Date()
         var key = ColorLUTKey(Adjustments()); key.contrast = 13; key.hsl[2].hue = 20; key.grading.midtones.saturation = 30
@@ -412,7 +534,31 @@ enum NSColorShim {
     }
 }
 
-/// `Pixon --snapshot <dir>`: drives the UI through its main states and saves window captures.
+/// Output folders for `--selftest` and `--snapshot`, which delete and recreate things inside them.
+enum TestOutput {
+    static let marker = ".halfstop-test-output"
+
+    /// True when `dir` is safe to use: it didn't exist (it's created), is an empty folder, or holds
+    /// the marker from an earlier run. The marker is written so later runs can reuse it. Anything
+    /// else (a home folder, a link, a folder with other files) is refused and left untouched.
+    static func claim(_ dir: URL) -> Bool {
+        let fm = FileManager.default
+        let markerURL = dir.appendingPathComponent(marker)
+        switch LibraryFiles.kind(dir) {
+        case nil:
+            guard (try? fm.createDirectory(at: dir, withIntermediateDirectories: true)) != nil else { return false }
+        case .directory:
+            if LibraryFiles.kind(markerURL) == .file { return true }
+            let contents = ((try? fm.contentsOfDirectory(atPath: dir.path)) ?? ["?"]).filter { $0 != ".DS_Store" }
+            guard contents.isEmpty else { return false }
+        default:
+            return false
+        }
+        return (try? Data("Made by Halfstop --selftest / --snapshot. Its contents may be deleted.\n".utf8).write(to: markerURL)) != nil
+    }
+}
+
+/// `Halfstop --snapshot <dir>`: drives the UI through its main states and saves window captures.
 /// The Metal preview is drawn separately (window caching can't read Metal layers).
 @MainActor
 enum Snapshot {
@@ -437,7 +583,10 @@ enum Snapshot {
 
     static func run(store: LibraryStore, renderer: PreviewRenderer) {
         guard let dir = outputDir else { return }
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        guard TestOutput.claim(dir) else {
+            print("--snapshot: \(dir.path) isn't empty and wasn't made by a snapshot run. Choose a new or empty folder.")
+            return
+        }
         Task { @MainActor in
             func wait(_ s: Double) async { try? await Task.sleep(for: .seconds(s)) }
             @MainActor func shot(_ name: String, sheet: Bool = false) {
@@ -462,7 +611,7 @@ enum Snapshot {
                 let copy = dir.appendingPathComponent("photos")
                 try? FileManager.default.removeItem(at: copy)
                 try? FileManager.default.copyItem(at: samples, to: copy)
-                try? FileManager.default.removeItem(at: copy.appendingPathComponent(".pixon"))
+                try? FileManager.default.removeItem(at: copy.appendingPathComponent(SidecarFiles.folderName))
                 // A photo with two clear subjects for the subject-mask step.
                 if let ctx = CGContext(data: nil, width: 1800, height: 1200, bitsPerComponent: 8, bytesPerRow: 0, space: Render.sRGB,
                                        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) {
@@ -769,6 +918,8 @@ enum LibraryTest {
                 store.flushSaves()
                 let sidecar = LibraryStore.sidecarURL(for: doomed.url)
                 let hadSidecar = fm.fileExists(atPath: sidecar.path)
+                let historyFile = SidecarFiles.historyURL(for: doomed.url)
+                let hadHistory = fm.fileExists(atPath: historyFile.path)
                 if let c = store.catalog.collections.first { store.addToCollection(c.id, [doomed]) }
                 let before = store.photos.count
 
@@ -784,6 +935,7 @@ enum LibraryTest {
                 let failed = store.moveToTrash([doomed.url])
                 check("photo file moved to trash", failed.isEmpty && !fm.fileExists(atPath: doomed.url.path))
                 check("sidecar moved too", hadSidecar && !fm.fileExists(atPath: sidecar.path), "had \(hadSidecar)")
+                check("history file moved too", hadHistory && !fm.fileExists(atPath: historyFile.path), "had \(hadHistory)")
                 check("removed from library and collections", store.photos.count == before - 1
                       && !store.catalog.collections.contains { $0.members.contains(doomed.ref) }
                       && store.catalog.fingerprints[doomed.ref.key] == nil)
@@ -818,7 +970,489 @@ enum LibraryTest {
         } else {
             check("brush mask renders", false)
         }
+        // Sorting (restores the user's choice afterwards: it's remembered in UserDefaults).
+        let (savedSort, savedDesc) = (store.sortOrder, store.sortDescending)
+        store.source = .all; store.filter = .all; store.minRating = 0
+        store.sortOrder = .fileName; store.sortDescending = false
+        let names = store.visiblePhotos.map(\.name)
+        check("sort by file name", names == names.sorted { $0.lowercased().compare($1.lowercased(), options: .numeric) == .orderedAscending }, "\(names)")
+        store.sortDescending = true
+        check("reverse order", store.visiblePhotos.map(\.name) == names.reversed(), "")
+        if let first = store.visiblePhotos.last { store.select(first); store.setRating(5) }
+        store.sortOrder = .rating; store.sortDescending = false
+        check("sort by rating puts the best first", store.visiblePhotos.first?.rating == 5, "")
+        store.sortOrder = savedSort; store.sortDescending = savedDesc
+
+        await sidecarChecks(dir: dir.appendingPathComponent("sidecars"), check: check)
+        await scaleChecks(dir: dir.appendingPathComponent("scale"), check: check)
+        toleranceChecks(dir: dir.appendingPathComponent("tolerance"), check: check)
+        await saveFailureChecks(dir: dir.appendingPathComponent("save-failures"), check: check)
         print(ok ? "LIBRARY PASSED" : "LIBRARY FAILED")
         return ok
+    }
+}
+
+// MARK: - Sidecar files
+
+extension LibraryTest {
+    /// History lives in its own file with strokes pooled; older inline-history sidecars still load.
+    @MainActor
+    static func sidecarChecks(dir: URL, check: (String, Bool, String) -> Void) async {
+        let fm = FileManager.default
+        try? fm.removeItem(at: dir)
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        let photo = dir.appendingPathComponent("brushy.jpg")
+        if let img = SelfTest.scene(width: 300, height: 200, hue: 0.5, variant: 1) { SelfTest.write(img, to: photo) }
+
+        // A brush-heavy history: 60 steps, each adding a 150-point stroke to the same mask.
+        var a = Adjustments()
+        var mask = Mask(name: "Brush", kind: .brush)
+        mask.local.exposure = 0.5
+        var history = [HistoryStep(label: "Original", adjustments: a)]
+        for i in 0..<60 {
+            let y = Double(i) / 60
+            mask.strokes.append(BrushStroke(points: (0..<150).map { NormPoint(x: Double($0) / 150, y: y + 0.01 * sin(Double($0))) }, radius: 0.03))
+            a.masks = [mask]
+            history.append(HistoryStep(label: "Brush \(i)", adjustments: a))
+        }
+        var sidecar = Sidecar()
+        sidecar.rating = 3
+        sidecar.adjustments = a
+        sidecar.history = history
+        sidecar.historyIndex = history.count - 1
+
+        try? SidecarFiles.write(sidecar, for: photo, history: true)
+        let back = SidecarFiles.read(for: photo)
+        check("history round-trips", back?.history == history && back?.historyIndex == history.count - 1 && back?.rating == 3, "")
+        let mainSize = (try? fm.attributesOfItem(atPath: SidecarFiles.mainURL(for: photo).path)[.size] as? Int) ?? 0
+        let histSize = (try? fm.attributesOfItem(atPath: SidecarFiles.historyURL(for: photo).path)[.size] as? Int) ?? 0
+        let oldSize = (try? JSONEncoder().encode(sidecar).count) ?? 0
+        check("pooled history is small", histSize > 0 && histSize * 10 < oldSize, "\(histSize / 1024) KB vs \(oldSize / 1024) KB inline")
+        let mainJSON = (try? String(contentsOf: SidecarFiles.mainURL(for: photo), encoding: .utf8)) ?? ""
+        check("main sidecar has no history", !mainJSON.contains("\"history\""), "\(mainSize / 1024) KB")
+
+        // A rating change doesn't rewrite the history file.
+        var rated = sidecar
+        rated.rating = 5
+        rated.history = Array(history.prefix(2))
+        try? SidecarFiles.write(rated, for: photo, history: false)
+        let afterRating = SidecarFiles.read(for: photo)
+        check("rating save leaves history alone", afterRating?.rating == 5 && afterRating?.history.count == history.count, "")
+
+        // An older sidecar (history inline) loads, and moves its history out on the next save.
+        let legacy = dir.appendingPathComponent("legacy.jpg")
+        try? fm.copyItem(at: photo, to: legacy)
+        let encoder = JSONEncoder()
+        try? encoder.encode(sidecar).write(to: SidecarFiles.mainURL(for: legacy))
+        let legacyBack = SidecarFiles.read(for: legacy)
+        check("older inline-history sidecar loads", legacyBack?.history == history, "")
+        if var lb = legacyBack {
+            lb.rating = 1
+            try? SidecarFiles.write(lb, for: legacy, history: false)
+            let migrated = SidecarFiles.read(for: legacy)
+            check("older history moves to its own file", fm.fileExists(atPath: SidecarFiles.historyURL(for: legacy).path)
+                  && migrated?.history == history && migrated?.rating == 1, "")
+        }
+
+        // Renames carry both files.
+        let (done, errors) = LibraryStore.applyRenames(["brushy.jpg": "renamed.jpg"], in: dir.path)
+        let renamed = dir.appendingPathComponent("renamed.jpg")
+        check("rename moves both sidecar files", done.count == 1 && errors.isEmpty
+              && fm.fileExists(atPath: SidecarFiles.historyURL(for: renamed).path)
+              && !fm.fileExists(atPath: SidecarFiles.historyURL(for: photo).path)
+              && SidecarFiles.read(for: renamed)?.history.count == history.count, "")
+
+        // Nothing left to keep: both files go.
+        try? SidecarFiles.write(Sidecar(), for: renamed, history: true)
+        check("empty sidecar removes both files", !fm.fileExists(atPath: SidecarFiles.mainURL(for: renamed).path)
+              && !fm.fileExists(atPath: SidecarFiles.historyURL(for: renamed).path), "")
+
+        // Sidecars saved under the app's old name move to the new folder when first read.
+        let oldFolder = dir.appendingPathComponent("old-name", isDirectory: true)
+        let oldSidecars = oldFolder.appendingPathComponent(LegacyNames.sidecarFolder, isDirectory: true)
+        try? fm.createDirectory(at: oldSidecars, withIntermediateDirectories: true)
+        var oldSidecar = Sidecar()
+        oldSidecar.rating = 4
+        try? JSONEncoder().encode(oldSidecar).write(to: oldSidecars.appendingPathComponent("old.jpg.json"))
+        let oldBack = SidecarFiles.read(for: oldFolder.appendingPathComponent("old.jpg"))
+        check("old-name sidecar folder is moved and read", oldBack?.rating == 4
+              && !fm.fileExists(atPath: oldSidecars.path)
+              && fm.fileExists(atPath: oldFolder.appendingPathComponent(SidecarFiles.folderName).path), "")
+    }
+}
+
+// MARK: - Library scale
+
+extension LibraryTest {
+    /// Thumbnails survive a restart on disk; a change in one folder rescans only that folder.
+    @MainActor
+    static func scaleChecks(dir: URL, check: (String, Bool, String) -> Void) async {
+        let fm = FileManager.default
+        try? fm.removeItem(at: dir)
+        let x = dir.appendingPathComponent("X"), y = dir.appendingPathComponent("Y")
+        try? fm.createDirectory(at: x, withIntermediateDirectories: true)
+        try? fm.createDirectory(at: y, withIntermediateDirectories: true)
+        for (i, folder) in [x, x, y].enumerated() {
+            if let img = SelfTest.scene(width: 900, height: 600, hue: Double(i) / 4, variant: i) {
+                SelfTest.write(img, to: folder.appendingPathComponent("P\(i).jpg"))
+            }
+        }
+
+        // Disk thumbnails: a fresh service (empty memory caches) reads what an earlier one wrote.
+        let photo = x.appendingPathComponent("P0.jpg")
+        var edit = Adjustments(); edit.exposure = 0.5
+        let first = await ThumbnailService().image(url: photo, adjustments: edit)
+        ThumbnailDiskCache.shared.flush()
+        let files = (fm.enumerator(at: ThumbnailDiskCache.directory, includingPropertiesForKeys: nil)?.allObjects as? [URL] ?? [])
+            .filter { $0.pathExtension == "jpg" }
+        check("thumbnails are written to disk", files.count >= 2, "\(files.count) files")
+        let key = ThumbnailDiskCache.shared.key(url: photo, adjustments: edit)
+        let fromDisk = key.flatMap { ThumbnailDiskCache.shared.load($0) }
+        let second = await ThumbnailService().image(url: photo, adjustments: edit)
+        check("thumbnails load back from disk", fromDisk != nil && second?.width == first?.width, "\(first?.width ?? 0) / \(second?.width ?? 0)")
+        try? fm.setAttributes([.modificationDate: Date().addingTimeInterval(60)], ofItemAtPath: photo.path)
+        check("a changed file gets a new thumbnail", ThumbnailDiskCache.shared.key(url: photo, adjustments: edit) != key, "")
+
+        // Per-folder rescans.
+        let store = LibraryStore(catalogURL: dir.appendingPathComponent("catalog.json"), watch: false)
+        store.catalog.folders = [CatalogFolder(path: x.path), CatalogFolder(path: y.path)]
+        await withCheckedContinuation { c in store.reload { c.resume() } }
+        let xID = store.catalog.folders[0].id, yID = store.catalog.folders[1].id
+        let yPhoto = store.photos.first { $0.ref.folder == yID }
+        check("folder events map to their folder", store.foldersContaining([x.appendingPathComponent("P9.jpg").path]) == [xID]
+              && store.foldersContaining(["/somewhere/else.jpg"]) == nil, "")
+        if let img = SelfTest.scene(width: 300, height: 200, hue: 0.7, variant: 3) { SelfTest.write(img, to: x.appendingPathComponent("P9.jpg")) }
+        await withCheckedContinuation { c in store.reload(only: [xID]) { c.resume() } }
+        check("rescanning one folder picks up its new photo", store.photos.count == 4
+              && store.photos.contains { $0.url.lastPathComponent == "P9.jpg" }, "\(store.photos.count)")
+        check("other folders are left as they were", store.photos.first { $0.ref.folder == yID } === yPhoto
+              && store.photos.last?.ref.folder == yID, "")
+    }
+}
+
+// MARK: - Damaged and hostile files
+
+extension LibraryTest {
+    /// Files written by other versions, damaged, or crafted to cause harm.
+    static func toleranceChecks(dir: URL, check: (String, Bool, String) -> Void) {
+        let fm = FileManager.default
+        try? fm.removeItem(at: dir)
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        func backups(_ prefix: String) -> [String] {
+            ((try? fm.contentsOfDirectory(atPath: dir.path)) ?? []).filter { $0.hasPrefix(prefix + ".partial-") }
+        }
+
+        // Catalog: one folder from another version (no `excluded`), one with no path, and a
+        // collection with one malformed member. Only the broken pieces may be dropped.
+        let keep = UUID().uuidString
+        let catalogJSON = """
+        {"version":1,"folders":[
+          {"id":"\(UUID().uuidString)","path":"/x/2024","includeSubfolders":true,"excluded":[],"addedAt":"2024-01-01T00:00:00Z"},
+          {"id":"\(keep)","path":"/x/2025","includeSubfolders":false,"addedAt":"2025-01-01T00:00:00Z"},
+          {"id":"\(UUID().uuidString)","includeSubfolders":true}],
+         "collections":[{"id":"\(UUID().uuidString)","name":"Best","members":[],"createdAt":"2024-01-01T00:00:00Z"},
+                        {"id":"\(UUID().uuidString)","name":"Mixed","members":[{"folder":"\(keep)","path":5},{"folder":"\(keep)","path":"a.jpg"}]}],
+         "fingerprints":{"a":"1","b":7},
+         "lastImport":{"folder":"\(keep)","refs":[{"folder":"\(keep)","path":"a.jpg"}]}}
+        """
+        let catalogURL = dir.appendingPathComponent("catalog.json")
+        try? catalogJSON.write(to: catalogURL, atomically: true, encoding: .utf8)
+        let catalog = Catalog.load(from: catalogURL)
+        check("catalog keeps good folders when one is bad", catalog.folders.map(\.path) == ["/x/2024", "/x/2025"]
+              && catalog.folders[1].includeSubfolders == false, "\(catalog.folders.map(\.path))")
+        check("catalog keeps a collection with a bad member", catalog.collections.count == 2
+              && catalog.collections[1].members.map(\.path) == ["a.jpg"], "\(catalog.collections.map(\.members.count))")
+        check("catalog keeps other entries", catalog.fingerprints == ["a": "1"] && catalog.lastImport?.refs.count == 1, "")
+        check("catalog with dropped entries is backed up", backups("catalog").count == 1, "\(backups("catalog"))")
+        _ = Catalog.load(from: catalogURL)
+        check("backup isn't repeated on every load", backups("catalog").count == 1, "")
+
+        let current = dir.appendingPathComponent("current.json")
+        try? Catalog().save(to: current)
+        _ = Catalog.load(from: current)
+        check("a clean catalog makes no backup", backups("current").isEmpty, "")
+
+        // Presets: one malformed preset must not take the others with it.
+        let presetsURL = dir.appendingPathComponent("presets.json")
+        let presetsJSON = """
+        [{"id":"\(UUID().uuidString)","name":"Warm","adjustments":{"temperature":20}},
+         {"id":"\(UUID().uuidString)","name":"Broken","adjustments":7},
+         {"name":"Older","adjustments":{"exposure":0.5,"futureField":1}}]
+        """
+        try? presetsJSON.write(to: presetsURL, atomically: true, encoding: .utf8)
+        let presets = LibraryStore.loadPresets(from: presetsURL)
+        check("presets keep good entries when one is bad", presets.map(\.name) == ["Warm", "Older"]
+              && presets[1].adjustments.exposure == 0.5, "\(presets.map(\.name))")
+        check("presets with dropped entries are backed up", backups("presets").count == 1, "")
+
+        sidecarToleranceChecks(dir: dir.appendingPathComponent("sidecars"), check: check)
+
+        // Values that would hang or blank the renderer are brought into range when loaded.
+        let hostile = """
+        {"masks":[{"name":"m","kind":"sky","grow":1e6,"softness":1e6,"radiusX":1e9,"feather":-3,
+                   "strokes":[{"points":[{"x":0,"y":0},{"x":1e8,"y":-1e8}],"radius":0,"feather":7,"flow":-1}],
+                   "shapes":[{"kind":"radial","radiusX":1e9,"radiusY":-5,"center":{"x":1e300,"y":0.5}}]}],
+         "crop":{"rect":{"x":-2,"y":0.5,"width":-1,"height":9},"angle":1e5}}
+        """
+        let h = try? JSONDecoder().decode(Adjustments.self, from: Data(hostile.utf8))
+        let hm = h?.masks.first, hs = hm?.strokes.first, shape = hm?.shapes.first
+        check("hostile stroke values are clamped on load", hs?.points.last == NormPoint(x: 50, y: -50) && hs?.radius == 0.0005
+              && hs?.feather == 1 && hs?.flow == 0, "\(String(describing: hs))")
+        check("hostile mask values are clamped on load", hm?.grow == 100 && hm?.softness == 100 && hm?.radiusX == 10 && hm?.feather == 0
+              && shape?.radiusX == 10 && shape?.radiusY == 0.001 && shape?.center.x == 50, "")
+        let hc = h?.crop
+        check("hostile crop is clamped on load", hc?.angle == 45 && hc?.rect.x == 0 && hc?.rect.width == EditLimits.minCropSide
+              && hc?.rect.y == 0.5 && hc?.rect.height == 0.5, "\(String(describing: hc))")
+        var normal = Adjustments()
+        var nm = Mask(name: "n", kind: .brush)
+        nm.strokes = [BrushStroke(points: [NormPoint(x: -0.3, y: 0.2), NormPoint(x: 1.4, y: 0.9)], radius: 0.25, feather: 0, flow: 0.5)]
+        nm.radiusX = 3
+        normal.masks = [nm]
+        normal.crop.rect = NormRect(x: 0.1, y: 0.2, width: 0.9, height: 0.5)
+        normal.crop.angle = -12
+        let normalBack = (try? JSONEncoder().encode(normal)).flatMap { try? JSONDecoder().decode(Adjustments.self, from: $0) }
+        check("edits the editor makes load unchanged", normalBack == normal, "")
+
+        symlinkChecks(dir: dir.appendingPathComponent("links"), check: check)
+
+        // Rename names can't hide files, add line breaks, disguise names or run too long.
+        func renamed(_ custom: String) -> String {
+            RenamePattern.plan([(path: "sub/IMG_1.jpg", date: Date(timeIntervalSince1970: 0))], pattern: .nameSequence,
+                               customName: custom)["sub/IMG_1.jpg"] ?? ""
+        }
+        check("rename: leading dot doesn't hide files", renamed(".hidden") == "sub/hidden-001.jpg", renamed(".hidden"))
+        check("rename: dot-dot stays a name", !renamed("..").contains("/../") && renamed("..").hasPrefix("sub/"), renamed(".."))
+        check("rename: no control or direction characters", renamed("a\nb\u{0}c") == "sub/abc-001.jpg"
+              && renamed("\u{202E}gpj.exe") == "sub/gpj.exe-001.jpg", renamed("a\nb\u{0}c"))
+        check("rename: separators and colons replaced", renamed("a/b:c d") == "sub/a-b-c-d-001.jpg", renamed("a/b:c d"))
+        let long = renamed(String(repeating: "é", count: 300))
+        check("rename: long names are capped", (long as NSString).lastPathComponent.utf8.count < 255, "\(long.utf8.count) bytes")
+        check("rename: ordinary names are unchanged", renamed("japan-2024") == "sub/japan-2024-001.jpg", "")
+
+        // Renames: only swaps use temporary names, and an interrupted rename is put back on the next scan.
+        let swap = dir.appendingPathComponent("swap")
+        try? fm.createDirectory(at: swap, withIntermediateDirectories: true)
+        for n in ["a.jpg", "b.jpg", "c.jpg", "CASE.jpg"] { try? Data(n.utf8).write(to: swap.appendingPathComponent(n)) }
+        let (swapped, swapErrors) = LibraryStore.applyRenames(["a.jpg": "b.jpg", "b.jpg": "a.jpg", "c.jpg": "d.jpg", "CASE.jpg": "case.jpg"], in: swap.path)
+        let contents = { ((try? fm.contentsOfDirectory(atPath: swap.path)) ?? []).sorted() }
+        check("rename: swaps, plain and case-only renames all land", swapped.count == 4 && swapErrors.isEmpty
+              && (try? String(contentsOf: swap.appendingPathComponent("b.jpg"), encoding: .utf8)) == "a.jpg"
+              && (try? String(contentsOf: swap.appendingPathComponent("a.jpg"), encoding: .utf8)) == "b.jpg"
+              && contents() == ["a.jpg", "b.jpg", "case.jpg", "d.jpg"], "\(contents()) \(swapErrors)")
+        let leftover = LibraryFiles.temporaryRenameName(for: "IMG_7.CR3")
+        check("rename: temporary names stay visible photos", !leftover.hasPrefix(".") && leftover.hasSuffix(".CR3")
+              && LibraryFiles.originalName(fromTemporary: leftover) == "IMG_7.CR3", leftover)
+        try? Data("x".utf8).write(to: swap.appendingPathComponent(leftover))
+        let blocked = LibraryFiles.temporaryRenameName(for: "a.jpg")
+        try? Data("y".utf8).write(to: swap.appendingPathComponent(blocked))
+        let restored = LibraryFiles.recoverInterruptedRenames(in: swap, recursive: true)
+        check("rename: an interrupted rename is put back on the next scan", restored == 1
+              && fm.fileExists(atPath: swap.appendingPathComponent("IMG_7.CR3").path)
+              && fm.fileExists(atPath: swap.appendingPathComponent(blocked).path)
+              && (try? String(contentsOf: swap.appendingPathComponent("a.jpg"), encoding: .utf8)) == "b.jpg", "\(contents())")
+
+        // Test output folders: only new, empty or marked ones are used.
+        let outputs = dir.appendingPathComponent("outputs")
+        try? fm.createDirectory(at: outputs.appendingPathComponent("full"), withIntermediateDirectories: true)
+        try? "keep".write(to: outputs.appendingPathComponent("full/notes.txt"), atomically: true, encoding: .utf8)
+        try? fm.createDirectory(at: outputs.appendingPathComponent("empty"), withIntermediateDirectories: true)
+        try? fm.createSymbolicLink(at: outputs.appendingPathComponent("link"), withDestinationURL: outputs.appendingPathComponent("empty"))
+        let home = fm.homeDirectoryForCurrentUser
+        check("test output: home folder is refused", !TestOutput.claim(home)
+              && LibraryFiles.kind(home.appendingPathComponent(TestOutput.marker)) == nil, "")
+        check("test output: a folder with other files is refused", !TestOutput.claim(outputs.appendingPathComponent("full"))
+              && (try? fm.contentsOfDirectory(atPath: outputs.appendingPathComponent("full").path)) == ["notes.txt"], "")
+        check("test output: a link is refused", !TestOutput.claim(outputs.appendingPathComponent("link")), "")
+        check("test output: new and empty folders are used, then reused",
+              TestOutput.claim(outputs.appendingPathComponent("new")) && TestOutput.claim(outputs.appendingPathComponent("empty"))
+              && TestOutput.claim(outputs.appendingPathComponent("empty")), "")
+
+        // Export checks the declared size before decoding (limit lowered so a normal photo trips it;
+        // the real case is a tiny PNG declaring gigapixels).
+        let big = dir.appendingPathComponent("big.jpg")
+        if let img = SelfTest.scene(width: 600, height: 400, hue: 0.3, variant: 1) { SelfTest.write(img, to: big) }
+        let limit = ImageSource.maxFullSizePixels
+        ImageSource.maxFullSizePixels = 100_000
+        var exportError = ""
+        do { _ = try Exporter.export((big, Adjustments()), settings: ExportSettings(), to: dir) } catch { exportError = error.localizedDescription }
+        check("export refuses an image over the pixel limit", exportError.contains("too large to export"), exportError)
+        check("full-size decode refuses it; previews still load", ImageSource(url: big, maxPixelSize: nil) == nil
+              && ImageSource(url: big, maxPixelSize: 256) != nil, "")
+        ImageSource.maxFullSizePixels = limit
+        let exported = try? Exporter.export((big, Adjustments()), settings: ExportSettings(), to: dir)
+        check("export works under the limit", exported.map { fm.fileExists(atPath: $0.path) } == true, "")
+    }
+
+    /// A sidecar folder or file that's a link (planted in a shared or downloaded folder) is never
+    /// followed: nothing outside the photo's folder is read, written, deleted or moved.
+    static func symlinkChecks(dir: URL, check: (String, Bool, String) -> Void) {
+        let fm = FileManager.default
+        let victim = dir.appendingPathComponent("victim")
+        try? fm.createDirectory(at: victim, withIntermediateDirectories: true)
+        let precious = victim.appendingPathComponent("IMG_1.jpg.history.json")
+        try? "precious".write(to: precious, atomically: true, encoding: .utf8)
+        try? "{\"rating\":5}".write(to: victim.appendingPathComponent("IMG_1.jpg.json"), atomically: true, encoding: .utf8)
+        func victimFiles() -> [String] { ((try? fm.contentsOfDirectory(atPath: victim.path)) ?? []).sorted() }
+        let untouched = victimFiles()
+
+        func sharedPhoto(_ linkName: String) -> URL {
+            let shared = dir.appendingPathComponent("shared" + linkName)
+            try? fm.createDirectory(at: shared, withIntermediateDirectories: true)
+            try? fm.createSymbolicLink(at: shared.appendingPathComponent(linkName), withDestinationURL: victim)
+            let photo = shared.appendingPathComponent("IMG_1.jpg")
+            if let img = SelfTest.scene(width: 64, height: 64, hue: 0.1, variant: 0) { SelfTest.write(img, to: photo) }
+            return photo
+        }
+
+        // The sidecar folder itself is a link: everything through it is refused.
+        let photo1 = sharedPhoto(SidecarFiles.folderName)
+        check("sidecar folder link: not read through", SidecarFiles.read(for: photo1) == nil, "")
+        var s = Sidecar(); s.rating = 3
+        let wrote = (try? SidecarFiles.write(s, for: photo1, history: true)) != nil
+        check("sidecar folder link: write is refused", !wrote && victimFiles() == untouched, "\(victimFiles())")
+        s.rating = 0
+        let removed = (try? SidecarFiles.write(s, for: photo1, history: true)) != nil
+        check("sidecar folder link: delete is refused", !removed && victimFiles() == untouched
+              && (try? String(contentsOf: precious, encoding: .utf8)) == "precious", "")
+        check("sidecar folder link: trash skips its sidecars", SidecarFiles.all(for: photo1).allSatisfy { !SidecarFiles.isSafe($0, for: photo1) }, "")
+        let (moved1, _) = LibraryStore.applyRenames(["IMG_1.jpg": "renamed.jpg"], in: photo1.deletingLastPathComponent().path)
+        check("sidecar folder link: rename moves the photo, not files through the link", moved1.count == 1 && victimFiles() == untouched, "")
+
+        // The old-name folder is a link: it isn't migrated, and edits go to a new real folder.
+        let photo2 = sharedPhoto(LegacyNames.sidecarFolder)
+        check("old-name folder link: not read through", SidecarFiles.read(for: photo2) == nil, "")
+        s.rating = 3
+        let wrote2 = (try? SidecarFiles.write(s, for: photo2, history: true)) != nil
+        let newFolder = photo2.deletingLastPathComponent().appendingPathComponent(SidecarFiles.folderName)
+        check("old-name folder link: edits saved in a real folder instead", wrote2 && LibraryFiles.kind(newFolder) == .directory
+              && SidecarFiles.read(for: photo2)?.rating == 3 && victimFiles() == untouched, "")
+
+        // A link in place of one sidecar file inside a real sidecar folder.
+        let real = dir.appendingPathComponent("real")
+        try? fm.createDirectory(at: real.appendingPathComponent(SidecarFiles.folderName), withIntermediateDirectories: true)
+        let photo = real.appendingPathComponent("IMG_1.jpg")
+        if let img = SelfTest.scene(width: 64, height: 64, hue: 0.1, variant: 0) { SelfTest.write(img, to: photo) }
+        try? fm.createSymbolicLink(at: SidecarFiles.historyURL(for: photo), withDestinationURL: precious)
+        s.rating = 2
+        let wrote3 = (try? SidecarFiles.write(s, for: photo, history: true)) != nil
+        check("linked sidecar file: write is refused", !wrote3 && (try? String(contentsOf: precious, encoding: .utf8)) == "precious", "")
+
+        // Rename records come from the catalog file: they can't move photos out of their folder.
+        let outside = dir.appendingPathComponent("outside")
+        try? fm.createDirectory(at: outside, withIntermediateDirectories: true)
+        let (done, errors) = LibraryStore.applyRenames(["IMG_1.jpg": "../outside/IMG_1.jpg"], in: real.path)
+        try? fm.createSymbolicLink(at: real.appendingPathComponent("escape"), withDestinationURL: outside)
+        let (viaLink, linkErrors) = LibraryStore.applyRenames(["IMG_1.jpg": "escape/IMG_1.jpg"], in: real.path)
+        check("rename can't move a photo through a linked subfolder", viaLink.isEmpty && linkErrors.count == 1
+              && fm.fileExists(atPath: photo.path), "\(linkErrors)")
+        check("rename can't move a photo out of its folder", done.isEmpty && errors.count == 1
+              && fm.fileExists(atPath: photo.path) && !fm.fileExists(atPath: outside.appendingPathComponent("IMG_1.jpg").path), "\(errors)")
+    }
+
+    /// One malformed item in a sidecar loses only that item, and the original is kept.
+    static func sidecarToleranceChecks(dir: URL, check: (String, Bool, String) -> Void) {
+        let fm = FileManager.default
+        try? fm.createDirectory(at: dir.appendingPathComponent(SidecarFiles.folderName), withIntermediateDirectories: true)
+        let photo = dir.appendingPathComponent("p.jpg")
+        if let img = SelfTest.scene(width: 64, height: 64, hue: 0.2, variant: 0) { SelfTest.write(img, to: photo) }
+        func backups() -> [String] {
+            ((try? fm.contentsOfDirectory(atPath: dir.appendingPathComponent(SidecarFiles.folderName).path)) ?? [])
+                .filter { $0.contains(".partial-") }
+        }
+
+        // A stroke and a crop from another version (missing fields), a snapshot with no
+        // adjustments, a malformed curve point and a shape of an unknown kind.
+        let main = """
+        {"version":2,"rating":5,"flag":"pick",
+         "snapshots":[{"id":"\(UUID().uuidString)","name":"Final","date":0,"adjustments":{}},{"name":"x"}],
+         "adjustments":{"exposure":1.2,"crop":{"rect":{"x":0.1,"y":0,"width":0.8,"height":1},"angle":2},
+           "masks":[{"name":"Sky","kind":"brush","strokes":[
+             {"points":[{"x":0.1,"y":0.1}],"radius":0.05,"feather":0.5,"flow":1,"erase":false},
+             {"points":[{"x":0.2,"y":0.2},{"x":"bad"}],"radius":0.05,"feather":0.5,"flow":1}],
+             "shapes":[{"kind":"radial","mode":"subtract"},{"kind":"polygon"}]}],
+           "curve":[{"x":0,"y":0},{"x":0.5,"y":0.7},{"x":1}]}}
+        """
+        try? main.write(to: SidecarFiles.mainURL(for: photo), atomically: true, encoding: .utf8)
+        let s = SidecarFiles.read(for: photo)
+        let mask = s?.adjustments.masks.first
+        check("sidecar keeps good strokes when one is from another version", mask?.strokes.count == 2
+              && mask?.strokes[1].points.count == 1 && mask?.strokes[1].erase == false, "\(mask?.strokes.count ?? -1) of 2")
+        check("sidecar keeps good shapes", mask?.shapes.map(\.mode) == [.subtract], "")
+        check("sidecar keeps good curve points", s?.adjustments.curve == [CurvePoint(x: 0, y: 0), CurvePoint(x: 0.5, y: 0.7)], "")
+        check("sidecar keeps good snapshots", s?.snapshots.map(\.name) == ["Final"], "")
+        check("crop with a missing field still loads", s?.adjustments.crop.rect.x == 0.1 && s?.adjustments.crop.angle == 2, "")
+        check("sidecar keeps the rest", s?.rating == 5 && s?.flag == .pick && s?.adjustments.exposure == 1.2, "")
+        check("sidecar with dropped items is backed up", backups().count == 1, "\(backups())")
+
+        // History file: one bad step and one bad pooled stroke.
+        var a = Adjustments(); a.exposure = 0.3
+        var m = Mask(name: "B", kind: .brush)
+        m.strokes = [BrushStroke(points: [NormPoint(x: 0.5, y: 0.5)])]
+        a.masks = [m]
+        let history = [HistoryStep(label: "Original", adjustments: Adjustments()), HistoryStep(label: "Brush", adjustments: a)]
+        let file = HistoryFile(history, index: 1)
+        guard let data = try? JSONEncoder().encode(file),
+              var json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              var steps = json["steps"] as? [Any], var pool = json["strokes"] as? [String: Any] else {
+            check("history fixture builds", false, ""); return
+        }
+        steps.insert(["label": "Broken"], at: 1)
+        pool["junk"] = 5
+        json["steps"] = steps; json["strokes"] = pool
+        try? JSONSerialization.data(withJSONObject: json).write(to: SidecarFiles.historyURL(for: photo))
+        let h = SidecarFiles.read(for: photo)
+        check("history keeps good steps and strokes", h?.history.map(\.label) == ["Original", "Brush"]
+              && h?.history.last?.adjustments.masks.first?.strokes.count == 1, "\(h?.history.map(\.label) ?? [])")
+        check("history with dropped items is backed up", backups().count == 2, "\(backups())")
+
+        // A sidecar written by this version loads without a backup.
+        let clean = dir.appendingPathComponent("clean.jpg")
+        try? fm.copyItem(at: photo, to: clean)
+        var good = Sidecar(); good.rating = 2; good.adjustments = a
+        good.history = history; good.historyIndex = 1
+        try? SidecarFiles.write(good, for: clean, history: true)
+        let cleanBack = SidecarFiles.read(for: clean)
+        check("a clean sidecar round-trips without a backup", cleanBack?.adjustments == a && cleanBack?.history == history
+              && backups().count == 2, "")
+    }
+}
+
+// MARK: - Save failures
+
+extension LibraryTest {
+    /// A folder that can't be written to: the photo stays unsaved with a reason, and saves once it can.
+    @MainActor
+    static func saveFailureChecks(dir: URL, check: (String, Bool, String) -> Void) async {
+        let fm = FileManager.default
+        let locked = dir.appendingPathComponent("Locked")
+        try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: locked.path)
+        try? fm.removeItem(at: dir)
+        try? fm.createDirectory(at: locked, withIntermediateDirectories: true)
+        if let img = SelfTest.scene(width: 300, height: 200, hue: 0.4, variant: 2) { SelfTest.write(img, to: locked.appendingPathComponent("L1.jpg")) }
+        let store = LibraryStore(catalogURL: dir.appendingPathComponent("catalog.json"), watch: false)
+        store.catalog.folders = [CatalogFolder(path: LibraryFiles.canonical(locked))]
+        await withCheckedContinuation { c in store.reload { c.resume() } }
+        let scan = await store.scanForImport(locked, includeSubfolders: true)
+        check("writable folder is reported writable", scan.writable, "")
+
+        try? fm.setAttributes([.posixPermissions: 0o555], ofItemAtPath: locked.path)
+        defer { try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: locked.path) }
+        let lockedScan = await store.scanForImport(locked, includeSubfolders: true)
+        check("read-only folder is reported at import", !lockedScan.writable, "")
+        guard let photo = store.photos.first else { check("save-failure photo loads", false, ""); return }
+        photo.rating = 4
+        store.scheduleSave(photo)
+        store.flushSaves()
+        let reason = store.failedSaves[photo.url] ?? ""
+        check("a failed save keeps the photo unsaved", store.hasSaveProblems && reason.contains("read-only"), reason)
+        check("the warning names the folder", store.saveProblems.first?.title == "Locked" && store.saveProblems.first?.photoCount == 1, "")
+        check("a failed save doesn't claim to be saved", store.lastSaved == nil && SidecarFiles.read(for: photo.url) == nil, "")
+
+        try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: locked.path)
+        store.flushSaves()
+        check("saves once the folder can be written", !store.hasSaveProblems && SidecarFiles.read(for: photo.url)?.rating == 4, "")
+
+        check("disk full is described plainly",
+              LibraryStore.describeSaveError(NSError(domain: NSPOSIXErrorDomain, code: Int(ENOSPC))) == "The disk is full", "")
     }
 }

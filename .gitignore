@@ -3,3 +3,6 @@ build/
 *.xcodeproj
 .DS_Store
 .swiftpm/
+
+# Local planning and handoff notes
+plans/

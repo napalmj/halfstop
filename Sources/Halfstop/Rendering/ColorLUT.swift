@@ -152,7 +152,7 @@ enum ColorLUT {
             ds += w * bands.sat[i]
             dl += w * bands.lum[i]
         }
-        // Gray-ish pixels barely respond, like Lightroom.
+        // Gray-ish pixels barely respond, so neutrals stay neutral.
         let satWeight = min(1, s * 2.5)
         h += dh / 100 * 30 * satWeight
         if h < 0 { h += 360 }

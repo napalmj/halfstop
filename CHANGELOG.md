@@ -1,9 +1,14 @@
 # Changelog
 
-All notable changes to Pixon are listed here. The format follows
+All notable changes to Halfstop are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
+
+### Changed
+- Renamed the app from Pixon to Halfstop. On first launch, the library, presets, settings and
+  thumbnail cache move to the new name, and each photo folder's hidden `.pixon` sidecar folder is
+  renamed to `.halfstop` the first time Halfstop reads it.
 
 ### Added
 - README with install and usage instructions, a user guide and an architecture overview.
@@ -23,4 +28,4 @@ Initial public development version.
 - Brush, linear, radial, subject and sky masks with refinement.
 - Crop and straighten, edit history with snapshots, presets, copy/paste settings, undo/redo.
 - Export to JPEG, HEIC and 16-bit TIFF; RAW support through Core Image.
-- App icon and `scripts/bundle.sh` to build `Pixon.app`.
+- App icon and `scripts/bundle.sh` to build `Halfstop.app`.

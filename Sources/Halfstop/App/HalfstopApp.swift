@@ -3,18 +3,23 @@ import AppKit
 import UniformTypeIdentifiers
 
 @main
-struct PixonApp: App {
+struct HalfstopApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
-    @State private var store = LibraryStore(catalogURL: Snapshot.catalogOverride ?? Catalog.defaultURL)
+    @State private var store: LibraryStore
     @State private var renderer = PreviewRenderer()
 
     init() {
         SelfTest.runIfRequested()
         Bench.runIfRequested()
+        // Before the library and settings are read.
+        LegacyNames.migrateAppData()
+        let store = LibraryStore(catalogURL: Snapshot.catalogOverride ?? Catalog.defaultURL)
+        LibraryStore.appStore = store
+        _store = State(initialValue: store)
     }
 
     var body: some Scene {
-        Window("Pixon", id: "main") {
+        Window("Halfstop", id: "main") {
             ContentView()
                 .environment(store)
                 .environment(renderer)
@@ -23,9 +28,9 @@ struct PixonApp: App {
         }
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1440, height: 900)
-        .commands { PixonCommands(store: store) }
+        .commands { HalfstopCommands(store: store) }
 
-        Window("Pixon Help", id: "help") {
+        Window("Halfstop Help", id: "help") {
             HelpView()
                 .preferredColorScheme(.dark)
         }
@@ -43,6 +48,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+
+    /// Saves everything; if some edits can't be saved, asks before quitting loses them.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        MainActor.assumeIsolated {
+            guard let store = LibraryStore.appStore else { return .terminateNow }
+            store.flushSaves()
+            guard store.hasSaveProblems else { return .terminateNow }
+            let problems = store.saveProblems
+            let photos = problems.reduce(0) { $0 + $1.photoCount }
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = photos > 0
+                ? "\(photos) photo\(photos == 1 ? " has" : "s have") edits that couldn’t be saved"
+                : "Your library couldn’t be saved"
+            let reasons = problems.prefix(3).map { "\($0.title): \($0.reason.prefix(1).lowercased() + $0.reason.dropFirst())" }
+            alert.informativeText = reasons.joined(separator: "\n") + "\n\nIf you quit now, these changes are lost."
+            alert.addButton(withTitle: "Don’t Quit")
+            alert.addButton(withTitle: "Quit Anyway")
+            if alert.runModal() == .alertFirstButtonReturn {
+                store.showSaveProblems = true
+                return .terminateCancel
+            }
+            return .terminateNow
+        }
+    }
 }
 
 struct ContentView: View {
@@ -94,6 +124,7 @@ struct ContentView: View {
         .sheet(isPresented: $store.showExport) { ExportSheet() }
         .sheet(isPresented: $store.showImport) { ImportSheet() }
         .sheet(isPresented: $store.showSavePreset) { SavePresetSheet() }
+        .sheet(isPresented: $store.showSelectivePaste) { SelectivePasteSheet() }
         .alert(TrashText.title(store.trashRequest),
                isPresented: Binding(get: { store.trashRequest != nil }, set: { if !$0 { store.trashRequest = nil } }),
                presenting: store.trashRequest) { request in
@@ -135,8 +166,8 @@ enum TrashText {
         let wanted = Set(r.urls)
         let edited = photos.filter { wanted.contains($0.url) && !$0.adjustments.isDefault }.count
         var text = names.count == 1
-            ? "“\(names[0])” will be moved from its folder to the Trash, along with its Pixon edits."
-            : "\(list(names)) will be moved from their folders to the Trash, along with their Pixon edits."
+            ? "“\(names[0])” will be moved from its folder to the Trash, along with its Halfstop edits."
+            : "\(list(names)) will be moved from their folders to the Trash, along with their Halfstop edits."
         if edited > 0 && names.count > 1 { text += " \(edited) of them \(edited == 1 ? "has" : "have") edits." }
         let one = names.count == 1
         text += one ? " It’s also removed from your collections." : " They’re also removed from your collections."
@@ -154,7 +185,7 @@ enum TrashText {
     }
 }
 
-/// Single-key shortcuts for culling and editing (Lightroom-style).
+/// Single-key shortcuts for culling and editing.
 @MainActor
 enum KeyHandler {
     static func handle(_ event: NSEvent, store: LibraryStore) -> Bool {
@@ -163,6 +194,12 @@ enum KeyHandler {
         let mods = event.modifierFlags.intersection([.command, .control, .option])
         if !mods.isEmpty { return false }
         guard store.hasLibrary else { return false }
+
+        // ↑/↓ over a slider nudge it (⇧ = 5 steps) instead of changing photos.
+        if store.mode == .edit, event.keyCode == 125 || event.keyCode == 126 {
+            let steps = (event.keyCode == 126 ? 1.0 : -1.0) * (event.modifierFlags.contains(.shift) ? 5 : 1)
+            if SliderFocus.shared.nudge(steps) { return true }
+        }
 
         switch event.keyCode {
         case 123: store.step(-1); return true                                         // ←
@@ -183,7 +220,8 @@ enum KeyHandler {
             }
             return true
         case 53:                                                                      // esc
-            if store.isCropping { store.isCropping = false }
+            if store.pickingWhite { store.pickingWhite = false }
+            else if store.isCropping { store.isCropping = false }
             else if store.refineMode != nil { store.refineMode = nil }
             else if store.activeMaskID != nil { store.activeMaskID = nil }
             else if store.showBefore { store.showBefore = false }
@@ -192,12 +230,21 @@ enum KeyHandler {
         default: break
         }
 
+        // Rating and flags; ⇧ (or Auto Advance) then moves on to the next photo. Digits go by key
+        // code because ⇧1 types "!".
+        let digits: [UInt16: Int] = [29: 0, 18: 1, 19: 2, 20: 3, 21: 4, 23: 5, 82: 0, 83: 1, 84: 2, 85: 3, 86: 4, 87: 5]  // row + keypad
+        let advance = (store.autoAdvance || event.modifierFlags.contains(.shift)) && store.targets.count <= 1
+        if let rating = digits[event.keyCode] {
+            store.setRating(rating)
+            if advance { store.step(1) }
+            return true
+        }
+
         guard let chars = event.charactersIgnoringModifiers?.lowercased(), chars.count == 1 else { return false }
         switch chars {
-        case "0", "1", "2", "3", "4", "5": store.setRating(Int(chars)!)
-        case "p": store.setFlag(.pick)
-        case "x": store.setFlag(.reject)
-        case "u": store.setFlag(.none)
+        case "p": store.setFlag(.pick); if advance { store.step(1) }
+        case "x": store.setFlag(.reject); if advance { store.step(1) }
+        case "u": store.setFlag(.none); if advance { store.step(1) }
         case "g": store.mode = .library
         case "e": if store.current != nil { store.mode = .edit }
         case "c", "r":
@@ -205,6 +252,13 @@ enum KeyHandler {
             store.mode = .edit
             store.isCropping.toggle()
         case "\\": if store.mode == .edit { store.showBefore.toggle() }
+        case "j": if store.mode == .edit { store.showClipping.toggle() }
+        case "w":
+            guard store.current != nil else { return false }
+            store.mode = .edit
+            store.isCropping = false
+            store.activeMaskID = nil
+            store.pickingWhite.toggle()
         case "o": if store.activeMaskID != nil { store.setOverlay(!store.showMaskOverlay) }
         case "[": store.brushSize = max(0.005, store.brushSize / 1.2)
         case "]": store.brushSize = min(0.25, store.brushSize * 1.2)
@@ -216,13 +270,13 @@ enum KeyHandler {
     }
 }
 
-struct PixonCommands: Commands {
+struct HalfstopCommands: Commands {
     let store: LibraryStore
     @Environment(\.openWindow) private var openWindow
 
     var body: some Commands {
         CommandGroup(replacing: .help) {
-            Button("Pixon Help") { openWindow(id: "help") }
+            Button("Halfstop Help") { openWindow(id: "help") }
                 .keyboardShortcut("?", modifiers: .command)
         }
         CommandGroup(replacing: .newItem) {
@@ -248,6 +302,9 @@ struct PixonCommands: Commands {
                 .keyboardShortcut("c", modifiers: [.command, .shift])
             Button("Paste Settings") { store.pasteSettings() }
                 .keyboardShortcut("v", modifiers: [.command, .shift])
+            Button("Paste Selected Settings…") { store.showSelectivePaste = true }
+                .keyboardShortcut("v", modifiers: [.command, .shift, .option])
+                .disabled(store.clipboard == nil)
             Button("Reset All Adjustments") { store.resetAdjustments() }
                 .keyboardShortcut("r", modifiers: [.command, .shift])
             Divider()
@@ -270,6 +327,11 @@ struct PixonCommands: Commands {
                 .keyboardShortcut("s", modifiers: [.command, .shift])
             Button("Library") { store.mode = .library }
             Button("Edit") { store.mode = .edit }
+            Divider()
+            Toggle("Auto Advance After Rating", isOn: Binding(get: { store.autoAdvance }, set: { store.autoAdvance = $0 }))
+            Divider()
+            Button(store.showClipping ? "Hide Clipping (J)" : "Show Clipping (J)") { store.showClipping.toggle() }
+                .disabled(store.mode != .edit)
         }
     }
 }
