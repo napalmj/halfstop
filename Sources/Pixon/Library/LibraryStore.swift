@@ -6,6 +6,12 @@ enum ViewMode { case library, edit }
 
 enum PanelTab: String { case quick, detailed }
 
+enum LibrarySource: Hashable {
+    case all, lastImport
+    case folder(UUID)
+    case collection(UUID)
+}
+
 enum LibraryFilter: String, CaseIterable, Identifiable {
     case all, picks, unflagged, rejected
     var id: String { rawValue }
@@ -22,10 +28,22 @@ enum LibraryFilter: String, CaseIterable, Identifiable {
 @MainActor
 @Observable
 final class LibraryStore {
-    // Folder contents
-    private(set) var folder: URL?
-    private(set) var photos: [Photo] = []
+    // Library contents
+    /// Mutated only by the store and its Importer extension.
+    var catalog = Catalog()
+    var photos: [Photo] = []
+    @ObservationIgnored private var photoByRef: [PhotoRef: Photo] = [:]
     private(set) var isLoading = false
+    var source: LibrarySource = .all {
+        didSet { if oldValue != source { selection = []; keepCurrentVisible() } }
+    }
+    var showSidebar = true
+    var showImport = false
+    /// Folder to prefill in the import sheet (e.g. from drag and drop).
+    var importPrefill: URL?
+    @ObservationIgnored let catalogURL: URL
+    @ObservationIgnored private var watcher: FolderWatcher?
+    @ObservationIgnored private var reloadPending = false
 
     // Navigation
     var mode: ViewMode = .library
@@ -46,6 +64,8 @@ final class LibraryStore {
     /// Mask currently being edited; nil = whole photo.
     var activeMaskID: UUID? { didSet { if activeMaskID != nil { isCropping = false } } }
     var showMaskOverlay = false
+    /// True while a mask is being painted or dragged.
+    var maskInteracting = false
     // Brush tool
     var brushSize: Double = 0.04
     var brushFeather: Double = 0.6
@@ -67,21 +87,46 @@ final class LibraryStore {
 
     @ObservationIgnored private var pendingSaves: [URL: DispatchWorkItem] = [:]
 
-    init() {
+    init(catalogURL: URL = Catalog.defaultURL, watch: Bool = true) {
+        self.catalogURL = catalogURL
         NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.flushSaves() }
         }
         loadPresets()
-        if let path = UserDefaults.standard.string(forKey: "lastFolder") {
-            let url = URL(fileURLWithPath: path)
-            if FileManager.default.fileExists(atPath: url.path) { open(folder: url) }
+        catalog = Catalog.load(from: catalogURL)
+        // One-time migration from the folder-at-a-time version.
+        if catalogURL == Catalog.defaultURL, catalog.folders.isEmpty, let path = UserDefaults.standard.string(forKey: "lastFolder"),
+           FileManager.default.fileExists(atPath: path) {
+            catalog.folders.append(CatalogFolder(path: LibraryFiles.canonical(URL(fileURLWithPath: path)), includeSubfolders: false))
+            saveCatalog()
         }
+        if watch {
+            watcher = FolderWatcher { [weak self] _ in
+                MainActor.assumeIsolated { self?.scheduleReload() }
+            }
+        }
+        reload()
     }
+
+    var hasLibrary: Bool { !catalog.folders.isEmpty }
+
+    func saveCatalog() { catalog.save(to: catalogURL) }
 
     // MARK: - Derived
 
     var visiblePhotos: [Photo] {
-        photos.filter { p in
+        let base: [Photo]
+        switch source {
+        case .all:
+            base = photos
+        case .lastImport:
+            base = (catalog.lastImport?.refs ?? []).compactMap { photoByRef[$0] }
+        case .folder(let id):
+            base = photos.filter { $0.ref.folder == id }
+        case .collection(let id):
+            base = (catalog.collections.first { $0.id == id }?.members ?? []).compactMap { photoByRef[$0] }
+        }
+        return base.filter { p in
             if p.rating < minRating { return false }
             if hideRejected && p.flag == .reject && filter != .rejected { return false }
             switch filter {
@@ -90,6 +135,24 @@ final class LibraryStore {
             case .unflagged: return p.flag == .none
             case .rejected: return p.flag == .reject
             }
+        }
+    }
+
+    var sourceTitle: String {
+        switch source {
+        case .all: "All photos"
+        case .lastImport: "Last import"
+        case .folder(let id): catalog.folder(id)?.name ?? "Folder"
+        case .collection(let id): catalog.collections.first { $0.id == id }?.name ?? "Collection"
+        }
+    }
+
+    func count(_ source: LibrarySource) -> Int {
+        switch source {
+        case .all: photos.count
+        case .lastImport: (catalog.lastImport?.refs ?? []).filter { photoByRef[$0] != nil }.count
+        case .folder(let id): photos.filter { $0.ref.folder == id }.count
+        case .collection(let id): (catalog.collections.first { $0.id == id }?.members ?? []).filter { photoByRef[$0] != nil }.count
         }
     }
 
@@ -106,53 +169,81 @@ final class LibraryStore {
         return current.map { [$0] } ?? []
     }
 
-    // MARK: - Folder
-
-    func chooseFolder() {
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.allowsMultipleSelection = false
-        panel.prompt = "Open"
-        panel.message = "Choose a folder of photos"
-        if panel.runModal() == .OK, let url = panel.url { open(folder: url) }
+    /// Selection in the grid (or the current photo).
+    var selectedPhotos: [Photo] {
+        if mode == .library && !selection.isEmpty {
+            return visiblePhotos.filter { selection.contains($0.url) }
+        }
+        return current.map { [$0] } ?? []
     }
 
-    func open(folder url: URL) {
-        flushSaves()
-        folder = url
-        isLoading = true
-        photos = []
-        currentID = nil
-        selection = []
-        mode = .library
-        isCropping = false
-        UserDefaults.standard.set(url.path, forKey: "lastFolder")
+    // MARK: - Loading
 
+    func showImportSheet(prefill: URL? = nil) {
+        importPrefill = prefill
+        showImport = true
+    }
+
+    private func scheduleReload() {
+        guard !reloadPending else { return }
+        reloadPending = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            guard let self else { return }
+            self.reloadPending = false
+            self.reload()
+        }
+    }
+
+    /// Rescans every imported folder. Keeps existing Photo objects (and their unsaved state) for files still present.
+    func reload(completion: (() -> Void)? = nil) {
+        let catalog = self.catalog
+        let existing = Dictionary(photos.map { ($0.url, $0) }, uniquingKeysWith: { a, _ in a })
+        let known = Set(existing.keys)
+        if photos.isEmpty { isLoading = true }
+        watcher?.watch(catalog.folders.filter(\.exists).map(\.path))
         Task.detached(priority: .userInitiated) {
-            let loaded = LibraryStore.scan(folder: url)
+            let found = LibraryStore.scanCatalog(catalog, known: known)
             await MainActor.run {
-                guard self.folder == url else { return }
-                self.photos = loaded.map { Photo(url: $0.0, sidecar: $0.1) }
-                self.currentID = self.photos.first?.url
-                if let first = self.currentID { self.selection = [first] }
+                var list: [Photo] = []
+                for item in found {
+                    if let p = existing[item.url], p.ref == item.ref {
+                        list.append(p)
+                    } else {
+                        list.append(Photo(url: item.url, ref: item.ref, sidecar: item.sidecar ?? Sidecar()))
+                    }
+                }
+                self.photos = list
+                self.photoByRef = Dictionary(list.map { ($0.ref, $0) }, uniquingKeysWith: { a, _ in a })
                 self.isLoading = false
+                self.keepCurrentVisible()
+                self.backfillFingerprints()
+                completion?()
             }
         }
     }
 
-    nonisolated private static func scan(folder: URL) -> [(URL, Sidecar)] {
-        let fm = FileManager.default
-        guard let entries = try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) else { return [] }
-        let files = entries
-            .filter { ImageFormats.all.contains($0.pathExtension.lowercased()) }
-            .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+    struct ScannedPhoto: Sendable {
+        let url: URL
+        let ref: PhotoRef
+        let sidecar: Sidecar?
+    }
+
+    nonisolated static func scanCatalog(_ catalog: Catalog, known: Set<URL>) -> [ScannedPhoto] {
         let decoder = JSONDecoder()
-        return files.map { url in
-            let sidecarURL = sidecarURL(for: url)
-            let sidecar = (try? Data(contentsOf: sidecarURL)).flatMap { try? decoder.decode(Sidecar.self, from: $0) } ?? Sidecar()
-            return (url, sidecar)
+        var seen = Set<String>()
+        var out: [ScannedPhoto] = []
+        for folder in catalog.folders where folder.exists {
+            for rel in LibraryFiles.enumerate(folder.url, recursive: folder.includeSubfolders) where !folder.excluded.contains(rel) {
+                let url = URL(fileURLWithPath: folder.path).appendingPathComponent(rel)
+                guard seen.insert(url.path).inserted else { continue }
+                var sidecar: Sidecar?
+                if !known.contains(url) {
+                    sidecar = (try? Data(contentsOf: sidecarURL(for: url))).flatMap { try? decoder.decode(Sidecar.self, from: $0) }
+                }
+                out.append(ScannedPhoto(url: url, ref: PhotoRef(folder: folder.id, path: rel), sidecar: sidecar))
+            }
         }
+        return out
     }
 
     nonisolated static func sidecarURL(for photo: URL) -> URL {
@@ -161,13 +252,139 @@ final class LibraryStore {
             .appendingPathComponent(photo.lastPathComponent + ".json")
     }
 
+    /// Computes fingerprints for library photos that don't have one yet (in the background).
+    @ObservationIgnored private var fingerprinting = false
+    private func backfillFingerprints() {
+        guard !fingerprinting else { return }
+        let missing = photos.filter { catalog.fingerprints[$0.ref.key] == nil }.map { ($0.ref, $0.url) }
+        guard !missing.isEmpty else { return }
+        fingerprinting = true
+        Task.detached(priority: .utility) {
+            var found: [String: String] = [:]
+            for (ref, url) in missing {
+                if let fp = LibraryFiles.fingerprint(url) { found[ref.key] = fp }
+            }
+            let computed = found
+            await MainActor.run {
+                self.catalog.fingerprints.merge(computed) { _, new in new }
+                self.saveCatalog()
+                self.fingerprinting = false
+            }
+        }
+    }
+
+    // MARK: - Folders
+
+    func removeFolder(_ id: UUID) {
+        flushSaves()
+        catalog.folders.removeAll { $0.id == id }
+        for i in catalog.collections.indices {
+            catalog.collections[i].members.removeAll { $0.folder == id }
+        }
+        catalog.fingerprints = catalog.fingerprints.filter { !$0.key.hasPrefix(id.uuidString + "/") }
+        if catalog.lastImport?.folder == id { catalog.lastImport = nil }
+        if source == .folder(id) || (source == .lastImport && catalog.lastImport == nil) { source = .all }
+        saveCatalog()
+        reload()
+    }
+
+    /// Points a moved or renamed folder at its new location; edits and collections carry over.
+    func relocateFolder(_ id: UUID) {
+        guard let i = catalog.folders.firstIndex(where: { $0.id == id }) else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.prompt = "Use folder"
+        panel.message = "Where is “\(catalog.folders[i].name)” now?"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        relocateFolder(id, to: url)
+    }
+
+    func relocateFolder(_ id: UUID, to url: URL) {
+        guard let i = catalog.folders.firstIndex(where: { $0.id == id }) else { return }
+        flushSaves()
+        catalog.folders[i].path = LibraryFiles.canonical(url)
+        saveCatalog()
+        photos = photos.filter { $0.ref.folder != id }
+        reload()
+    }
+
+    // MARK: - Collections
+
+    @discardableResult
+    func createCollection(named name: String, with members: [Photo] = []) -> UUID? {
+        let trimmed = name.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return nil }
+        let c = PhotoCollection(name: trimmed, members: members.map(\.ref))
+        catalog.collections.append(c)
+        catalog.targetCollection = c.id
+        saveCatalog()
+        return c.id
+    }
+
+    func renameCollection(_ id: UUID, to name: String) {
+        let trimmed = name.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty, let i = catalog.collections.firstIndex(where: { $0.id == id }) else { return }
+        catalog.collections[i].name = trimmed
+        saveCatalog()
+    }
+
+    func deleteCollection(_ id: UUID) {
+        catalog.collections.removeAll { $0.id == id }
+        if catalog.targetCollection == id { catalog.targetCollection = catalog.collections.first?.id }
+        if source == .collection(id) { source = .all }
+        saveCatalog()
+    }
+
+    func addToCollection(_ id: UUID, _ items: [Photo]) {
+        guard let i = catalog.collections.firstIndex(where: { $0.id == id }) else { return }
+        var members = catalog.collections[i].members
+        let existing = Set(members)
+        members.append(contentsOf: items.map(\.ref).filter { !existing.contains($0) })
+        catalog.collections[i].members = members
+        saveCatalog()
+    }
+
+    func removeFromCollection(_ id: UUID, _ items: [Photo]) {
+        guard let i = catalog.collections.firstIndex(where: { $0.id == id }) else { return }
+        let drop = Set(items.map(\.ref))
+        catalog.collections[i].members.removeAll { drop.contains($0) }
+        saveCatalog()
+        keepCurrentVisible()
+    }
+
+    var targetCollection: PhotoCollection? {
+        guard let id = catalog.targetCollection else { return nil }
+        return catalog.collections.first { $0.id == id }
+    }
+
+    func setTargetCollection(_ id: UUID) {
+        catalog.targetCollection = id
+        saveCatalog()
+    }
+
+    /// The B key: add the selection to the target collection.
+    func addSelectionToTarget() {
+        guard let target = targetCollection else { return }
+        addToCollection(target.id, selectedPhotos)
+    }
+
+    /// Drag and drop: dropping one photo of a multi-selection adds the whole selection.
+    func dropOnCollection(_ id: UUID, urls: [URL]) {
+        var items = urls.compactMap { u in photos.first { $0.url == u } }
+        if items.contains(where: { selection.contains($0.url) }) {
+            items = photos.filter { selection.contains($0.url) }
+        }
+        addToCollection(id, items)
+    }
+
     // MARK: - Persistence
 
     func scheduleSave(_ photo: Photo) {
         pendingSaves[photo.url]?.cancel()
         let sidecar = photo.sidecar
         let url = photo.url
-        let work = DispatchWorkItem { LibraryStore.write(sidecar, for: url) }
+        let work = DispatchWorkItem { LibraryStore.writeSidecar(sidecar, for: url) }
         pendingSaves[url] = work
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.5, execute: work)
     }
@@ -176,13 +393,13 @@ final class LibraryStore {
         for (url, work) in pendingSaves {
             work.cancel()
             if let photo = photos.first(where: { $0.url == url }) {
-                LibraryStore.write(photo.sidecar, for: url)
+                LibraryStore.writeSidecar(photo.sidecar, for: url)
             }
         }
         pendingSaves = [:]
     }
 
-    nonisolated private static func write(_ sidecar: Sidecar, for url: URL) {
+    nonisolated static func writeSidecar(_ sidecar: Sidecar, for url: URL) {
         let dest = sidecarURL(for: url)
         let fm = FileManager.default
         if sidecar.rating == 0 && sidecar.flag == .none && sidecar.adjustments.isDefault {

@@ -26,6 +26,7 @@ struct Sidecar: Codable {
 @Observable
 final class Photo: Identifiable, Hashable {
     let url: URL
+    let ref: PhotoRef
     var rating: Int
     var flag: Flag
     var adjustments: Adjustments
@@ -34,8 +35,9 @@ final class Photo: Identifiable, Hashable {
     var name: String { url.lastPathComponent }
     var isRAW: Bool { ImageFormats.raw.contains(url.pathExtension.lowercased()) }
 
-    init(url: URL, sidecar: Sidecar) {
+    init(url: URL, ref: PhotoRef, sidecar: Sidecar) {
         self.url = url
+        self.ref = ref
         self.rating = sidecar.rating
         self.flag = sidecar.flag
         self.adjustments = sidecar.adjustments

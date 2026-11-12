@@ -5,7 +5,7 @@ import UniformTypeIdentifiers
 @main
 struct PixonApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
-    @State private var store = LibraryStore()
+    @State private var store = LibraryStore(catalogURL: Snapshot.catalogOverride ?? Catalog.defaultURL)
     @State private var renderer = PreviewRenderer()
 
     init() {
@@ -48,10 +48,16 @@ struct ContentView: View {
             TopBar()
             Rectangle().fill(Theme.hairline).frame(height: 1)
             Group {
-                if store.folder == nil {
+                if !store.hasLibrary {
                     WelcomeView()
                 } else if store.mode == .library {
-                    LibraryGridView()
+                    HStack(spacing: 0) {
+                        if store.showSidebar {
+                            LibrarySidebar()
+                            Rectangle().fill(Theme.hairline).frame(width: 1)
+                        }
+                        LibraryGridView()
+                    }
                 } else {
                     EditorView()
                 }
@@ -72,11 +78,12 @@ struct ContentView: View {
                 var isDir: ObjCBool = false
                 FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir)
                 let folder = isDir.boolValue ? url : url.deletingLastPathComponent()
-                DispatchQueue.main.async { store.open(folder: folder) }
+                DispatchQueue.main.async { store.showImportSheet(prefill: folder) }
             }
             return true
         }
         .sheet(isPresented: $store.showExport) { ExportSheet() }
+        .sheet(isPresented: $store.showImport) { ImportSheet() }
         .sheet(isPresented: $store.showSavePreset) { SavePresetSheet() }
         .onAppear {
             SubjectDetector.shared.onDetected = { _ in renderer.bump() }
@@ -85,7 +92,6 @@ struct ContentView: View {
                 KeyHandler.handle(event, store: store) ? nil : event
             }
         }
-        .onChange(of: store.folder) { renderer.clear() }
     }
 }
 
@@ -97,7 +103,7 @@ enum KeyHandler {
         if window.firstResponder is NSText { return false }
         let mods = event.modifierFlags.intersection([.command, .control, .option])
         if !mods.isEmpty { return false }
-        guard store.folder != nil else { return false }
+        guard store.hasLibrary else { return false }
 
         switch event.keyCode {
         case 123: store.step(-1); return true                                         // ←
@@ -108,6 +114,12 @@ enum KeyHandler {
             if store.isCropping { store.isCropping = false }
             else if store.mode == .library, store.current != nil { store.mode = .edit }
             return true
+        case 51, 117:                                                                 // delete
+            if case .collection(let id) = store.source, store.mode == .library {
+                store.removeFromCollection(id, store.selectedPhotos)
+                return true
+            }
+            return false
         case 53:                                                                      // esc
             if store.isCropping { store.isCropping = false }
             else if store.activeMaskID != nil { store.activeMaskID = nil }
@@ -133,6 +145,7 @@ enum KeyHandler {
         case "o": if store.activeMaskID != nil { store.setOverlay(!store.showMaskOverlay) }
         case "[": store.brushSize = max(0.005, store.brushSize / 1.2)
         case "]": store.brushSize = min(0.25, store.brushSize * 1.2)
+        case "b": store.addSelectionToTarget()
         case "d": store.panelTab = store.panelTab == .quick ? .detailed : .quick
         default: return false
         }
@@ -145,8 +158,8 @@ struct PixonCommands: Commands {
 
     var body: some Commands {
         CommandGroup(replacing: .newItem) {
-            Button("Open Folder…") { store.chooseFolder() }
-                .keyboardShortcut("o")
+            Button("Import Photos…") { store.showImportSheet() }
+                .keyboardShortcut("i")
         }
         CommandGroup(after: .newItem) {
             Button("Export…") { store.showExport = true }
@@ -168,6 +181,11 @@ struct PixonCommands: Commands {
             Divider()
             Button("Save Preset…") { store.showSavePreset = true }
             Divider()
+            Button("Add to Target Collection") { store.addSelectionToTarget() }
+                .disabled(store.targetCollection == nil)
+            Divider()
+            Button("Show or Hide Sidebar") { store.showSidebar.toggle() }
+                .keyboardShortcut("s", modifiers: [.command, .shift])
             Button("Library") { store.mode = .library }
             Button("Edit") { store.mode = .edit }
         }

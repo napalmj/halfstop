@@ -1,8 +1,10 @@
 # Pixon
 
-A fast, folder-based photo editor for macOS (SwiftUI + Core Image + Metal).
-No import, no catalog: open a folder and go. Edits, ratings and flags are saved
-as small JSON sidecars in a hidden `.pixon/` folder next to your photos.
+A fast photo editor for macOS (SwiftUI + Core Image + Metal).
+Import references photos where they already are (nothing is copied). Edits,
+ratings and flags are saved as small JSON sidecars in a hidden `.pixon/` folder
+next to your photos; the library index (folders, collections) lives in
+`~/Library/Application Support/Pixon/catalog.json`.
 
 ## Build & run
 
@@ -15,7 +17,11 @@ Requires macOS 14+ and the Xcode command line tools.
 
 ## Features
 
-- **Library**: thumbnail grid, ratings, pick/reject flags, filters, multi-select.
+- **Import**: add folders in place (optionally with subfolders); skip duplicates by content,
+  apply a preset, rename files with a pattern (revertible), file into a collection.
+  Imported folders are watched for new files; moved folders can be relocated.
+- **Library**: sidebar with All photos, Last import, Folders and manual Collections;
+  thumbnail grid, ratings, pick/reject flags, filters, multi-select, drag to collections.
 - **Quick tab**: exposure, contrast, highlights, shadows, temperature, saturation, vignette.
 - **Detailed tab**: full light & color, color grading wheels, tone curve, HSL, detail.
 - **Masks**: brush, linear, radial, subject (Apple Vision) and sky; each with its own sliders.
@@ -40,11 +46,15 @@ Requires macOS 14+ and the Xcode command line tools.
 | ⌘Z / ⇧⌘Z | Undo / redo |
 | ⇧⌘C / ⇧⌘V | Copy / paste settings |
 | ⇧⌘E | Export |
+| ⌘I | Import photos |
+| B | Add selection to the target collection |
+| Delete | Remove from the current collection |
+| ⇧⌘S | Show / hide sidebar |
 
 ## Developer checks
 
 ```bash
 build/Pixon.app/Contents/MacOS/Pixon --selftest /tmp/pixon-test      # pipeline assertions
 build/Pixon.app/Contents/MacOS/Pixon --make-samples /tmp/pixon-samples
-build/Pixon.app/Contents/MacOS/Pixon --snapshot /tmp/pixon-snap      # scripted UI captures
+build/Pixon.app/Contents/MacOS/Pixon --snapshot /tmp/pixon-snap --catalog /tmp/snap-catalog.json --samples /tmp/pixon-samples
 ```

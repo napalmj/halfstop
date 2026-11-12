@@ -15,7 +15,17 @@ enum SelfTest {
             exit(0)
         }
         if let i = args.firstIndex(of: "--selftest"), i + 1 < args.count {
-            exit(run(dir: URL(fileURLWithPath: args[i + 1])) ? 0 : 1)
+            let dir = URL(fileURLWithPath: args[i + 1])
+            let pipelineOK = run(dir: dir)
+            var libraryOK = false
+            var done = false
+            Task { @MainActor in
+                libraryOK = await LibraryTest.run(dir: dir.appendingPathComponent("library"))
+                done = true
+            }
+            while !done { RunLoop.main.run(until: Date().addingTimeInterval(0.05)) }
+            print(pipelineOK && libraryOK ? "EVERYTHING PASSED" : "FAILURES ABOVE")
+            exit(pipelineOK && libraryOK ? 0 : 1)
         }
     }
 
@@ -223,72 +233,221 @@ enum Snapshot {
         return URL(fileURLWithPath: args[i + 1])
     }
 
+    /// `--catalog <path>` points the app at a different library index (used by snapshots).
+    nonisolated static var catalogOverride: URL? {
+        let args = CommandLine.arguments
+        guard let i = args.firstIndex(of: "--catalog"), i + 1 < args.count else { return nil }
+        return URL(fileURLWithPath: args[i + 1])
+    }
+
+    nonisolated static var samplesFolder: URL? {
+        let args = CommandLine.arguments
+        guard let i = args.firstIndex(of: "--samples"), i + 1 < args.count else { return nil }
+        return URL(fileURLWithPath: args[i + 1])
+    }
+
     static func run(store: LibraryStore, renderer: PreviewRenderer) {
         guard let dir = outputDir else { return }
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         Task { @MainActor in
             func wait(_ s: Double) async { try? await Task.sleep(for: .seconds(s)) }
-            @MainActor func shot(_ name: String) {
-                guard let window = NSApp.windows.first(where: { $0.isVisible && $0.contentView != nil }),
-                      let view = window.contentView,
-                      let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { print("no window"); return }
+            @MainActor func shot(_ name: String, sheet: Bool = false) {
+                let window = NSApp.windows.first { $0.isVisible && (sheet ? $0.sheetParent != nil : $0.sheetParent == nil) && $0.contentView != nil }
+                guard let view = window?.contentView, let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { print("no window for \(name)"); return }
                 view.cacheDisplay(in: view.bounds, to: rep)
                 try? rep.representation(using: .png, properties: [:])?.write(to: dir.appendingPathComponent(name + ".png"))
                 print("snapshot \(name)")
             }
             @MainActor func preview(_ name: String) {
-                guard let p = store.current, let src = renderer.source(for: p.url) else { return }
+                guard let p = store.current, let src = renderer.source(for: p.url) else { print("no preview"); return }
+                let neutral = store.activeMask?.local.isNeutral ?? false
                 let img = src.developed(p.adjustments, geometry: store.activeMaskID != nil ? .none : .full,
-                                        overlayMask: store.showMaskOverlay ? store.activeMaskID : nil)
+                                        overlayMask: (store.showMaskOverlay || neutral) ? store.activeMaskID : nil)
                 try? Render.background.writeJPEGRepresentation(of: img, to: dir.appendingPathComponent(name + ".jpg"),
                                                                colorSpace: Render.sRGB, options: [:])
             }
-            await wait(2.5)
+            await wait(1.5)
+            // Work on a private copy so snapshots never touch real sidecars.
+            var samplesCopy: URL?
+            if let samples = samplesFolder {
+                let copy = dir.appendingPathComponent("photos")
+                try? FileManager.default.removeItem(at: copy)
+                try? FileManager.default.copyItem(at: samples, to: copy)
+                try? FileManager.default.removeItem(at: copy.appendingPathComponent(".pixon"))
+                samplesCopy = copy
+            }
+            if !store.hasLibrary, let samples = samplesCopy {
+                let portfolio = store.createCollection(named: "Portfolio")
+                store.createCollection(named: "Print queue")
+                let scan = await store.scanForImport(samples, includeSubfolders: true)
+                var opts = ImportOptions()
+                opts.collection = portfolio
+                _ = await store.performImport(scan, options: opts)
+                if let pq = store.catalog.collections.first(where: { $0.name == "Print queue" }) {
+                    store.addToCollection(pq.id, Array(store.photos.prefix(2)))
+                    store.setTargetCollection(pq.id)
+                }
+            }
+            store.source = .all
+            await wait(0.5)
+            if let first = store.visiblePhotos.first { store.select(first) }
             store.setRating(4); store.setFlag(.pick)
             store.step(1); store.setFlag(.reject)
-            store.step(1); store.setRating(2)
-            await wait(1.5)
-            shot("1-library")
+            await wait(2)
+            shot("1-library-sidebar")
 
-            store.mode = .edit
+            store.showImportSheet(prefill: samplesCopy)
             await wait(2.5)
-            shot("2-edit-quick")
+            shot("2-import-sheet", sheet: true)
+            store.showImport = false
+            await wait(0.8)
 
-            store.checkpoint()
-            store.edit { $0.exposure = 0.4; $0.contrast = 25; $0.temperature = 20; $0.vignette = -30 }
-            store.panelTab = .detailed
-            await wait(1.5)
-            shot("3-edit-detailed")
-
-            store.edit { $0.grading.shadows = GradeWheel(hue: 215, saturation: 45); $0.grading.highlights = GradeWheel(hue: 40, saturation: 35) }
-            store.addMask(.radial)
-            store.editMask { $0.center = NormPoint(x: 0.68, y: 0.22); $0.local.exposure = 0.8 }
-            store.setOverlay(true)
-            await wait(1.5)
-            shot("4-mask-radial")
-            preview("4-mask-radial-preview")
-
-            store.setOverlay(false)
-            store.activeMaskID = nil
-            store.isCropping = true
-            store.edit { $0.crop.angle = 4 }
-            await wait(1.5)
-            shot("5-crop")
-            store.isCropping = false
-            await wait(1)
-            preview("6-final-preview")
-            if let p = store.current, let src = renderer.source(for: p.url) {
-                let img = src.developed(p.adjustments)
-                let ok = PreviewMTKView.renderOffscreen(img, size: CGSize(width: 1200, height: 800),
-                                                        to: dir.appendingPathComponent("7-metal-path.png"))
-                print("metal path render \(ok)")
+            if let pq = store.catalog.collections.first(where: { $0.name == "Print queue" }) {
+                store.source = .collection(pq.id)
             }
+            await wait(1)
+            shot("3-collection")
 
-            store.resetAdjustments()
-            store.setRating(0)
+            store.source = .all
+            store.mode = .edit
+            await wait(2)
+            store.addMask(.brush)
+            var s1 = BrushStroke(radius: 0.05, feather: 0.4)
+            s1.points = [NormPoint(x: 0.15, y: 0.25), NormPoint(x: 0.3, y: 0.3), NormPoint(x: 0.4, y: 0.25)]
+            var s2 = BrushStroke(radius: 0.05, feather: 0.4)
+            s2.points = [NormPoint(x: 0.7, y: 0.75)]
+            store.editMask { $0.strokes.append(s1) }
+            store.editMask { $0.strokes.append(s2) }
+            await wait(1.5)
+            shot("4-brush-mask")
+            preview("4-brush-mask-preview")
+
             store.flushSaves()
             print("snapshot done")
             NSApp.terminate(nil)
         }
+    }
+}
+
+/// Import, rename, duplicates, collections, relocation and persistence, against a throwaway catalog.
+@MainActor
+enum LibraryTest {
+    static func run(dir: URL) async -> Bool {
+        let fm = FileManager.default
+        try? fm.removeItem(at: dir)
+        let a = dir.appendingPathComponent("Trip A"), b = dir.appendingPathComponent("Card B")
+        try? fm.createDirectory(at: a.appendingPathComponent("day2"), withIntermediateDirectories: true)
+        try? fm.createDirectory(at: b, withIntermediateDirectories: true)
+        for i in 0..<4 {
+            if let img = SelfTest.scene(width: 600, height: 400, hue: Double(i) / 5, variant: i) {
+                SelfTest.write(img, to: a.appendingPathComponent("IMG_\(100 + i).jpg"))
+            }
+        }
+        if let img = SelfTest.scene(width: 600, height: 400, hue: 0.9, variant: 7) { SelfTest.write(img, to: a.appendingPathComponent("day2/IMG_200.jpg")) }
+        // Card B: two copies of A's photos under new names, plus one new photo.
+        try? fm.copyItem(at: a.appendingPathComponent("IMG_100.jpg"), to: b.appendingPathComponent("DSC_1.jpg"))
+        try? fm.copyItem(at: a.appendingPathComponent("IMG_101.jpg"), to: b.appendingPathComponent("DSC_2.jpg"))
+        if let img = SelfTest.scene(width: 600, height: 400, hue: 0.33, variant: 9) { SelfTest.write(img, to: b.appendingPathComponent("DSC_3.jpg")) }
+
+        var ok = true
+        func check(_ name: String, _ cond: Bool, _ detail: String = "") {
+            print("\(cond ? "PASS" : "FAIL")  \(name)  \(detail)")
+            if !cond { ok = false }
+        }
+        func reloaded(_ store: LibraryStore) async { await withCheckedContinuation { c in store.reload { c.resume() } } }
+
+        let catalogURL = dir.appendingPathComponent("catalog.json")
+        let store = LibraryStore(catalogURL: catalogURL, watch: false)
+        await reloaded(store)
+        check("empty library starts empty", store.photos.isEmpty)
+
+        let best = store.createCollection(named: "Best")!
+        var preset = Adjustments(); preset.exposure = 1
+        let scanA = await store.scanForImport(a, includeSubfolders: true)
+        check("scan finds photos in subfolders", scanA.files.count == 5, "\(scanA.files)")
+        var opts = ImportOptions()
+        opts.preset = Preset(name: "Bright", adjustments: preset)
+        opts.rename = .nameSequence
+        opts.customName = "trip"
+        opts.collection = best
+        let resA = await store.performImport(scanA, options: opts)
+        check("import A brings in 5", resA.imported == 5 && store.photos.count == 5, "\(resA)")
+        check("files renamed on disk", fm.fileExists(atPath: a.appendingPathComponent("trip-001.jpg").path)
+              && !fm.fileExists(atPath: a.appendingPathComponent("IMG_100.jpg").path), "renamed \(resA.renamed)")
+        check("subfolder file renamed in place", fm.fileExists(atPath: a.appendingPathComponent("day2").path)
+              && (try? fm.contentsOfDirectory(atPath: a.appendingPathComponent("day2").path))?.contains { $0.hasPrefix("trip-") } == true)
+        check("preset applied via sidecars", store.photos.allSatisfy { $0.adjustments.exposure == 1 })
+        check("added to collection", store.count(.collection(best)) == 5)
+        check("last import shows A", store.source == .lastImport && store.count(.lastImport) == 5)
+
+        // Edit one photo, then revert names: the edit and membership must follow the file.
+        store.photos.first?.rating = 4
+        if let p = store.photos.first { store.scheduleSave(p) }
+        store.flushSaves()
+        await store.revertLastImportNames()
+        check("revert restores original names", fm.fileExists(atPath: a.appendingPathComponent("IMG_100.jpg").path)
+              && !fm.fileExists(atPath: a.appendingPathComponent("trip-001.jpg").path))
+        check("collection survives revert", store.count(.collection(best)) == 5)
+        check("rating survives revert", store.photos.contains { $0.rating == 4 })
+        check("preset survives revert", store.photos.allSatisfy { $0.adjustments.exposure == 1 })
+
+        let scanB = await store.scanForImport(b, includeSubfolders: true)
+        check("duplicates detected by content", scanB.duplicates.count == 2 && scanB.newFiles(skipDuplicates: true).count == 1,
+              "dups \(scanB.duplicates.sorted())")
+        let resB = await store.performImport(scanB, options: ImportOptions())
+        check("import B skips duplicates", resB.imported == 1 && store.photos.count == 6, "\(resB)")
+        let again = await store.scanForImport(b, includeSubfolders: true)
+        check("re-import finds nothing new", again.newFiles(skipDuplicates: true).isEmpty)
+        let inside = await store.scanForImport(a.appendingPathComponent("day2"), includeSubfolders: true)
+        check("subfolder of imported folder is recognized", inside.coveredBy == "Trip A" && inside.newFiles(skipDuplicates: true).isEmpty)
+
+        // Collections.
+        let picks = store.createCollection(named: "Picks")!
+        let bPhoto = store.photos.first { $0.url.path.contains("Card B") }!
+        store.addToCollection(picks, [bPhoto, store.photos[0]])
+        store.addToCollection(picks, [bPhoto])
+        check("collection ignores repeat adds", store.count(.collection(picks)) == 2)
+        store.removeFromCollection(picks, [store.photos[0]])
+        check("remove from collection", store.count(.collection(picks)) == 1)
+        check("B targets newest collection", store.targetCollection?.id == picks)
+
+        // Move folder B on disk, then relocate.
+        let moved = dir.appendingPathComponent("Card B moved")
+        try? fm.moveItem(at: b, to: moved)
+        await reloaded(store)
+        let bFolder = store.catalog.folders.first { $0.name == "Card B" }!
+        check("moved folder shows missing", !bFolder.exists && store.photos.count == 5)
+        store.relocateFolder(bFolder.id, to: moved)
+        await reloaded(store)
+        check("relocated folder comes back", store.photos.count == 6)
+        check("collection survives relocation", store.count(.collection(picks)) == 1)
+
+        // Persistence.
+        let fresh = LibraryStore(catalogURL: catalogURL, watch: false)
+        await reloaded(fresh)
+        check("catalog persists", fresh.photos.count == 6 && fresh.catalog.collections.count == 2
+              && fresh.count(.collection(best)) == 5, "\(fresh.photos.count) photos")
+
+        store.deleteCollection(picks)
+        check("delete collection keeps photos", store.catalog.collections.count == 1 && store.photos.count == 6)
+        store.removeFolder(bFolder.id)
+        await reloaded(store)
+        check("remove folder drops its photos only", store.photos.count == 5 && fm.fileExists(atPath: moved.appendingPathComponent("DSC_3.jpg").path))
+
+        // Brush: two separate strokes must both land in the mask.
+        var brush = Mask(name: "Brush", kind: .brush)
+        brush.strokes = [BrushStroke(points: [NormPoint(x: 0.2, y: 0.3), NormPoint(x: 0.25, y: 0.3)], radius: 0.03, feather: 0.3)]
+        brush.strokes.append(BrushStroke(points: [NormPoint(x: 0.75, y: 0.7)], radius: 0.03, feather: 0.3))
+        let size = CGSize(width: 1500, height: 1000)
+        if let m = MaskRenderer.image(for: brush, size: size, url: a, base: CIImage(color: .gray).cropped(to: CGRect(origin: .zero, size: size))) {
+            let s1 = SelfTest.sample(m, 0.22, 0.3), s2 = SelfTest.sample(m, 0.75, 0.7), off = SelfTest.sample(m, 0.5, 0.5)
+            check("brush: first stroke painted", s1.g > 0.8, "\(s1)")
+            check("brush: second stroke painted", s2.g > 0.8, "\(s2)")
+            check("brush: unpainted area clear", off.g < 0.05, "\(off)")
+        } else {
+            check("brush mask renders", false)
+        }
+        print(ok ? "LIBRARY PASSED" : "LIBRARY FAILED")
+        return ok
     }
 }

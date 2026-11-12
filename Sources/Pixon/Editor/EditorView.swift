@@ -62,13 +62,16 @@ struct PreviewArea: View {
             return b
         }()
         let mode = geometryMode
-        let overlayID = store.showMaskOverlay && !store.showBefore ? store.activeMaskID : nil
+        // Show the red overlay when asked, while a mask is being drawn, or when the mask has no
+        // adjustments yet (otherwise fresh brush strokes would be invisible).
+        let wantsOverlay = store.showMaskOverlay || store.maskInteracting || (store.activeMask?.local.isNeutral ?? false)
+        let overlayID = wantsOverlay && !store.showBefore ? store.activeMaskID : nil
         let token = PreviewToken(url: url, adjustments: shown, geometry: "\(mode)", overlay: overlayID, generation: renderer.generation)
 
         PreviewImageView(
             token: token,
             provider: { renderer.source(for: url)?.developed(shown, geometry: mode, overlayMask: overlayID) },
-            onRendered: { img in renderer.requestHistogram(img) }
+            onRendered: { img in if overlayID == nil { renderer.requestHistogram(img) } }
         )
 
         if let source = renderer.source(for: url) {
@@ -143,7 +146,10 @@ struct MaskOverlay: View {
 
     private enum Drag { case center, radiusX, radiusY, start, end, newGradient, paint }
     @State private var drag: Drag?
+    @State private var dragStart: CGPoint?
     @State private var hover: CGPoint?
+    /// Resets even when SwiftUI cancels a gesture without calling onEnded.
+    @GestureState private var gestureActive = false
 
     private func view(_ p: NormPoint) -> CGPoint {
         CGPoint(x: imageRect.minX + p.x * imageRect.width, y: imageRect.minY + p.y * imageRect.height)
@@ -165,8 +171,12 @@ struct MaskOverlay: View {
                 Color.clear
                     .contentShape(Rectangle())
                     .gesture(DragGesture(minimumDistance: 0)
+                        .updating($gestureActive) { _, state, _ in state = true }
                         .onChanged(changed)
-                        .onEnded { _ in drag = nil })
+                        .onEnded { _ in endDrag() })
+                    .onChange(of: gestureActive) { _, active in
+                        if !active { endDrag() }
+                    }
                     .onContinuousHover { phase in
                         if case .active(let p) = phase { hover = p } else { hover = nil }
                     }
@@ -226,8 +236,11 @@ struct MaskOverlay: View {
 
     private func changed(_ g: DragGesture.Value) {
         hover = g.location
-        if drag == nil {
+        // A new start location means a new gesture, even if the last one never reported its end.
+        if drag == nil || dragStart != g.startLocation {
+            dragStart = g.startLocation
             drag = pick(g.startLocation)
+            store.maskInteracting = true
             store.checkpoint()
             if drag == .paint {
                 let stroke = BrushStroke(points: [norm(g.startLocation)], radius: store.brushSize, feather: store.brushFeather,
@@ -261,6 +274,12 @@ struct MaskOverlay: View {
         case nil:
             break
         }
+    }
+
+    private func endDrag() {
+        drag = nil
+        dragStart = nil
+        store.maskInteracting = false
     }
 
     private func pick(_ loc: CGPoint) -> Drag {

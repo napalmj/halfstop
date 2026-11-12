@@ -37,8 +37,12 @@ struct LibraryGridView: View {
                 ProgressView()
             } else if store.visiblePhotos.isEmpty && !store.photos.isEmpty {
                 Text("No photos match this filter").foregroundStyle(Theme.secondary)
-            } else if store.photos.isEmpty {
-                Text("This folder has no photos").foregroundStyle(Theme.secondary)
+            } else if store.visiblePhotos.isEmpty {
+                if case .collection = store.source {
+                    Text("Drag photos here, or select them and press B").foregroundStyle(Theme.secondary)
+                } else {
+                    Text("No photos here yet").foregroundStyle(Theme.secondary)
+                }
             }
         }
     }
@@ -50,6 +54,11 @@ private struct GridCell: View {
     let selected: Bool
     let isCurrent: Bool
     @State private var hovering = false
+
+    /// Right-clicking a selected photo acts on the whole selection, otherwise just this one.
+    private var contextTargets: [Photo] {
+        selected ? store.visiblePhotos.filter { store.selection.contains($0.url) } : [photo]
+    }
 
     var body: some View {
         VStack(spacing: 6) {
@@ -88,8 +97,35 @@ private struct GridCell: View {
                 store.select(photo, extend: flags.contains(.shift), toggle: flags.contains(.command))
             }
         }
+        .draggable(photo.url) {
+            ThumbnailView(photo: photo, maxSize: 200)
+                .frame(width: 120, height: 80)
+                .overlay(alignment: .topTrailing) {
+                    if store.selection.count > 1 && selected {
+                        Text("\(store.selection.count)")
+                            .font(.system(size: 11, weight: .bold))
+                            .padding(.horizontal, 6).padding(.vertical, 2)
+                            .background(Theme.accent, in: Capsule())
+                            .foregroundStyle(.black)
+                    }
+                }
+        }
         .contextMenu {
             Button("Edit") { store.open(photo) }
+            Menu("Add to collection") {
+                ForEach(store.catalog.collections) { c in
+                    Button(c.name) { store.addToCollection(c.id, contextTargets) }
+                }
+                if !store.catalog.collections.isEmpty { Divider() }
+                Button("New collection…") {
+                    if let id = store.createCollection(named: "New collection", with: contextTargets) {
+                        store.source = .collection(id)
+                    }
+                }
+            }
+            if case .collection(let id) = store.source {
+                Button("Remove from collection") { store.removeFromCollection(id, contextTargets) }
+            }
             Divider()
             Button("Pick") { store.select(photo); store.setFlag(.pick) }
             Button("Reject") { store.select(photo); store.setFlag(.reject) }
@@ -108,22 +144,43 @@ struct TopBar: View {
         @Bindable var store = store
         HStack(spacing: 12) {
             Color.clear.frame(width: 64, height: 1) // traffic lights
-            if let folder = store.folder {
-                Button { store.chooseFolder() } label: {
-                    HStack(spacing: 6) {
-                        Text(folder.lastPathComponent).fontWeight(.semibold).foregroundStyle(Theme.text)
-                        Text("\(store.visiblePhotos.count) photos").foregroundStyle(Theme.secondary)
+            if store.hasLibrary {
+                if store.mode == .library {
+                    Button { store.showSidebar.toggle() } label: {
+                        Image(systemName: "sidebar.left")
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(store.showSidebar ? Theme.text : Theme.secondary)
+                    .help("Show or hide sidebar (⇧⌘S)")
+                }
+                HStack(spacing: 6) {
+                    Text(store.sourceTitle).fontWeight(.semibold).foregroundStyle(Theme.text)
+                    Text("\(store.visiblePhotos.count) photos").foregroundStyle(Theme.secondary)
+                    if store.mode == .library && store.selection.count > 1 {
+                        Text("· \(store.selection.count) selected").foregroundStyle(Theme.secondary)
                     }
                 }
-                .buttonStyle(.plain)
-                .help("Open another folder (⌘O)")
             }
             Spacer()
-            if store.folder != nil {
+            if store.hasLibrary {
                 ModeSwitch()
             }
             Spacer()
-            if store.folder != nil {
+            if store.hasLibrary {
+                if store.mode == .library, let target = store.targetCollection {
+                    Button { store.addSelectionToTarget() } label: {
+                        Label("Add to \(target.name)", systemImage: "plus.square.on.square")
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(Theme.text.opacity(0.85))
+                    .help("Add the selection to “\(target.name)” (B)")
+                }
+                Button { store.showImportSheet() } label: {
+                    Label("Import", systemImage: "square.and.arrow.down")
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(Theme.text.opacity(0.85))
+                .help("Import photos (⌘I)")
                 if store.mode == .library {
                     Slider(value: $store.thumbnailSize, in: 120...360)
                         .controlSize(.mini)
@@ -207,16 +264,16 @@ struct WelcomeView: View {
             Image(systemName: "photo.on.rectangle.angled")
                 .font(.system(size: 44, weight: .light))
                 .foregroundStyle(Theme.secondary)
-            Text("Open a folder of photos")
+            Text("Import your photos")
                 .font(.system(size: 18, weight: .medium))
                 .foregroundStyle(Theme.text)
-            Text("No import, no catalog. Edits are saved next to your photos in a hidden .pixon folder.")
+            Text("Photos stay where they are on disk. Edits are saved next to them in a hidden .pixon folder.")
                 .font(.system(size: 12.5))
                 .foregroundStyle(Theme.secondary)
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 340)
-            Button("Open folder…") { store.chooseFolder() }
-                .keyboardShortcut("o")
+            Button("Import photos…") { store.showImportSheet() }
+                .keyboardShortcut("i")
                 .controlSize(.large)
             Text("or drop a folder here")
                 .font(.system(size: 11))
@@ -331,8 +388,8 @@ struct ExportSheet: View {
         .frame(width: 440)
         .onAppear {
             targets = store.targets.map { ($0.url, $0.adjustments) }
-            if settings.destinationPath == nil, let folder = store.folder {
-                settings.destinationPath = folder.appendingPathComponent("Exports").path
+            if settings.destinationPath == nil, let first = store.targets.first {
+                settings.destinationPath = first.url.deletingLastPathComponent().appendingPathComponent("Exports").path
             }
         }
         .onChange(of: settings.format) { save() }
