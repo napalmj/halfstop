@@ -23,6 +23,14 @@ struct PixonApp: App {
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1440, height: 900)
         .commands { PixonCommands(store: store) }
+
+        Window("Pixon Help", id: "help") {
+            HelpView()
+                .preferredColorScheme(.dark)
+        }
+        .windowStyle(.hiddenTitleBar)
+        .defaultSize(width: 860, height: 680)
+        .windowResizability(.contentMinSize)
     }
 }
 
@@ -85,12 +93,62 @@ struct ContentView: View {
         .sheet(isPresented: $store.showExport) { ExportSheet() }
         .sheet(isPresented: $store.showImport) { ImportSheet() }
         .sheet(isPresented: $store.showSavePreset) { SavePresetSheet() }
+        .alert(TrashText.title(store.trashRequest),
+               isPresented: Binding(get: { store.trashRequest != nil }, set: { if !$0 { store.trashRequest = nil } }),
+               presenting: store.trashRequest) { request in
+            Button("Move to Trash", role: .destructive) {
+                store.trashFailures = store.moveToTrash(request.urls)
+                store.trashRequest = nil
+            }
+            Button("Cancel", role: .cancel) { store.trashRequest = nil }
+        } message: { request in
+            Text(TrashText.message(request, photos: store.photos))
+        }
+        .alert("Some photos couldn’t be moved to the Trash",
+               isPresented: Binding(get: { !store.trashFailures.isEmpty }, set: { if !$0 { store.trashFailures = [] } })) {
+            Button("OK") { store.trashFailures = [] }
+        } message: {
+            Text(TrashText.list(store.trashFailures) + ". They may be locked, or on a read-only drive.")
+        }
         .onAppear {
             SubjectDetector.shared.onDetected = { _ in renderer.bump() }
             Snapshot.run(store: store, renderer: renderer)
             keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
                 KeyHandler.handle(event, store: store) ? nil : event
             }
+        }
+    }
+}
+
+/// Wording for the Move to Trash warning.
+enum TrashText {
+    static func title(_ r: TrashRequest?) -> String {
+        guard let r else { return "Move to Trash?" }
+        let n = r.urls.count
+        let what = r.rejectedOnly ? (n == 1 ? "rejected photo" : "rejected photos") : (n == 1 ? "photo" : "photos")
+        return "Move \(n) \(what) to the Trash?"
+    }
+
+    static func message(_ r: TrashRequest, photos: [Photo]) -> String {
+        let names = r.urls.map(\.lastPathComponent)
+        let wanted = Set(r.urls)
+        let edited = photos.filter { wanted.contains($0.url) && !$0.adjustments.isDefault }.count
+        var text = names.count == 1
+            ? "“\(names[0])” will be moved from its folder to the Trash, along with its Pixon edits."
+            : "\(list(names)) will be moved from their folders to the Trash, along with their Pixon edits."
+        if edited > 0 && names.count > 1 { text += " \(edited) of them \(edited == 1 ? "has" : "have") edits." }
+        let one = names.count == 1
+        text += one ? " It’s also removed from your collections." : " They’re also removed from your collections."
+        text += "\n\nYou can put \(one ? "it" : "them") back from the Trash in Finder until you empty it."
+        return text
+    }
+
+    static func list(_ names: [String]) -> String {
+        switch names.count {
+        case 0: return ""
+        case 1: return "“\(names[0])”"
+        case 2...3: return names.dropLast().map { "“\($0)”" }.joined(separator: ", ") + " and “\(names.last!)”"
+        default: return names.prefix(2).map { "“\($0)”" }.joined(separator: ", ") + " and \(names.count - 2) more"
         }
     }
 }
@@ -115,11 +173,14 @@ enum KeyHandler {
             else if store.mode == .library, store.current != nil { store.mode = .edit }
             return true
         case 51, 117:                                                                 // delete
-            if case .collection(let id) = store.source, store.mode == .library {
+            // In a collection Delete only takes photos out of it; elsewhere it asks to move the files to the Trash.
+            guard store.mode == .library else { return false }
+            if case .collection(let id) = store.source {
                 store.removeFromCollection(id, store.selectedPhotos)
-                return true
+            } else {
+                store.requestTrash(store.selectedPhotos)
             }
-            return false
+            return true
         case 53:                                                                      // esc
             if store.isCropping { store.isCropping = false }
             else if store.refineMode != nil { store.refineMode = nil }
@@ -156,8 +217,13 @@ enum KeyHandler {
 
 struct PixonCommands: Commands {
     let store: LibraryStore
+    @Environment(\.openWindow) private var openWindow
 
     var body: some Commands {
+        CommandGroup(replacing: .help) {
+            Button("Pixon Help") { openWindow(id: "help") }
+                .keyboardShortcut("?", modifiers: .command)
+        }
         CommandGroup(replacing: .newItem) {
             Button("Import Photos…") { store.showImportSheet() }
                 .keyboardShortcut("i")
@@ -188,6 +254,14 @@ struct PixonCommands: Commands {
             Divider()
             Button("Add to Target Collection") { store.addSelectionToTarget() }
                 .disabled(store.targetCollection == nil)
+            Divider()
+            Button(store.selectedPhotos.count > 1 ? "Move \(store.selectedPhotos.count) Photos to Trash…" : "Move to Trash…") {
+                store.requestTrash(store.selectedPhotos)
+            }
+                .keyboardShortcut(.delete, modifiers: .command)
+                .disabled(store.selectedPhotos.isEmpty)
+            Button("Delete Rejected Photos…") { store.requestTrashRejected() }
+                .disabled(store.rejectedInSource.isEmpty)
             Divider()
             Button("Show or Hide Sidebar / History") {
                 if store.mode == .library { store.showSidebar.toggle() } else { store.showHistory.toggle() }

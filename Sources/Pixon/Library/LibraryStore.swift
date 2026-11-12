@@ -67,6 +67,10 @@ final class LibraryStore {
     // Navigation
     var mode: ViewMode = .library
     var currentID: URL?
+    /// Photos waiting on the "Move to Trash" confirmation.
+    var trashRequest: TrashRequest?
+    /// Files that couldn't be moved to the Trash (shown in an alert).
+    var trashFailures: [String] = []
     var selection: Set<URL> = []
     private var selectionAnchor: URL?
 
@@ -147,19 +151,22 @@ final class LibraryStore {
 
     // MARK: - Derived
 
-    var visiblePhotos: [Photo] {
-        let base: [Photo]
+    /// Everything in the chosen source (folder, collection…), before filters.
+    var sourcePhotos: [Photo] {
         switch source {
         case .all:
-            base = photos
+            photos
         case .lastImport:
-            base = (catalog.lastImport?.refs ?? []).compactMap { photoByRef[$0] }
+            (catalog.lastImport?.refs ?? []).compactMap { photoByRef[$0] }
         case .folder(let id):
-            base = photos.filter { $0.ref.folder == id }
+            photos.filter { $0.ref.folder == id }
         case .collection(let id):
-            base = (catalog.collections.first { $0.id == id }?.members ?? []).compactMap { photoByRef[$0] }
+            (catalog.collections.first { $0.id == id }?.members ?? []).compactMap { photoByRef[$0] }
         }
-        return base.filter { p in
+    }
+
+    var visiblePhotos: [Photo] {
+        sourcePhotos.filter { p in
             if p.rating < minRating { return false }
             if hideRejected && p.flag == .reject && filter != .rejected { return false }
             switch editsFilter {
@@ -526,6 +533,82 @@ final class LibraryStore {
         selection = currentID.map { [$0] } ?? []
     }
 
+    // MARK: - Trash
+
+    /// How a file goes to the Trash. Tests swap this for a scratch folder so they never touch the real Trash.
+    nonisolated(unsafe) static var trashFile: (URL) throws -> Void = { url in
+        try FileManager.default.trashItem(at: url, resultingItemURL: nil)
+    }
+
+    /// Asks for confirmation (see `TrashConfirmation`) before moving these photos' files to the Trash.
+    func requestTrash(_ items: [Photo]) {
+        guard !items.isEmpty else { return }
+        trashRequest = TrashRequest(urls: items.map(\.url), rejectedOnly: false)
+    }
+
+    /// Every rejected photo in the current source (ignores filters, so hidden rejects count too).
+    var rejectedInSource: [Photo] { sourcePhotos.filter { $0.flag == .reject } }
+
+    func requestTrashRejected() {
+        let items = rejectedInSource
+        guard !items.isEmpty else { return }
+        trashRequest = TrashRequest(urls: items.map(\.url), rejectedOnly: true)
+    }
+
+    /// Moves the photo files (and their `.pixon` sidecars) to the Trash, where Finder can put them back,
+    /// and drops them from the library, collections and last import. Returns the files that couldn't be moved.
+    @discardableResult
+    func moveToTrash(_ urls: [URL]) -> [String] {
+        let wanted = Set(urls)
+        let items = photos.filter { wanted.contains($0.url) }
+        guard !items.isEmpty else { return [] }
+
+        // Remember where we were so the next photo takes the current one's place.
+        let before = visiblePhotos
+        let currentIndex = before.firstIndex { $0.url == currentID }
+
+        var moved: [Photo] = []
+        var failed: [String] = []
+        let fm = FileManager.default
+        for p in items {
+            // Don't let a pending save or history step recreate the sidecar afterwards.
+            pendingSaves[p.url]?.cancel(); pendingSaves[p.url] = nil; pendingTokens[p.url] = nil
+            pendingCommits[p.url]?.cancel(); pendingCommits[p.url] = nil
+            do {
+                try Self.trashFile(p.url)
+                let sidecar = Self.sidecarURL(for: p.url)
+                if fm.fileExists(atPath: sidecar.path) { try? Self.trashFile(sidecar) }
+                moved.append(p)
+            } catch {
+                failed.append(p.url.lastPathComponent)
+            }
+        }
+        unsavedCount = pendingSaves.count
+        guard !moved.isEmpty else { return failed }
+
+        catalog.forget(Set(moved.map(\.ref)))
+        saveCatalog()
+        let gone = Set(moved.map(\.url))
+        photos.removeAll { gone.contains($0.url) }
+        photoByRef = Dictionary(photos.map { ($0.ref, $0) }, uniquingKeysWith: { a, _ in a })
+        selection.subtract(gone)
+
+        if let id = currentID, gone.contains(id) {
+            currentID = nil
+            let after = visiblePhotos
+            if let i = currentIndex, !after.isEmpty {
+                // Next surviving photo after the old position, else the one before it.
+                let next = before[i...].first { !gone.contains($0.url) } ?? before[..<i].last { !gone.contains($0.url) }
+                setCurrent(next?.url ?? after[min(i, after.count - 1)].url)
+            } else {
+                setCurrent(after.first?.url)
+            }
+            selection = currentID.map { [$0] } ?? []
+        }
+        if photos.isEmpty || currentID == nil { mode = .library }
+        return failed
+    }
+
     // MARK: - Culling
 
     func setRating(_ rating: Int) {
@@ -868,4 +951,11 @@ final class LibraryStore {
         encoder.outputFormatting = [.prettyPrinted]
         if let data = try? encoder.encode(presets) { try? data.write(to: Self.presetsURL, options: .atomic) }
     }
+}
+
+struct TrashRequest: Identifiable {
+    let id = UUID()
+    let urls: [URL]
+    /// Came from "Delete Rejected…" (changes the wording).
+    let rejectedOnly: Bool
 }

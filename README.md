@@ -22,6 +22,10 @@ Requires macOS 14+ and the Xcode command line tools.
   Imported folders are watched for new files; moved folders can be relocated.
 - **Library**: sidebar with All photos, Last import, Folders and manual Collections;
   thumbnail grid, ratings, pick/reject flags, filters, multi-select, drag to collections.
+- **Deleting**: Move to Trash (⌘⌫, or Delete in the grid) and Delete Rejected Photos (Photo or
+  filter menu) move the files and their edits to the macOS Trash after a warning; Finder's
+  Put Back restores them (put back the matching `.json` too to keep the edits). Help ▸ Pixon
+  Help (⌘?) lists every shortcut.
 - **Quick tab**: exposure, contrast, highlights, shadows, temperature, saturation, vignette.
 - **Detailed tab**: full light & color, color grading wheels, tone curve, HSL, detail.
 - **Masks**: brush, linear, radial, subject (Apple Vision) and sky; each with its own sliders.
@@ -54,7 +58,8 @@ Requires macOS 14+ and the Xcode command line tools.
 | ⇧⌘E | Export |
 | ⌘I | Import photos |
 | B | Add selection to the target collection |
-| Delete | Remove from the current collection |
+| Delete | In a collection: remove from it. Elsewhere in the grid: move to Trash (asks first) |
+| ⌘⌫ | Move selected photos to Trash (asks first) |
 | ⇧⌘S | Show / hide the sidebar (library) or history (editor) |
 | ⌘S | Save now |
 

@@ -1,3 +1,4 @@
+import SwiftUI
 import Foundation
 import CoreImage
 import CoreGraphics
@@ -484,6 +485,27 @@ enum Snapshot {
             await wait(1)
             shot("8-edited-filter")
             store.editsFilter = .any
+            // The Move to Trash warning (cancelled: nothing is trashed).
+            store.requestTrash(Array(store.visiblePhotos.prefix(3)))
+            await wait(1)
+            shot("10-trash-warning", sheet: true)
+            shot("10-trash-warning-window")
+            store.trashRequest = nil
+            await wait(0.5)
+            // Help window, rendered in its own window.
+            let help = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 860, height: 680), styleMask: [.titled, .fullSizeContentView],
+                                backing: .buffered, defer: false)
+            help.titlebarAppearsTransparent = true
+            help.appearance = NSAppearance(named: .darkAqua)
+            help.contentView = NSHostingView(rootView: HelpView().preferredColorScheme(.dark))
+            help.orderFront(nil)
+            await wait(1)
+            if let view = help.contentView, let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
+                view.cacheDisplay(in: view.bounds, to: rep)
+                try? rep.representation(using: .png, properties: [:])?.write(to: dir.appendingPathComponent("11-help.png"))
+                print("snapshot 11-help")
+            }
+            help.close()
             store.flushSaves()
             print("snapshot done")
             NSApp.terminate(nil)
@@ -642,6 +664,63 @@ enum LibraryTest {
             check("clear keeps current edits", photo.history.count == 1 && photo.adjustments.saturation == -30)
             store.resetAdjustments()
             store.mode = .library
+        }
+
+        // Move to Trash: files and sidecars go to the (fake) trash, references are dropped, the next photo is current.
+        do {
+            let fakeTrash = dir.appendingPathComponent("FakeTrash")
+            try? fm.createDirectory(at: fakeTrash, withIntermediateDirectories: true)
+            let realTrash = LibraryStore.trashFile
+            LibraryStore.trashFile = { url in
+                try FileManager.default.moveItem(at: url, to: fakeTrash.appendingPathComponent(UUID().uuidString + "-" + url.lastPathComponent))
+            }
+            defer { LibraryStore.trashFile = realTrash }
+
+            store.source = .all
+            store.filter = .all; store.minRating = 0; store.editsFilter = .any; store.hideRejected = false
+            let list = store.visiblePhotos
+            if list.count >= 4 {
+                let doomed = list[1], keep = list[2]
+                store.select(doomed)
+                store.setFlag(.reject)
+                store.edit { $0.exposure = 0.5 }
+                store.flushSaves()
+                let sidecar = LibraryStore.sidecarURL(for: doomed.url)
+                let hadSidecar = fm.fileExists(atPath: sidecar.path)
+                if let c = store.catalog.collections.first { store.addToCollection(c.id, [doomed]) }
+                let before = store.photos.count
+
+                check("delete rejected finds the reject", store.rejectedInSource.map(\.url) == [doomed.url],
+                      "\(store.rejectedInSource.count)")
+                store.requestTrashRejected()
+                check("trash asks first", store.trashRequest?.urls == [doomed.url] && fm.fileExists(atPath: doomed.url.path))
+                let msg = store.trashRequest.map { TrashText.message($0, photos: store.photos) } ?? ""
+                check("warning names the photo", msg.contains(doomed.url.lastPathComponent), msg)
+                store.trashRequest = nil
+                check("cancel keeps the file", fm.fileExists(atPath: doomed.url.path) && store.photos.count == before)
+
+                let failed = store.moveToTrash([doomed.url])
+                check("photo file moved to trash", failed.isEmpty && !fm.fileExists(atPath: doomed.url.path))
+                check("sidecar moved too", hadSidecar && !fm.fileExists(atPath: sidecar.path), "had \(hadSidecar)")
+                check("removed from library and collections", store.photos.count == before - 1
+                      && !store.catalog.collections.contains { $0.members.contains(doomed.ref) }
+                      && store.catalog.fingerprints[doomed.ref.key] == nil)
+                check("next photo becomes current", store.currentID == keep.url, store.currentID?.lastPathComponent ?? "nil")
+
+                // Bulk: two at once, and it stays gone after a rescan and a reopen.
+                let two = Array(store.visiblePhotos.suffix(2))
+                store.moveToTrash(two.map(\.url))
+                await reloaded(store)
+                let reopened = LibraryStore(catalogURL: catalogURL, watch: false)
+                await reloaded(reopened)
+                let goneURLs = Set([doomed.url] + two.map(\.url))
+                check("bulk trash survives rescan and reopen", store.photos.count == before - 3
+                      && !reopened.photos.contains { goneURLs.contains($0.url) }, "\(reopened.photos.count)")
+                let trashed = (try? fm.contentsOfDirectory(atPath: fakeTrash.path)) ?? []
+                check("real Trash untouched by tests", trashed.count >= 4, "\(trashed.count) in fake trash")
+            } else {
+                check("enough photos for trash test", false, "\(list.count)")
+            }
         }
 
         // Brush: two separate strokes must both land in the mask.

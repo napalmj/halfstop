@@ -125,6 +125,10 @@ private struct GridCell: View {
             Button("Reject") { store.select(photo); store.setFlag(.reject) }
             Divider()
             Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([photo.url]) }
+            Divider()
+            Button(contextTargets.count > 1 ? "Move \(contextTargets.count) Photos to Trash…" : "Move to Trash…", role: .destructive) {
+                store.requestTrash(contextTargets)
+            }
         }
     }
 }
@@ -200,6 +204,10 @@ struct TopBar: View {
                         Text("· \(store.selection.count) selected").foregroundStyle(Theme.secondary)
                     }
                 }
+                if store.mode == .edit, let photo = store.current {
+                    Rectangle().fill(Theme.hairline).frame(width: 1, height: 18)
+                    RatingControl(photo: photo)
+                }
             }
             Spacer()
             if store.hasLibrary {
@@ -243,6 +251,9 @@ struct TopBar: View {
                     }
                     .pickerStyle(.inline)
                     Toggle("Hide rejected", isOn: $store.hideRejected)
+                    Divider()
+                    Button("Delete Rejected Photos…") { store.requestTrashRejected() }
+                        .disabled(store.rejectedInSource.isEmpty)
                 } label: {
                     Label(filterLabel, systemImage: "line.3.horizontal.decrease")
                 }
@@ -273,6 +284,53 @@ struct TopBar: View {
         if store.editsFilter == .edited { parts.append("Edited") }
         if store.editsFilter == .unedited { parts.append("Not edited") }
         return parts.isEmpty ? "All" : parts.joined(separator: " · ")
+    }
+}
+
+/// Stars plus pick/reject for the photo being edited. Click a star to rate (click it again to clear);
+/// same as the 0–5, P, X and U keys.
+private struct RatingControl: View {
+    @Environment(LibraryStore.self) private var store
+    let photo: Photo
+    @State private var hover: Int?
+
+    var body: some View {
+        HStack(spacing: 10) {
+            HStack(spacing: 2) {
+                ForEach(1...5, id: \.self) { n in
+                    let lit = n <= (hover ?? photo.rating)
+                    Image(systemName: lit ? "star.fill" : "star")
+                        .font(.system(size: 12))
+                        .foregroundStyle(lit ? (hover != nil ? Theme.accent.opacity(0.7) : Theme.accent) : Theme.secondary.opacity(0.7))
+                        .frame(width: 16, height: 20)
+                        .contentShape(Rectangle())
+                        .onHover { inside in
+                            if inside { hover = n } else if hover == n { hover = nil }
+                        }
+                        .onTapGesture { store.setRating(n) }
+                        .help(photo.rating == n ? "Clear rating (0)" : "Rate \(n) star\(n == 1 ? "" : "s") (\(n))")
+                }
+            }
+            HStack(spacing: 4) {
+                flagButton(.pick, icon: "flag.fill", help: "Pick (P)")
+                flagButton(.reject, icon: "xmark", help: "Reject (X)")
+            }
+        }
+    }
+
+    private func flagButton(_ flag: Flag, icon: String, help: String) -> some View {
+        let on = photo.flag == flag
+        return Button {
+            store.setFlag(on ? .none : flag)
+        } label: {
+            Image(systemName: icon)
+                .font(.system(size: 11, weight: .semibold))
+                .frame(width: 24, height: 20)
+                .background(on ? Theme.panelRaised : .clear, in: RoundedRectangle(cornerRadius: 5))
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(on ? (flag == .reject ? Color(red: 1, green: 0.45, blue: 0.4) : Theme.text) : Theme.secondary)
+        .help(on ? "Unflag (U)" : help)
     }
 }
 

@@ -100,6 +100,16 @@ struct Catalog: Codable {
 
     func folder(_ id: UUID) -> CatalogFolder? { folders.first { $0.id == id } }
 
+    /// Drops every reference to photos that are gone (moved to the Trash).
+    mutating func forget(_ refs: Set<PhotoRef>) {
+        for i in collections.indices { collections[i].members.removeAll { refs.contains($0) } }
+        for r in refs { fingerprints[r.key] = nil }
+        if var record = lastImport {
+            record.refs.removeAll { refs.contains($0) }
+            lastImport = record
+        }
+    }
+
     /// Rewrites every reference to a renamed photo (collections, fingerprints, last import).
     mutating func rename(_ from: PhotoRef, to: PhotoRef) {
         for i in collections.indices {
