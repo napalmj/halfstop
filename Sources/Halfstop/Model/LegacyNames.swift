@@ -38,7 +38,10 @@ enum LegacyNames {
         let isNew = checkedFolders.insert(folder.path).inserted
         lock.unlock()
         guard isNew else { return }
-        moveIfNew(from: folder.appendingPathComponent(sidecarFolder, isDirectory: true), to: newFolder)
+        // Only a real folder: moving a planted link would make the new sidecar folder a link too.
+        let old = folder.appendingPathComponent(sidecarFolder, isDirectory: true)
+        guard LibraryFiles.kind(old) == .directory else { return }
+        moveIfNew(from: old, to: newFolder)
     }
 
     private static func moveIfNew(from old: URL, to new: URL) {

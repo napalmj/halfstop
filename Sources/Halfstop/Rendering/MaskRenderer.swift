@@ -130,7 +130,8 @@ enum MaskRenderer {
     }
 
     /// Grow (+) / shrink (-) the edge, then soften it. Both scale with the image so preview and export match.
-    static func adjustEdges(_ input: CIImage, grow: Double, softness: Double, size: CGSize) -> CIImage {
+    static func adjustEdges(_ input: CIImage, grow rawGrow: Double, softness rawSoftness: Double, size: CGSize) -> CIImage {
+        let grow = rawGrow.clamped(to: EditLimits.grow), softness = rawSoftness.clamped(to: EditLimits.softness)
         let extent = CGRect(origin: .zero, size: size)
         let long = Double(max(size.width, size.height))
         var img = input
@@ -214,7 +215,8 @@ enum MaskRenderer {
 
     static func rasterize(_ strokes: [BrushStroke], width: Int, height: Int, background: CGImage? = nil) -> CGImage? {
         guard let ctx = StrokePainter.context(width: width, height: height, background: background) else { return nil }
-        for stroke in strokes { StrokePainter.paint(stroke, from: 0, in: ctx, width: width, height: height) }
+        var budget = StrokePainter.budget(width: width, height: height)
+        for stroke in strokes { StrokePainter.paint(stroke, from: 0, in: ctx, width: width, height: height, budget: &budget) }
         return ctx.makeImage()
     }
 }
@@ -235,34 +237,78 @@ enum StrokePainter {
         return ctx
     }
 
+    /// How much painting one rasterization may do, in pixel-sized units of work. Enough for a
+    /// mask with hundreds of long strokes, so real edits are never cut short, but bounded by the
+    /// raster size, so a crafted stroke can't keep a render busy for minutes.
+    static func budget(width: Int, height: Int) -> Double {
+        256 * Double(max(width, 1)) * Double(max(height, 1))
+    }
+
+    /// Work charged for one dab: its area (capped at the raster), and at least a fixed cost.
+    private static func dabCost(radius r: CGFloat, width: Int, height: Int) -> Double {
+        max(64, min(Double(r * r) * 4, Double(width) * Double(height)))
+    }
+
     /// Paints a stroke's dabs starting at segment `from` (segment i joins points i-1 and i;
     /// 0 also paints the first point). Painting 0..<k and then k... gives the same pixels as
     /// painting the whole stroke at once, which is what lets live strokes grow incrementally.
-    static func paint(_ stroke: BrushStroke, from: Int, in ctx: CGContext, width: Int, height: Int) {
-        guard let space = ctx.colorSpace, !stroke.points.isEmpty, from < stroke.points.count else { return }
+    ///
+    /// Only the part of each segment within `r` of the raster is walked (dabs further out can't
+    /// touch it), keeping the dabs where they'd be on the full segment. `budget` is shared by
+    /// everything painted in one rasterization; when it runs out, painting stops.
+    static func paint(_ stroke: BrushStroke, from: Int, in ctx: CGContext, width: Int, height: Int, budget: inout Double) {
+        guard let space = ctx.colorSpace, !stroke.points.isEmpty, from < stroke.points.count, budget > 0 else { return }
         let long = CGFloat(max(width, height))
         let r = CGFloat(stroke.radius) * long
         let tone: CGFloat = stroke.erase ? 0 : 1
         let core = max(0, 1 - CGFloat(stroke.feather))
         let flow = CGFloat(stroke.flow)
-        guard let gradient = CGGradient(colorSpace: space, colorComponents: [tone, flow, tone, flow, tone, 0],
-                                        locations: [0, core * 0.999, 1], count: 3) else { return }
+        guard r.isFinite, let gradient = CGGradient(colorSpace: space, colorComponents: [tone, flow, tone, flow, tone, 0],
+                                                    locations: [0, core * 0.999, 1], count: 3) else { return }
+        let cost = dabCost(radius: r, width: width, height: height)
+        let reach = CGRect(x: 0, y: 0, width: width, height: height).insetBy(dx: -r - 1, dy: -r - 1)
         func pt(_ i: Int) -> CGPoint { CGPoint(x: stroke.points[i].x * Double(width), y: stroke.points[i].y * Double(height)) }
-        func dab(_ p: CGPoint) {
-            ctx.drawRadialGradient(gradient, startCenter: p, startRadius: 0, endCenter: p, endRadius: r, options: [])
+        func dab(_ p: CGPoint) -> Bool {
+            guard budget > 0 else { return false }
+            budget -= cost
+            if reach.contains(p) {
+                ctx.drawRadialGradient(gradient, startCenter: p, startRadius: 0, endCenter: p, endRadius: r, options: [])
+            }
+            return true
         }
-        if from == 0 { dab(pt(0)) }
+        if from == 0 { _ = dab(pt(0)) }
         let spacing = max(r * 0.2, 0.5)
         for i in max(from, 1)..<max(stroke.points.count, 1) {
             let a = pt(i - 1), b = pt(i)
             let d = hypot(b.x - a.x, b.y - a.y)
-            var t = spacing
-            while t <= d {
-                dab(CGPoint(x: a.x + (b.x - a.x) * t / d, y: a.y + (b.y - a.y) * t / d))
+            guard d.isFinite else { continue }
+            if d < spacing {
+                guard dab(b) else { return }
+                continue
+            }
+            // The stretch of the segment near the raster, as distances from `a`.
+            guard let (enter, exit) = clip(a, b, length: d, to: reach) else { continue }
+            var t = max(spacing, (enter / spacing).rounded(.up) * spacing)
+            while t <= min(d, exit) {
+                guard dab(CGPoint(x: a.x + (b.x - a.x) * t / d, y: a.y + (b.y - a.y) * t / d)) else { return }
                 t += spacing
             }
-            if d < spacing { dab(b) }
         }
+    }
+
+    /// The part of segment a→b inside `rect`, as distances along it from `a` (Liang–Barsky).
+    static func clip(_ a: CGPoint, _ b: CGPoint, length d: CGFloat, to rect: CGRect) -> (CGFloat, CGFloat)? {
+        var t0: CGFloat = 0, t1: CGFloat = 1
+        let dx = b.x - a.x, dy = b.y - a.y
+        for (p, q) in [(-dx, a.x - rect.minX), (dx, rect.maxX - a.x), (-dy, a.y - rect.minY), (dy, rect.maxY - a.y)] {
+            if p == 0 {
+                if q < 0 { return nil }
+            } else {
+                let u = q / p
+                if p < 0 { t0 = max(t0, u) } else { t1 = min(t1, u) }
+            }
+        }
+        return t0 <= t1 ? (t0 * d, t1 * d) : nil
     }
 }
 
@@ -293,8 +339,9 @@ enum LiveRaster {
         guard let e = entries[key(maskID, width, height)], e.baseKey == baseKey,
               let start = appendedFrom(e.drawn, to: strokes) else { return nil }
         if start.stroke == strokes.count { return e.image }  // nothing new
+        var budget = StrokePainter.budget(width: width, height: height)
         for i in start.stroke..<strokes.count {
-            StrokePainter.paint(strokes[i], from: i == start.stroke ? start.segment : 0, in: e.ctx, width: width, height: height)
+            StrokePainter.paint(strokes[i], from: i == start.stroke ? start.segment : 0, in: e.ctx, width: width, height: height, budget: &budget)
         }
         e.drawn = strokes
         e.image = e.ctx.makeImage()
@@ -304,7 +351,8 @@ enum LiveRaster {
     /// Paints all strokes from scratch and keeps the bitmap for later `extend` calls.
     static func rebuild(maskID: UUID, width: Int, height: Int, background: CGImage?, baseKey: Int?, strokes: [BrushStroke]) -> CGImage? {
         guard let ctx = StrokePainter.context(width: width, height: height, background: background) else { return nil }
-        for stroke in strokes { StrokePainter.paint(stroke, from: 0, in: ctx, width: width, height: height) }
+        var budget = StrokePainter.budget(width: width, height: height)
+        for stroke in strokes { StrokePainter.paint(stroke, from: 0, in: ctx, width: width, height: height, budget: &budget) }
         let entry = Entry(ctx: ctx, baseKey: baseKey, drawn: strokes)
         entry.image = ctx.makeImage()
         lock.lock(); defer { lock.unlock() }

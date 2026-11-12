@@ -336,6 +336,10 @@ struct ExportSettings: Codable {
 
 enum Exporter {
     static func export(_ photo: (url: URL, adjustments: Adjustments), settings: ExportSettings, to folder: URL) throws -> URL {
+        if let n = ImageSource.declaredPixelCount(url: photo.url), n > Double(ImageSource.maxFullSizePixels) {
+            throw NSError(domain: "Halfstop", code: 2, userInfo: [NSLocalizedDescriptionKey:
+                "\(photo.url.lastPathComponent) is too large to export (\(Int(n / 1_000_000)) megapixels; the limit is \(ImageSource.maxFullSizePixels / 1_000_000))"])
+        }
         guard let source = ImageSource(url: photo.url, maxPixelSize: nil) else {
             throw NSError(domain: "Halfstop", code: 1, userInfo: [NSLocalizedDescriptionKey: "Could not decode \(photo.url.lastPathComponent)"])
         }

@@ -29,9 +29,24 @@ final class ImageSource {
     /// Oriented pixel size of the undeveloped image at the scale it was loaded.
     let size: CGSize
 
-    /// Loads a photo. `maxPixelSize` downsamples for fast previews; nil means full resolution.
+    /// The most pixels decoded at full size (export). A tiny file can declare enormous dimensions
+    /// (a 380 KB PNG decodes to gigabytes), so this is checked from the header before decoding.
+    nonisolated(unsafe) static var maxFullSizePixels = 200_000_000   // var: the self-test lowers it
+
+    /// Width × height as the file's header declares them, without decoding; nil if unreadable.
+    static func declaredPixelCount(url: URL) -> Double? {
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary),
+              let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+              let w = (props[kCGImagePropertyPixelWidth] as? NSNumber)?.doubleValue,
+              let h = (props[kCGImagePropertyPixelHeight] as? NSNumber)?.doubleValue else { return nil }
+        return w * h
+    }
+
+    /// Loads a photo. `maxPixelSize` downsamples for fast previews; nil means full resolution
+    /// (refused above `maxFullSizePixels`).
     init?(url: URL, maxPixelSize: CGFloat?) {
         self.url = url
+        if maxPixelSize == nil, let n = ImageSource.declaredPixelCount(url: url), n > Double(ImageSource.maxFullSizePixels) { return nil }
         let ext = url.pathExtension.lowercased()
         if ImageFormats.raw.contains(ext), let raw = CIRAWFilter(imageURL: url) {
             if let maxPixelSize {
@@ -323,6 +338,8 @@ final class ImageSource {
                             height: r.height * frame.height)
         }
         target = target.integral.intersection(frame.integral)
+        // A degenerate crop (from a damaged file) would give an empty or infinite image.
+        if target.isNull || target.isEmpty || target.isInfinite { target = frame.integral }
         img = img.cropped(to: target)
         return img.transformed(by: CGAffineTransform(translationX: -target.minX, y: -target.minY))
     }

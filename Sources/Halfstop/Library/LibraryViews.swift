@@ -74,6 +74,9 @@ private struct GridCell: View {
                 .overlay(alignment: .bottomTrailing) {
                     if !photo.adjustments.isDefault { EditedBadge().padding(12) }
                 }
+                .overlay(alignment: .topLeading) {
+                    if store.failedSaves[photo.url] != nil { UnsavedDot().padding(14) }
+                }
                 .opacity(photo.flag == .reject ? 0.35 : 1)
             Text(photo.name)
                 .font(.system(size: 10.5))
@@ -152,20 +155,49 @@ struct EditedBadge: View {
     }
 }
 
+/// Marks a photo whose edits couldn't be saved.
+struct UnsavedDot: View {
+    var body: some View {
+        Circle()
+            .fill(Theme.accent)
+            .frame(width: 8, height: 8)
+            .overlay(Circle().stroke(.black.opacity(0.5), lineWidth: 1))
+            .help("Edits to this photo aren’t saved")
+    }
+}
+
 /// "Saved" / "Saving…" in the top bar. Edits save automatically next to each photo.
+/// When saves fail, a warning that opens the details instead.
 private struct SaveStatus: View {
     @Environment(LibraryStore.self) private var store
 
     var body: some View {
-        let saving = store.unsavedCount > 0
-        HStack(spacing: 4) {
-            Image(systemName: saving ? "arrow.triangle.2.circlepath" : "checkmark.circle.fill")
-            Text(saving ? "Saving…" : "Saved")
+        @Bindable var store = store
+        if store.hasSaveProblems {
+            let photos = store.saveProblems.reduce(0) { $0 + $1.photoCount }
+            Button { store.showSaveProblems.toggle() } label: {
+                Label(photos > 0 ? "\(photos) photo\(photos == 1 ? "" : "s") not saved" : "Library not saved",
+                      systemImage: "exclamationmark.triangle.fill")
+                    .font(.system(size: 11.5, weight: .medium))
+                    .foregroundStyle(Theme.accent)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(Theme.accent.opacity(0.16), in: RoundedRectangle(cornerRadius: 6))
+            }
+            .buttonStyle(.plain)
+            .help("Some edits can’t be saved. Click for details.")
+            .popover(isPresented: $store.showSaveProblems, arrowEdge: .bottom) { SaveProblemsView() }
+        } else {
+            let saving = store.unsavedCount > 0
+            HStack(spacing: 4) {
+                Image(systemName: saving ? "arrow.triangle.2.circlepath" : "checkmark.circle.fill")
+                Text(saving ? "Saving…" : "Saved")
+            }
+            .font(.system(size: 11.5, weight: store.savedFlash ? .semibold : .regular))
+            .foregroundStyle(store.savedFlash ? Theme.accent : Theme.secondary)
+            .animation(.easeOut(duration: 0.2), value: store.savedFlash)
+            .help(helpText)
         }
-        .font(.system(size: 11.5, weight: store.savedFlash ? .semibold : .regular))
-        .foregroundStyle(store.savedFlash ? Theme.accent : Theme.secondary)
-        .animation(.easeOut(duration: 0.2), value: store.savedFlash)
-        .help(helpText)
     }
 
     private var helpText: String {
@@ -175,6 +207,52 @@ private struct SaveStatus: View {
             t += " Last saved \(f.localizedString(for: d, relativeTo: Date()))."
         }
         return t
+    }
+}
+
+/// Where edits can't be saved, and why.
+private struct SaveProblemsView: View {
+    @Environment(LibraryStore.self) private var store
+
+    var body: some View {
+        let problems = store.saveProblems
+        let photos = problems.reduce(0) { $0 + $1.photoCount }
+        VStack(alignment: .leading, spacing: 8) {
+            Text(photos > 0 ? "Edits to \(photos) photo\(photos == 1 ? "" : "s") aren’t saved" : "Your library isn’t saved")
+                .font(.system(size: 13, weight: .semibold))
+            Text("They’re kept while Halfstop is open and saved as soon as the folder can be written to. Halfstop tries again every 30 seconds and on every change.")
+                .font(.system(size: 11.5))
+                .foregroundStyle(Theme.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            ForEach(problems) { p in
+                Divider()
+                HStack(alignment: .center) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 4) {
+                            Text(p.title)
+                            if p.photoCount > 0 {
+                                Text("· \(p.photoCount) photo\(p.photoCount == 1 ? "" : "s")").foregroundStyle(Theme.secondary)
+                            }
+                        }
+                        .font(.system(size: 12))
+                        Text(p.reason).font(.system(size: 11)).foregroundStyle(Theme.secondary)
+                    }
+                    Spacer()
+                    if let folder = p.folder {
+                        Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([folder]) }
+                            .controlSize(.small)
+                    }
+                }
+            }
+            HStack {
+                Spacer()
+                Button("Try Again") { store.retryFailedSaves() }
+                    .keyboardShortcut(.defaultAction)
+            }
+            .padding(.top, 4)
+        }
+        .padding(14)
+        .frame(width: 360)
     }
 }
 

@@ -1,10 +1,54 @@
 import Foundation
 import CoreGraphics
 
+/// Bounds applied when edits are loaded, so a damaged or crafted file can't send absurd values
+/// to the renderer (a stroke 1e8 image-widths long, a mask grown by 1e6, a crop of negative size).
+/// They're wider than anything the editor produces, so real edits load unchanged.
+enum EditLimits {
+    /// Normalized coordinates: strokes and shapes may run off the image, but not to infinity.
+    static let coordinate = -50.0...50.0
+    static let brushRadius = 0.0005...0.5
+    static let unit = 0.0...1.0
+    static let shapeRadius = 0.001...10.0
+    static let grow = -100.0...100.0
+    static let softness = 0.0...100.0
+    static let straighten = -45.0...45.0
+    static let minCropSide = 0.0001
+    static let pointsPerStroke = 50_000
+    static let strokesPerMask = 20_000
+    static let shapesPerMask = 200
+    static let masks = 500
+    static let curvePoints = 1_000
+}
+
+extension Double {
+    func clamped(to r: ClosedRange<Double>) -> Double { Swift.min(Swift.max(self, r.lowerBound), r.upperBound) }
+}
+
+extension TolerantContainer {
+    /// Like `array`, keeping at most `limit` elements (the rest count as dropped).
+    func array<T: Decodable>(_ key: K, default fallback: [T], limit: Int) -> [T] {
+        var a: [T] = array(key, default: fallback)
+        if a.count > limit {
+            noteDropped()
+            a.removeSubrange(limit...)
+        }
+        return a
+    }
+}
+
 /// A point on the tone curve, both coordinates in 0...1.
 struct CurvePoint: Codable, Hashable {
     var x: Double
     var y: Double
+
+    init(x: Double, y: Double) { self.x = x; self.y = y }
+
+    init(from decoder: Decoder) throws {
+        let t = try TolerantContainer(decoder, keyedBy: CodingKeys.self)
+        x = try t.required(.x, as: Double.self).clamped(to: EditLimits.unit)
+        y = try t.required(.y, as: Double.self).clamped(to: EditLimits.unit)
+    }
 }
 
 /// Per-color hue / saturation / luminance offsets, each in -100...100.
@@ -14,6 +58,15 @@ struct HSLBand: Codable, Hashable {
     var luminance: Double = 0
 
     var isNeutral: Bool { hue == 0 && saturation == 0 && luminance == 0 }
+
+    init(hue: Double = 0, saturation: Double = 0, luminance: Double = 0) {
+        self.hue = hue; self.saturation = saturation; self.luminance = luminance
+    }
+
+    init(from decoder: Decoder) throws {
+        let t = try TolerantContainer(decoder, keyedBy: CodingKeys.self)
+        hue = t.value(.hue, 0); saturation = t.value(.saturation, 0); luminance = t.value(.luminance, 0)
+    }
 }
 
 enum HSLColor: Int, CaseIterable, Identifiable {
@@ -91,6 +144,24 @@ struct NormRect: Codable, Hashable {
     var minY: Double { y }
     var maxX: Double { x + width }
     var maxY: Double { y + height }
+
+    /// Inside the unit square with a positive size (a crop rect can't be anything else).
+    var clampedToUnit: NormRect {
+        let m = EditLimits.minCropSide
+        var r = self
+        r.x = x.clamped(to: 0...(1 - m)); r.y = y.clamped(to: 0...(1 - m))
+        r.width = width.clamped(to: m...(1 - r.x)); r.height = height.clamped(to: m...(1 - r.y))
+        return r
+    }
+
+    init(x: Double = 0, y: Double = 0, width: Double = 1, height: Double = 1) {
+        self.x = x; self.y = y; self.width = width; self.height = height
+    }
+
+    init(from decoder: Decoder) throws {
+        let t = try TolerantContainer(decoder, keyedBy: CodingKeys.self)
+        x = t.value(.x, 0); y = t.value(.y, 0); width = t.value(.width, 1); height = t.value(.height, 1)
+    }
 }
 
 /// Crop and straighten. `rect` is normalized (top-left origin) inside the straightened frame.
@@ -111,6 +182,16 @@ struct CropSettings: Codable, Hashable {
     var isIdentity: Bool {
         angle == 0 && rect == .full
     }
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let t = try TolerantContainer(decoder, keyedBy: CodingKeys.self)
+        rect = t.value(.rect, NormRect.full).clampedToUnit
+        angle = t.value(.angle, 0.0).clamped(to: EditLimits.straighten)
+        aspect = t.value(.aspect, .free)
+        portrait = t.value(.portrait, false)
+    }
 }
 
 // MARK: - Color grading
@@ -122,6 +203,15 @@ struct GradeWheel: Codable, Hashable {
     var luminance: Double = 0
 
     var isNeutral: Bool { saturation == 0 && luminance == 0 }
+
+    init(hue: Double = 0, saturation: Double = 0, luminance: Double = 0) {
+        self.hue = hue; self.saturation = saturation; self.luminance = luminance
+    }
+
+    init(from decoder: Decoder) throws {
+        let t = try TolerantContainer(decoder, keyedBy: CodingKeys.self)
+        hue = t.value(.hue, 0); saturation = t.value(.saturation, 0); luminance = t.value(.luminance, 0)
+    }
 }
 
 struct ColorGrading: Codable, Hashable {
@@ -132,6 +222,17 @@ struct ColorGrading: Codable, Hashable {
     var balance: Double = 0
 
     var isNeutral: Bool { shadows.isNeutral && midtones.isNeutral && highlights.isNeutral }
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let t = try TolerantContainer(decoder, keyedBy: CodingKeys.self)
+        let d = ColorGrading()
+        shadows = t.value(.shadows, d.shadows)
+        midtones = t.value(.midtones, d.midtones)
+        highlights = t.value(.highlights, d.highlights)
+        balance = t.value(.balance, d.balance)
+    }
 }
 
 // MARK: - Masks
@@ -139,6 +240,14 @@ struct ColorGrading: Codable, Hashable {
 struct NormPoint: Codable, Hashable {
     var x: Double
     var y: Double
+
+    init(x: Double, y: Double) { self.x = x; self.y = y }
+
+    init(from decoder: Decoder) throws {
+        let t = try TolerantContainer(decoder, keyedBy: CodingKeys.self)
+        x = try t.required(.x, as: Double.self).clamped(to: EditLimits.coordinate)
+        y = try t.required(.y, as: Double.self).clamped(to: EditLimits.coordinate)
+    }
 }
 
 /// Adjustments a mask applies to its area. Same ranges as the global sliders.
@@ -160,8 +269,8 @@ struct LocalAdjustments: Codable, Hashable {
 
     // Tolerant decoding: a missing field keeps its default instead of dropping the whole set.
     init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        func v(_ key: CodingKeys) -> Double { (try? c.decodeIfPresent(Double.self, forKey: key)) ?? 0 }
+        let t = try TolerantContainer(decoder, keyedBy: CodingKeys.self)
+        func v(_ key: CodingKeys) -> Double { t.value(key, 0) }
         exposure = v(.exposure); contrast = v(.contrast); highlights = v(.highlights); shadows = v(.shadows)
         whites = v(.whites); blacks = v(.blacks); temperature = v(.temperature); tint = v(.tint)
         vibrance = v(.vibrance); saturation = v(.saturation)
@@ -196,6 +305,21 @@ struct BrushStroke: Codable, Hashable {
     var feather: Double = 0.6
     var flow: Double = 1
     var erase = false
+
+    init(points: [NormPoint] = [], radius: Double = 0.04, feather: Double = 0.6, flow: Double = 1, erase: Bool = false) {
+        self.points = points; self.radius = radius; self.feather = feather; self.flow = flow; self.erase = erase
+    }
+
+    // Tolerant decoding: a missing field keeps its default; a bad point drops only that point.
+    init(from decoder: Decoder) throws {
+        let t = try TolerantContainer(decoder, keyedBy: CodingKeys.self)
+        let d = BrushStroke()
+        points = t.array(.points, default: [], limit: EditLimits.pointsPerStroke)
+        radius = t.value(.radius, d.radius).clamped(to: EditLimits.brushRadius)
+        feather = t.value(.feather, d.feather).clamped(to: EditLimits.unit)
+        flow = t.value(.flow, d.flow).clamped(to: EditLimits.unit)
+        erase = t.value(.erase, d.erase)
+    }
 }
 
 enum ShapeKind: String, Codable { case linear, radial }
@@ -225,6 +349,28 @@ struct MaskShape: Codable, Hashable, Identifiable {
     var feather = 0.5
     var start = NormPoint(x: 0.5, y: 0.25)
     var end = NormPoint(x: 0.5, y: 0.6)
+
+    init(id: UUID = UUID(), kind: ShapeKind, mode: CombineMode = .add, center: NormPoint = NormPoint(x: 0.5, y: 0.5),
+         radiusX: Double = 0.25, radiusY: Double = 0.25, feather: Double = 0.5,
+         start: NormPoint = NormPoint(x: 0.5, y: 0.25), end: NormPoint = NormPoint(x: 0.5, y: 0.6)) {
+        self.id = id; self.kind = kind; self.mode = mode; self.center = center
+        self.radiusX = radiusX; self.radiusY = radiusY; self.feather = feather; self.start = start; self.end = end
+    }
+
+    // Tolerant decoding: only `kind` is needed (a shape of an unknown kind is dropped).
+    init(from decoder: Decoder) throws {
+        let t = try TolerantContainer(decoder, keyedBy: CodingKeys.self)
+        let d = MaskShape(kind: .radial)
+        id = t.value(.id, UUID())
+        kind = try t.required(.kind)
+        mode = t.value(.mode, d.mode)
+        center = t.value(.center, d.center)
+        radiusX = t.value(.radiusX, d.radiusX).clamped(to: EditLimits.shapeRadius)
+        radiusY = t.value(.radiusY, d.radiusY).clamped(to: EditLimits.shapeRadius)
+        feather = t.value(.feather, d.feather).clamped(to: EditLimits.unit)
+        start = t.value(.start, d.start)
+        end = t.value(.end, d.end)
+    }
 }
 
 /// A local adjustment area. Geometry is normalized (top-left origin) to the oriented,
@@ -298,27 +444,25 @@ struct Mask: Codable, Hashable, Identifiable {
 
     // Tolerant decoding: older sidecars lack the newer fields.
     init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let t = try TolerantContainer(decoder, keyedBy: CodingKeys.self)
         let d = Mask(name: "", kind: .radial)
-        func v<T: Decodable>(_ key: CodingKeys, _ fallback: T) -> T {
-            (try? c.decodeIfPresent(T.self, forKey: key)) ?? fallback
-        }
+        func v<T: Decodable>(_ key: CodingKeys, _ fallback: T) -> T { t.value(key, fallback) }
         id = v(.id, UUID())
         name = v(.name, "Mask")
         kind = v(.kind, .radial)
         enabled = v(.enabled, d.enabled)
         invert = v(.invert, d.invert)
         center = v(.center, d.center)
-        radiusX = v(.radiusX, d.radiusX)
-        radiusY = v(.radiusY, d.radiusY)
-        feather = v(.feather, d.feather)
+        radiusX = v(.radiusX, d.radiusX).clamped(to: EditLimits.shapeRadius)
+        radiusY = v(.radiusY, d.radiusY).clamped(to: EditLimits.shapeRadius)
+        feather = v(.feather, d.feather).clamped(to: EditLimits.unit)
         start = v(.start, d.start)
         end = v(.end, d.end)
-        strokes = v(.strokes, d.strokes)
-        shapes = v(.shapes, d.shapes)
-        subjects = try? c.decodeIfPresent([Int].self, forKey: .subjects)
-        grow = v(.grow, d.grow)
-        softness = v(.softness, d.softness)
+        strokes = t.array(.strokes, default: d.strokes, limit: EditLimits.strokesPerMask)
+        shapes = t.array(.shapes, default: d.shapes, limit: EditLimits.shapesPerMask)
+        subjects = t.array(.subjects, of: Int.self)
+        grow = v(.grow, d.grow).clamped(to: EditLimits.grow)
+        softness = v(.softness, d.softness).clamped(to: EditLimits.softness)
         local = v(.local, d.local)
     }
 }
@@ -400,11 +544,9 @@ struct Adjustments: Codable, Hashable {
 
     // Tolerant decoding so sidecars and presets survive new fields being added.
     init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let t = try TolerantContainer(decoder, keyedBy: CodingKeys.self)
         let d = Adjustments()
-        func v<T: Decodable>(_ key: CodingKeys, _ fallback: T) -> T {
-            (try? c.decodeIfPresent(T.self, forKey: key)) ?? fallback
-        }
+        func v<T: Decodable>(_ key: CodingKeys, _ fallback: T) -> T { t.value(key, fallback) }
         temperature = v(.temperature, d.temperature)
         tint = v(.tint, d.tint)
         exposure = v(.exposure, d.exposure)
@@ -418,12 +560,22 @@ struct Adjustments: Codable, Hashable {
         vignette = v(.vignette, d.vignette)
         sharpening = v(.sharpening, d.sharpening)
         noiseReduction = v(.noiseReduction, d.noiseReduction)
-        curve = v(.curve, d.curve)
+        // Per point and per mask: one bad entry doesn't reset the rest.
+        let points: [CurvePoint] = t.array(.curve, default: d.curve, limit: EditLimits.curvePoints)
+        if points.count >= 2 {
+            curve = points
+        } else {
+            if t.c.contains(.curve) { t.noteDropped() }
+            curve = d.curve
+        }
         var bands = v(.hsl, d.hsl)
-        if bands.count != HSLColor.allCases.count { bands = d.hsl }
+        if bands.count != HSLColor.allCases.count {
+            t.noteDropped()
+            bands = d.hsl
+        }
         hsl = bands
         grading = v(.grading, d.grading)
-        masks = v(.masks, d.masks)
+        masks = t.array(.masks, default: d.masks, limit: EditLimits.masks)
         crop = v(.crop, d.crop)
     }
 }

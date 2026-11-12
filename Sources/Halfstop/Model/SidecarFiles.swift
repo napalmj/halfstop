@@ -31,36 +31,84 @@ enum SidecarFiles {
     /// Every sidecar file a photo can have (for renames and trashing).
     static func all(for photo: URL) -> [URL] { [mainURL(for: photo), historyURL(for: photo)] }
 
+    enum Failure: LocalizedError {
+        /// The sidecar folder or file is a link, or isn't what it should be: refused, so a planted
+        /// link can't make the app write, delete or move files elsewhere.
+        case unsafeLocation(String)
+
+        var errorDescription: String? {
+            switch self {
+            case .unsafeLocation(let path): "\(path) is a link or not a regular folder; edits there are not read or saved."
+            }
+        }
+    }
+
+    /// Throws unless the photo's sidecar folder is a real folder (or doesn't exist yet) directly
+    /// in the photo's folder, and `file`, if it exists, is a regular file rather than a link.
+    static func checkSafe(_ file: URL, for photo: URL) throws {
+        let parent = photo.deletingLastPathComponent()
+        let dir = parent.appendingPathComponent(folderName, isDirectory: true)
+        guard file.deletingLastPathComponent().standardizedFileURL.path == dir.standardizedFileURL.path else {
+            throw Failure.unsafeLocation(file.path)
+        }
+        switch LibraryFiles.kind(dir) {
+        case .none, .directory: break
+        default: throw Failure.unsafeLocation(dir.path)
+        }
+        switch LibraryFiles.kind(file) {
+        case .none, .file: break
+        default: throw Failure.unsafeLocation(file.path)
+        }
+        guard LibraryFiles.isInside(dir, LibraryFiles.canonical(parent)) else { throw Failure.unsafeLocation(dir.path) }
+    }
+
+    static func isSafe(_ file: URL, for photo: URL) -> Bool { (try? checkSafe(file, for: photo)) != nil }
+
+    /// The photo's sidecar, keeping every part that can be read. When anything had to be
+    /// dropped (or a file can't be read at all), the file is copied aside first, since the next
+    /// save rewrites it without the missing parts.
     static func read(for photo: URL) -> Sidecar? {
-        let decoder = JSONDecoder()
-        guard var sidecar = (try? Data(contentsOf: mainURL(for: photo))).flatMap({ try? decoder.decode(Sidecar.self, from: $0) }) else {
+        let main = mainURL(for: photo), hist = historyURL(for: photo)
+        guard isSafe(main, for: photo), let data = try? Data(contentsOf: main) else { return nil }
+        let report = DecodeReport()
+        guard var sidecar = try? JSONDecoder.reporting(into: report).decode(Sidecar.self, from: data) else {
+            FileBackup.keepPartiallyLoaded(main, data: data)
             return nil
         }
-        if let data = try? Data(contentsOf: historyURL(for: photo)),
-           let file = try? decoder.decode(HistoryFile.self, from: data) {
-            sidecar.history = file.historySteps()
-            sidecar.historyIndex = file.index
+        if report.dropped > 0 { FileBackup.keepPartiallyLoaded(main, data: data) }
+        if isSafe(hist, for: photo), let data = try? Data(contentsOf: hist) {
+            let report = DecodeReport()
+            if let file = try? JSONDecoder.reporting(into: report).decode(HistoryFile.self, from: data) {
+                sidecar.history = file.historySteps()
+                sidecar.historyIndex = file.index
+                if report.dropped > 0 { FileBackup.keepPartiallyLoaded(hist, data: data) }
+            } else {
+                FileBackup.keepPartiallyLoaded(hist, data: data)
+            }
         }
         return sidecar
     }
 
     /// - Parameter history: also write the history file. Ignored (written anyway) when the history
     ///   only exists inline in an older sidecar, so it isn't lost when the main file is rewritten.
-    static func write(_ sidecar: Sidecar, for photo: URL, history: Bool) {
+    /// Throws when the sidecar folder is unsafe (see `checkSafe`) or a file can't be written.
+    static func write(_ sidecar: Sidecar, for photo: URL, history: Bool) throws {
         let main = mainURL(for: photo), hist = historyURL(for: photo)
+        try checkSafe(main, for: photo)
+        try checkSafe(hist, for: photo)
         let fm = FileManager.default
         if sidecar.isEmpty {
-            try? fm.removeItem(at: main)
-            try? fm.removeItem(at: hist)
+            for url in [main, hist] where LibraryFiles.kind(url) != nil { try fm.removeItem(at: url) }
             return
         }
-        try? fm.createDirectory(at: main.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try fm.createDirectory(at: main.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try checkSafe(main, for: photo)   // nothing swapped in while creating it
         let encoder = JSONEncoder()
         let writeHistory = history || (!fm.fileExists(atPath: hist.path) && sidecar.history.count > 1)
-        if writeHistory, let data = try? encoder.encode(HistoryFile(sidecar.history, index: sidecar.historyIndex)) {
-            try? data.write(to: hist, options: .atomic)
+        if writeHistory {
+            try encoder.encode(HistoryFile(sidecar.history, index: sidecar.historyIndex)).write(to: hist, options: .atomic)
         }
-        if let data = try? encoder.encode(MainFile(sidecar)) { try? data.write(to: main, options: .atomic) }
+        try encoder.encode(MainFile(sidecar)).write(to: main, options: .atomic)
     }
 }
 
@@ -93,6 +141,28 @@ struct HistoryFile: Codable {
         var adjustments: Adjustments
         /// Mask id → its strokes, in order, as keys into `strokes`.
         var strokeRefs: [String: [String]]?
+
+        init(id: UUID, label: String, date: Date, adjustments: Adjustments, strokeRefs: [String: [String]]?) {
+            self.id = id; self.label = label; self.date = date; self.adjustments = adjustments; self.strokeRefs = strokeRefs
+        }
+
+        init(from decoder: Decoder) throws {
+            let t = try TolerantContainer(decoder, keyedBy: CodingKeys.self)
+            id = t.value(.id, UUID())
+            label = t.value(.label, "Edit")
+            date = t.value(.date, Date())
+            adjustments = try t.required(.adjustments)
+            strokeRefs = t.dictionary(.strokeRefs)
+        }
+    }
+
+    // Tolerant decoding: one bad step or stroke is dropped on its own.
+    init(from decoder: Decoder) throws {
+        let t = try TolerantContainer(decoder, keyedBy: CodingKeys.self)
+        version = t.value(.version, 1)
+        index = t.value(.index, 0)
+        steps = t.array(.steps, default: [])
+        strokes = t.dictionary(.strokes) ?? [:]
     }
 
     init(_ history: [HistoryStep], index: Int) {

@@ -57,6 +57,7 @@ struct ImportSheet: View {
                     Text("Rename files")
                     Text("Renames the original files on disk. You can revert this from Last import.")
                 }
+                .disabled(scan?.writable == false)
                 if rename {
                     Picker("Pattern", selection: $pattern) {
                         ForEach(RenamePattern.allCases) { Text($0.label).tag($0) }
@@ -121,6 +122,14 @@ struct ImportSheet: View {
                 if let covered = scan.coveredBy {
                     Text("Inside “\(covered)”, which is already imported").foregroundStyle(.secondary).font(.system(size: 11))
                 }
+                if !scan.writable {
+                    Label("This folder is read-only. You can browse it, but ratings and edits can’t be saved there. Renaming on import is off.",
+                          systemImage: "exclamationmark.triangle.fill")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Theme.accent)
+                        .multilineTextAlignment(.trailing)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
         }
     }
@@ -149,6 +158,7 @@ struct ImportSheet: View {
         let s = await store.scanForImport(folder, includeSubfolders: includeSubfolders)
         guard !Task.isCancelled else { return }
         scan = s
+        if !s.writable { rename = false }
         scanning = false
     }
 

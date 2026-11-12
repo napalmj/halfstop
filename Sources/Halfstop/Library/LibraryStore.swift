@@ -166,6 +166,19 @@ final class LibraryStore {
     private(set) var lastSaved: Date?
     /// Briefly true after ⌘S, to confirm the save.
     var savedFlash = false
+    /// Photos whose last save failed → why. Their edits stay in memory, still count as unsaved,
+    /// and are retried (every 30 s, on any change to them, on ⌘S and on "Try again").
+    private(set) var failedSaves: [URL: String] = [:]
+    /// Library files ("Library index", "Presets") whose last save failed → why.
+    private(set) var failedLibraryFiles: [String: String] = [:]
+    /// The save problems popover in the top bar.
+    var showSaveProblems = false
+    /// What each failed save tried to write, so it can be retried even after its photo left the
+    /// list (its card was ejected, say).
+    @ObservationIgnored private var failedSnapshots: [URL: (sidecar: Sidecar, history: Bool)] = [:]
+    @ObservationIgnored private var retryTimer: Timer?
+    /// The app's own store (the self-test makes others), for the quit check.
+    static weak var appStore: LibraryStore?
 
     init(catalogURL: URL = Catalog.defaultURL, watch: Bool = true) {
         self.catalogURL = catalogURL
@@ -190,7 +203,15 @@ final class LibraryStore {
 
     var hasLibrary: Bool { !catalog.folders.isEmpty }
 
-    func saveCatalog() { catalog.save(to: catalogURL) }
+    func saveCatalog() {
+        do {
+            try catalog.save(to: catalogURL)
+            failedLibraryFiles["Library index"] = nil
+        } catch {
+            failedLibraryFiles["Library index"] = Self.describeSaveError(error)
+        }
+        updateRetryTimer()
+    }
 
     // MARK: - Derived
 
@@ -401,6 +422,7 @@ final class LibraryStore {
         var seen = Set<String>()
         var entries: [(url: URL, ref: PhotoRef)] = []
         for folder in catalog.folders where folder.exists && (only?.contains(folder.id) ?? true) {
+            LibraryFiles.recoverInterruptedRenames(in: folder.url, recursive: folder.includeSubfolders)
             for rel in LibraryFiles.enumerate(folder.url, recursive: folder.includeSubfolders) where !folder.excluded.contains(rel) {
                 let url = URL(fileURLWithPath: folder.path).appendingPathComponent(rel)
                 guard seen.insert(url.path).inserted else { continue }
@@ -457,6 +479,9 @@ final class LibraryStore {
 
     func removeFolder(_ id: UUID) {
         flushSaves()
+        if let path = catalog.folder(id)?.path {
+            forgetFailedSaves { LibraryFiles.isInside($0, LibraryFiles.canonical(URL(fileURLWithPath: path))) || $0.path.hasPrefix(path + "/") }
+        }
         catalog.folders.removeAll { $0.id == id }
         for i in catalog.collections.indices {
             catalog.collections[i].members.removeAll { $0.folder == id }
@@ -563,58 +588,168 @@ final class LibraryStore {
     /// - Parameter history: the edit history changed too, so write its file (it's skipped otherwise).
     ///   Sticks until a save goes through, so a later rating or slider save still includes it.
     func scheduleSave(_ photo: Photo, history: Bool = false) {
-        pendingSaves[photo.url]?.cancel()
-        let sidecar = photo.sidecar
-        let url = photo.url
-        if history { historyDirty.insert(url) }
+        if history { historyDirty.insert(photo.url) }
+        scheduleWrite(photo.url, sidecar: photo.sidecar, delay: 0.5)
+    }
+
+    private func scheduleWrite(_ url: URL, sidecar: Sidecar, delay: Double) {
+        pendingSaves[url]?.cancel()
         let withHistory = historyDirty.contains(url)
         let token = UUID()
         let work = DispatchWorkItem { [weak self] in
-            LibraryStore.writeSidecar(sidecar, for: url, history: withHistory)
+            let failure = LibraryStore.writeSidecar(sidecar, for: url, history: withHistory)
             DispatchQueue.main.async {
-                MainActor.assumeIsolated { self?.didWrite(url, token: token) }
+                MainActor.assumeIsolated { self?.didWrite(url, token: token, sidecar: sidecar, failure: failure) }
             }
         }
         pendingSaves[url] = work
         pendingTokens[url] = token
         unsavedCount = pendingSaves.count
-        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.5, execute: work)
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay, execute: work)
     }
 
-    private func didWrite(_ url: URL, token: UUID) {
+    private func didWrite(_ url: URL, token: UUID, sidecar: Sidecar, failure: String?) {
         guard pendingTokens[url] == token else { return }
         pendingTokens[url] = nil
-        historyDirty.remove(url)
         pendingSaves[url] = nil
+        recordSave(url, sidecar: sidecar, failure: failure)
         unsavedCount = pendingSaves.count
-        lastSaved = Date()
     }
 
+    /// Notes how a save went. A failure keeps the history marked dirty, so the retry writes it.
+    private func recordSave(_ url: URL, sidecar: Sidecar, failure: String?) {
+        if let failure {
+            failedSaves[url] = failure
+            failedSnapshots[url] = (sidecar, historyDirty.contains(url) || failedSnapshots[url]?.history == true)
+        } else {
+            historyDirty.remove(url)
+            failedSaves[url] = nil
+            failedSnapshots[url] = nil
+            lastSaved = Date()
+        }
+        updateRetryTimer()
+    }
+
+    /// Stops retrying saves for these photos (trashed, or their folder left the library).
+    private func forgetFailedSaves(where drop: (URL) -> Bool) {
+        for url in failedSaves.keys where drop(url) {
+            failedSaves[url] = nil
+            failedSnapshots[url] = nil
+        }
+        updateRetryTimer()
+    }
+
+    /// Writes every pending and failed save now, on this thread. Failures stay recorded.
     func flushSaves() {
         commitAllPending()
-        for (url, work) in pendingSaves {
-            work.cancel()
-            if let photo = photoByURL[url] {
-                LibraryStore.writeSidecar(photo.sidecar, for: url, history: historyDirty.contains(url))
-            }
-        }
+        let urls = Set(pendingSaves.keys).union(failedSaves.keys)
+        for (_, work) in pendingSaves { work.cancel() }
         pendingSaves = [:]
         pendingTokens = [:]
-        historyDirty = []
-        if unsavedCount != 0 { unsavedCount = 0; lastSaved = Date() }
+        for url in urls {
+            guard let sidecar = photoByURL[url]?.sidecar ?? failedSnapshots[url]?.sidecar else { continue }
+            if failedSnapshots[url]?.history == true { historyDirty.insert(url) }
+            let failure = LibraryStore.writeSidecar(sidecar, for: url, history: historyDirty.contains(url))
+            recordSave(url, sidecar: sidecar, failure: failure)
+        }
+        unsavedCount = 0
+        updateRetryTimer()
     }
 
     /// ⌘S: everything is saved automatically, but this writes it out right now and says so.
+    /// If anything can't be saved, shows why instead.
     func saveNow() {
         flushSaves()
         saveCatalog()
+        if failedLibraryFiles["Presets"] != nil { savePresets() }
+        guard !hasSaveProblems else {
+            showSaveProblems = true
+            return
+        }
         lastSaved = Date()
         savedFlash = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in self?.savedFlash = false }
     }
 
-    nonisolated static func writeSidecar(_ sidecar: Sidecar, for url: URL, history: Bool) {
-        SidecarFiles.write(sidecar, for: url, history: history)
+    /// "Try again" in the save problems popover, and the 30 s timer.
+    func retryFailedSaves() {
+        for url in failedSaves.keys where pendingSaves[url] == nil {
+            guard let sidecar = photoByURL[url]?.sidecar ?? failedSnapshots[url]?.sidecar else { continue }
+            if failedSnapshots[url]?.history == true { historyDirty.insert(url) }
+            scheduleWrite(url, sidecar: sidecar, delay: 0)
+        }
+        if failedLibraryFiles["Library index"] != nil { saveCatalog() }
+        if failedLibraryFiles["Presets"] != nil { savePresets() }
+        updateRetryTimer()
+    }
+
+    var hasSaveProblems: Bool { !failedSaves.isEmpty || !failedLibraryFiles.isEmpty }
+
+    /// One line per place that can't be saved: photos grouped by imported folder, then library files.
+    var saveProblems: [SaveProblem] {
+        var groups: [String: (folder: URL?, reason: String, count: Int)] = [:]
+        for (url, reason) in failedSaves {
+            let name = photoByURL[url].flatMap { catalog.folder($0.ref.folder)?.name } ?? url.deletingLastPathComponent().lastPathComponent
+            let folder = photoByURL[url].flatMap { catalog.folder($0.ref.folder)?.url } ?? url.deletingLastPathComponent()
+            var g = groups[name] ?? (folder, reason, 0)
+            g.count += 1
+            groups[name] = g
+        }
+        var out = groups.map { SaveProblem(title: $0.key, photoCount: $0.value.count, reason: $0.value.reason, folder: $0.value.folder) }
+            .sorted { $0.title.localizedStandardCompare($1.title) == .orderedAscending }
+        for (name, reason) in failedLibraryFiles.sorted(by: { $0.key < $1.key }) {
+            out.append(SaveProblem(title: name, photoCount: 0, reason: reason, folder: nil))
+        }
+        return out
+    }
+
+    private func updateRetryTimer() {
+        if hasSaveProblems {
+            guard retryTimer == nil else { return }
+            retryTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated { self?.retryFailedSaves() }
+            }
+        } else {
+            retryTimer?.invalidate()
+            retryTimer = nil
+            showSaveProblems = false
+        }
+    }
+
+    /// Writes the sidecar; returns why it couldn't be, or nil when it was saved.
+    nonisolated static func writeSidecar(_ sidecar: Sidecar, for url: URL, history: Bool) -> String? {
+        do {
+            try SidecarFiles.write(sidecar, for: url, history: history)
+            return nil
+        } catch {
+            return describeSaveError(error)
+        }
+    }
+
+    /// A short, plain reason for a failed save.
+    nonisolated static func describeSaveError(_ error: Error) -> String {
+        if error is SidecarFiles.Failure { return "The edits folder is a link, so it isn’t used" }
+        let ns = error as NSError
+        var posix: Int32?
+        if ns.domain == NSPOSIXErrorDomain { posix = Int32(ns.code) }
+        if let under = ns.userInfo[NSUnderlyingErrorKey] as? NSError, under.domain == NSPOSIXErrorDomain { posix = Int32(under.code) }
+        switch posix {
+        case EROFS: return "The disk is read-only"
+        case ENOSPC, EDQUOT: return "The disk is full"
+        case EACCES, EPERM: return "The folder is read-only (locked card?)"
+        case ENOENT, ENXIO, ENODEV: return "The folder isn’t available (disconnected?)"
+        default: break
+        }
+        if ns.domain == NSCocoaErrorDomain {
+            switch ns.code {
+            case NSFileWriteVolumeReadOnlyError: return "The disk is read-only"
+            case NSFileWriteOutOfSpaceError: return "The disk is full"
+            case NSFileWriteNoPermissionError: return "The folder is read-only (locked card?)"
+            case NSFileNoSuchFileError, NSFileReadNoSuchFileError: return "The folder isn’t available (disconnected?)"
+            default: break
+            }
+        }
+        return ns.localizedDescription
     }
 
     // MARK: - Navigation & selection
@@ -712,7 +847,9 @@ final class LibraryStore {
             pendingCommits[p.url]?.cancel(); pendingCommits[p.url] = nil
             do {
                 try Self.trashFile(p.url)
-                for sidecar in SidecarFiles.all(for: p.url) where fm.fileExists(atPath: sidecar.path) { try? Self.trashFile(sidecar) }
+                for sidecar in SidecarFiles.all(for: p.url) where fm.fileExists(atPath: sidecar.path) && SidecarFiles.isSafe(sidecar, for: p.url) {
+                    try? Self.trashFile(sidecar)
+                }
                 moved.append(p)
             } catch {
                 failed.append(p.url.lastPathComponent)
@@ -720,6 +857,8 @@ final class LibraryStore {
         }
         unsavedCount = pendingSaves.count
         guard !moved.isEmpty else { return failed }
+        let trashed = Set(moved.map(\.url))
+        forgetFailedSaves { trashed.contains($0) }
 
         catalog.forget(Set(moved.map(\.ref)))
         saveCatalog()
@@ -1120,16 +1259,43 @@ final class LibraryStore {
     }
 
     private func loadPresets() {
-        guard let data = try? Data(contentsOf: Self.presetsURL),
-              let list = try? JSONDecoder().decode([Preset].self, from: data) else { return }
-        presets = list
+        presets = Self.loadPresets(from: Self.presetsURL)
+    }
+
+    /// Every preset that can be read. If any can't, the file is copied aside first so the next
+    /// save doesn't lose them; an unreadable file is copied aside too.
+    nonisolated static func loadPresets(from url: URL) -> [Preset] {
+        guard let data = try? Data(contentsOf: url) else { return [] }
+        let report = DecodeReport()
+        guard let list = try? JSONDecoder.reporting(into: report).decode(TolerantList<Preset>.self, from: data) else {
+            FileBackup.keepPartiallyLoaded(url, data: data)
+            return []
+        }
+        if report.dropped > 0 { FileBackup.keepPartiallyLoaded(url, data: data) }
+        return list.items
     }
 
     private func savePresets() {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted]
-        if let data = try? encoder.encode(presets) { try? data.write(to: Self.presetsURL, options: .atomic) }
+        do {
+            try encoder.encode(presets).write(to: Self.presetsURL, options: .atomic)
+            failedLibraryFiles["Presets"] = nil
+        } catch {
+            failedLibraryFiles["Presets"] = Self.describeSaveError(error)
+        }
+        updateRetryTimer()
     }
+}
+
+/// A place edits can't be saved to, for the save problems popover.
+struct SaveProblem: Identifiable, Hashable {
+    var id: String { title }
+    let title: String
+    /// 0 for library files.
+    let photoCount: Int
+    let reason: String
+    let folder: URL?
 }
 
 struct TrashRequest: Identifiable {

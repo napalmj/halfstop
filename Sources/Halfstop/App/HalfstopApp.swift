@@ -13,7 +13,9 @@ struct HalfstopApp: App {
         Bench.runIfRequested()
         // Before the library and settings are read.
         LegacyNames.migrateAppData()
-        _store = State(initialValue: LibraryStore(catalogURL: Snapshot.catalogOverride ?? Catalog.defaultURL))
+        let store = LibraryStore(catalogURL: Snapshot.catalogOverride ?? Catalog.defaultURL)
+        LibraryStore.appStore = store
+        _store = State(initialValue: store)
     }
 
     var body: some Scene {
@@ -46,6 +48,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+
+    /// Saves everything; if some edits can't be saved, asks before quitting loses them.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        MainActor.assumeIsolated {
+            guard let store = LibraryStore.appStore else { return .terminateNow }
+            store.flushSaves()
+            guard store.hasSaveProblems else { return .terminateNow }
+            let problems = store.saveProblems
+            let photos = problems.reduce(0) { $0 + $1.photoCount }
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = photos > 0
+                ? "\(photos) photo\(photos == 1 ? " has" : "s have") edits that couldn’t be saved"
+                : "Your library couldn’t be saved"
+            let reasons = problems.prefix(3).map { "\($0.title): \($0.reason.prefix(1).lowercased() + $0.reason.dropFirst())" }
+            alert.informativeText = reasons.joined(separator: "\n") + "\n\nIf you quit now, these changes are lost."
+            alert.addButton(withTitle: "Don’t Quit")
+            alert.addButton(withTitle: "Quit Anyway")
+            if alert.runModal() == .alertFirstButtonReturn {
+                store.showSaveProblems = true
+                return .terminateCancel
+            }
+            return .terminateNow
+        }
+    }
 }
 
 struct ContentView: View {
