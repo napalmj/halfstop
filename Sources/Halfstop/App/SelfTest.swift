@@ -7,8 +7,8 @@ import UniformTypeIdentifiers
 import AppKit
 import Metal
 
-/// Headless checks for the develop pipeline: `Pixon --selftest <output-dir>`.
-/// Also `Pixon --make-samples <dir>` writes synthetic test photos.
+/// Headless checks for the develop pipeline: `Halfstop --selftest <output-dir>`.
+/// Also `Halfstop --make-samples <dir>` writes synthetic test photos.
 enum SelfTest {
     static func runIfRequested() {
         let args = CommandLine.arguments
@@ -507,7 +507,7 @@ enum NSColorShim {
     }
 }
 
-/// `Pixon --snapshot <dir>`: drives the UI through its main states and saves window captures.
+/// `Halfstop --snapshot <dir>`: drives the UI through its main states and saves window captures.
 /// The Metal preview is drawn separately (window caching can't read Metal layers).
 @MainActor
 enum Snapshot {
@@ -557,7 +557,7 @@ enum Snapshot {
                 let copy = dir.appendingPathComponent("photos")
                 try? FileManager.default.removeItem(at: copy)
                 try? FileManager.default.copyItem(at: samples, to: copy)
-                try? FileManager.default.removeItem(at: copy.appendingPathComponent(".pixon"))
+                try? FileManager.default.removeItem(at: copy.appendingPathComponent(SidecarFiles.folderName))
                 // A photo with two clear subjects for the subject-mask step.
                 if let ctx = CGContext(data: nil, width: 1800, height: 1200, bitsPerComponent: 8, bytesPerRow: 0, space: Render.sRGB,
                                        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) {
@@ -1010,6 +1010,18 @@ extension LibraryTest {
         SidecarFiles.write(Sidecar(), for: renamed, history: true)
         check("empty sidecar removes both files", !fm.fileExists(atPath: SidecarFiles.mainURL(for: renamed).path)
               && !fm.fileExists(atPath: SidecarFiles.historyURL(for: renamed).path), "")
+
+        // Sidecars saved under the app's old name move to the new folder when first read.
+        let oldFolder = dir.appendingPathComponent("old-name", isDirectory: true)
+        let oldSidecars = oldFolder.appendingPathComponent(LegacyNames.sidecarFolder, isDirectory: true)
+        try? fm.createDirectory(at: oldSidecars, withIntermediateDirectories: true)
+        var oldSidecar = Sidecar()
+        oldSidecar.rating = 4
+        try? JSONEncoder().encode(oldSidecar).write(to: oldSidecars.appendingPathComponent("old.jpg.json"))
+        let oldBack = SidecarFiles.read(for: oldFolder.appendingPathComponent("old.jpg"))
+        check("old-name sidecar folder is moved and read", oldBack?.rating == 4
+              && !fm.fileExists(atPath: oldSidecars.path)
+              && fm.fileExists(atPath: oldFolder.appendingPathComponent(SidecarFiles.folderName).path), "")
     }
 }
 

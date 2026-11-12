@@ -1,7 +1,7 @@
 import SwiftUI
 
-/// Help ▸ Pixon Help (⌘?): every shortcut and gesture, searchable, plus a few how-it-works notes.
-/// Keep this in step with `KeyHandler` and `PixonCommands`.
+/// Help ▸ Halfstop Help (⌘?): every shortcut and gesture, searchable, plus a few how-it-works notes.
+/// Keep this in step with `KeyHandler` and `HalfstopCommands`.
 struct HelpView: View {
     @State private var query = ""
 
@@ -81,8 +81,8 @@ struct HelpView: View {
     ]
 
     private static let notes: [(String, String)] = [
-        ("Your files are never changed", "Edits, ratings and history live in a small .pixon folder next to your photos. Export to get edited copies."),
-        ("Deleting goes to the Trash", "Pixon never erases files. Trashed photos come back with Finder's Put Back until you empty the Trash."),
+        ("Your files are never changed", "Edits, ratings and history live in a small .halfstop folder next to your photos. Export to get edited copies."),
+        ("Deleting goes to the Trash", "Halfstop never erases files. Trashed photos come back with Finder's Put Back until you empty the Trash."),
         ("Each photo keeps its own crop", "Paste settings copies everything except the crop. Presets carry only the global look, never crop or masks."),
     ]
 
@@ -99,7 +99,7 @@ struct HelpView: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 10) {
-                Text("Pixon Help").font(.system(size: 15, weight: .semibold)).foregroundStyle(Theme.text)
+                Text("Halfstop Help").font(.system(size: 15, weight: .semibold)).foregroundStyle(Theme.text)
                 Spacer()
                 HStack(spacing: 6) {
                     Image(systemName: "magnifyingglass").foregroundStyle(Theme.secondary)

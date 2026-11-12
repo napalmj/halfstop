@@ -21,7 +21,7 @@ struct EditSnapshot: Codable, Identifiable, Hashable {
     var adjustments: Adjustments
 }
 
-/// What gets written to `<folder>/.pixon/<filename>.json`.
+/// What gets written to `<folder>/.halfstop/<filename>.json`.
 struct Sidecar: Codable {
     var version = 1
     var rating = 0

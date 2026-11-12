@@ -50,7 +50,7 @@ struct ImportRecord: Codable, Hashable {
     var renames: [RenameRecord] = []
 }
 
-/// The library index: `~/Library/Application Support/Pixon/catalog.json`.
+/// The library index: `~/Library/Application Support/Halfstop/catalog.json`.
 struct Catalog: Codable {
     var version = 1
     var folders: [CatalogFolder] = []
@@ -77,7 +77,7 @@ struct Catalog: Codable {
 
     static var defaultURL: URL {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("Pixon", isDirectory: true)
+            .appendingPathComponent("Halfstop", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir.appendingPathComponent("catalog.json")
     }
@@ -134,7 +134,7 @@ enum LibraryFiles {
         url.standardizedFileURL.resolvingSymlinksInPath().path
     }
 
-    /// Photo files under a folder as sorted relative paths. Skips hidden files (and so `.pixon/`).
+    /// Photo files under a folder as sorted relative paths. Skips hidden files (and so `.halfstop/`).
     static func enumerate(_ folder: URL, recursive: Bool) -> [String] {
         let root = canonical(folder)
         let base = URL(fileURLWithPath: root, isDirectory: true)
@@ -232,7 +232,7 @@ enum RenamePattern: String, CaseIterable, Identifiable, Codable {
 // MARK: - Folder watching
 
 /// Calls back (on the main queue, debounced by FSEvents) when anything under the watched folders changes.
-/// Ignores changes inside `.pixon/` so saving edits doesn't trigger rescans.
+/// Ignores changes inside `.halfstop/` so saving edits doesn't trigger rescans.
 final class FolderWatcher {
     private var stream: FSEventStreamRef?
     private let onChange: ([String]) -> Void
@@ -252,7 +252,7 @@ final class FolderWatcher {
             guard let info else { return }
             let me = Unmanaged<FolderWatcher>.fromOpaque(info).takeUnretainedValue()
             let paths = (unsafeBitCast(eventPaths, to: NSArray.self) as? [String]) ?? []
-            let relevant = paths.filter { !$0.contains("/.pixon") }
+            let relevant = paths.filter { !$0.contains("/" + SidecarFiles.folderName) && !$0.contains("/" + LegacyNames.sidecarFolder) }
             if !relevant.isEmpty { me.onChange(relevant) }
         }
         stream = FSEventStreamCreate(nil, callback, &ctx, paths as CFArray,

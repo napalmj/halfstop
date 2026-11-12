@@ -1,4 +1,4 @@
-// Draws Pixon's app icon with Core Graphics and writes Resources/AppIcon.icns.
+// Draws Halfstop's app icon with Core Graphics and writes Resources/AppIcon.icns.
 //
 //   swift scripts/make-icon.swift [variant] [preview.png]
 //

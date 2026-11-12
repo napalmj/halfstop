@@ -386,7 +386,7 @@ struct WelcomeView: View {
             Text("Import your photos")
                 .font(.system(size: 18, weight: .medium))
                 .foregroundStyle(Theme.text)
-            Text("Photos stay where they are on disk. Edits are saved next to them in a hidden .pixon folder.")
+            Text("Photos stay where they are on disk. Edits are saved next to them in a hidden .halfstop folder.")
                 .font(.system(size: 12.5))
                 .foregroundStyle(Theme.secondary)
                 .multilineTextAlignment(.center)

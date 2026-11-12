@@ -1,6 +1,6 @@
-# Contributing to Pixon
+# Contributing to Halfstop
 
-Thanks for your interest in Pixon. Bug reports, ideas, documentation fixes and pull requests are all
+Thanks for your interest in Halfstop. Bug reports, ideas, documentation fixes and pull requests are all
 welcome. By taking part you agree to follow the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Reporting bugs
@@ -16,7 +16,7 @@ Please do not attach photos you want to keep private.
 
 ## Suggesting features
 
-Open an issue describing the problem you want solved, not only the solution. Pixon's priorities are
+Open an issue describing the problem you want solved, not only the solution. Halfstop's priorities are
 **responsive sliders**, **an uncluttered interface** and **fast imports**, so changes that add
 features without costing speed or clutter are the easiest to accept. For anything that changes the
 interface, a quick sketch or mockup in the issue helps agree on a direction before code is written.
@@ -26,10 +26,10 @@ interface, a quick sketch or mockup in the issue helps agree on a direction befo
 You need macOS 14 or later and the Swift 6 toolchain (Xcode 16+ or the Xcode command line tools).
 
 ```bash
-git clone https://github.com/napalmj/pixon.git pixon
-cd pixon
+git clone https://github.com/napalmj/halfstop.git halfstop
+cd halfstop
 ./scripts/bundle.sh
-open build/Pixon.app
+open build/Halfstop.app
 ```
 
 Read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for a map of the code.
@@ -41,10 +41,10 @@ Read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for a map of the code.
 
    ```bash
    ./scripts/bundle.sh
-   build/Pixon.app/Contents/MacOS/Pixon --selftest /tmp/pixon-test
+   build/Halfstop.app/Contents/MacOS/Halfstop --selftest /tmp/halfstop-test
    ```
 
-3. **Add a self-test case** (in `Sources/Pixon/App/SelfTest.swift`) for any change to the develop
+3. **Add a self-test case** (in `Sources/Halfstop/App/SelfTest.swift`) for any change to the develop
    pipeline, the library model or the sidecar format.
 4. If you change a shortcut, update `HelpView.swift` and the shortcut table in the README.
 5. If you add a setting to `Adjustments` or the sidecar, give it a default so existing sidecars still

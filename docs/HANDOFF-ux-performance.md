@@ -1,4 +1,4 @@
-# Handoff: Pixon — performance, editing speed, usability
+# Handoff: Halfstop — performance, editing speed, usability
 
 Audit date: 2026-11-11. Audited branch `import-and-collections` with uncommitted work (trash/delete,
 Help window, LibraryStore/LibraryViews/Catalog changes). It builds clean (`swift build -c release`).
@@ -8,11 +8,11 @@ Don't mix it into your commits without asking.
 ## Context you need
 
 - Native macOS SwiftUI + Core Image/Metal app, Swift package, **no full Xcode**, so use only
-  command line tools. Build with `./scripts/bundle.sh`, which produces `build/Pixon.app`.
-- Checks: `build/Pixon.app/Contents/MacOS/Pixon --selftest /tmp/pixon-test` (pipeline assertions in
-  `Sources/Pixon/App/SelfTest.swift`), plus `--make-samples` and `--snapshot` (see README).
+  command line tools. Build with `./scripts/bundle.sh`, which produces `build/Halfstop.app`.
+- Checks: `build/Halfstop.app/Contents/MacOS/Halfstop --selftest /tmp/halfstop-test` (pipeline assertions in
+  `Sources/Halfstop/App/SelfTest.swift`), plus `--make-samples` and `--snapshot` (see README).
   Add a selftest case for every pipeline change.
-- The user built this to replace Lightroom. Their stated pain points are **laggy sliders, cluttered UI,
+- The user built this to replace their previous photo editor. Their stated pain points are **laggy sliders, cluttered UI,
   and slow import/catalogs**. How the app feels matters more than how many features it has.
 - **The user wants a clickable design mockup before any new UI gets built**, and wants to approve it.
   This applies to every item marked 🎨 below. Pure performance work needs no mockup.
@@ -97,7 +97,7 @@ HSL, color-wheel, curve, contrast, whites or blacks control rebuilds the LUT syn
 LibraryStore.swift:625). On a brush-heavy photo, every stroke is stored about 100 times. On top of that,
 `writeSidecar` pretty-prints (LibraryStore.swift:484), and `scheduleSave` copies and encodes everything
 each time.
-- **Fix:** move history into a separate file (`.pixon/<name>.history.json`) written on commit, not per
+- **Fix:** move history into a separate file (`.halfstop/<name>.history.json`) written on commit, not per
   tick. Store only the changed top-level fields per step, or dedupe masks by id and revision. Drop
   `.prettyPrinted`. Keep the main sidecar small: rating, flag, current adjustments, snapshots. Stay
   backward compatible with the existing `Sidecar` decoder (it already tolerates missing keys).
@@ -120,12 +120,12 @@ each time.
 | # | Change | Why | Files |
 |---|---|---|---|
 | 8 🎨 | **Zoom and pan**: Z or click toggles Fit / 100% at the cursor; space-drag pans; ⌘+/⌘−; a small navigator thumbnail | There is currently **no zoom at all**, so sharpening, noise reduction and precise brush/mask work can't be judged. This is the biggest editing gap | EditorView `PreviewArea`, `PreviewMTKView.encode` (needs a viewport transform), `MaskOverlay`/`CropOverlay` coordinate mapping |
-| 9 | **Faster slider input**: hover + scroll wheel adjusts; ↑/↓ nudges the hovered slider (⇧ = ×10); click the value to type a number; keep the ⌥ fine-drag | Lightroom muscle memory; much faster than dragging | Components/AdjustSlider.swift |
+| 9 | **Faster slider input**: hover + scroll wheel adjusts; ↑/↓ nudges the hovered slider (⇧ = ×10); click the value to type a number; keep the ⌥ fine-drag | Familiar from other editors; much faster than dragging | Components/AdjustSlider.swift |
 | 10 | **White-balance eyedropper** (W) and **Auto** buttons (Auto tone via `CIImage.autoAdjustmentFilters`, Auto WB) | Most common first steps on any photo | ImageSource, AdjustPanel (Color section), store |
 | 11 | **Clipping overlay** (J): blue for crushed shadows, red for blown highlights | The histogram already computes clip fractions but nothing shows where | ImageSource (overlay pass like the mask overlay) |
 | 12 🎨 | **Before/after modes**: hold `\` for a momentary before, plus split and side-by-side | One toggle is slow for A/B checks | EditorView, PreviewMTKView |
 | 13 | **Selective paste and sync**: paste dialog with group checkboxes (Light, Color, Grading, Curve, HSL, Detail, Masks, Crop); "Paste from previous" (⌥⌘V) | Paste currently copies everything except crop (LibraryStore.swift:906) | LibraryStore, new sheet |
-| 14 | **Culling speed**: optional auto-advance after a rating or flag (Lightroom's Caps Lock behavior); full-screen loupe in the library (Space) | Faster culling of a shoot | LibraryStore `setRating`/`setFlag`, PixonApp key monitor |
+| 14 | **Culling speed**: optional auto-advance after a rating or flag (toggle on/off); full-screen loupe in the library (Space) | Faster culling of a shoot | LibraryStore `setRating`/`setFlag`, HalfstopApp key monitor |
 | 15 | **Sort**: capture date, name, rating, edited. The grid is in filesystem enumeration order today | Basic library need | LibraryStore `visiblePhotos`, toolbar |
 | 16 | **Preset hover preview**: show the preset on the preview while hovering it in the menu | Quicker preset choice | PanelFooter, PreviewArea (temporary adjustments) |
 | 17 | **Panel declutter** 🎨: "solo" sections (opening one collapses the others) and a "Modified only" filter | Detailed tab is a long scroll; this fits the user's "minimal UI" goal | AdjustPanel `DetailedPanel`, `PanelSection` |
@@ -133,7 +133,7 @@ each time.
 
 ## P2: Library and import scale
 
-- **Persistent thumbnail cache** in `~/Library/Caches/Pixon/thumbs/<fingerprint>-<adjHash>.heic`.
+- **Persistent thumbnail cache** in `~/Library/Caches/Halfstop/thumbs/<fingerprint>-<adjHash>.heic`.
   Today every launch re-extracts every embedded preview and re-renders every edited thumbnail.
 - **Incremental rescans**: `FolderWatcher` → `reload()` rescans every folder and re-reads sidecars on
   any FSEvent. Use the event paths to rescan only the affected folder(s).

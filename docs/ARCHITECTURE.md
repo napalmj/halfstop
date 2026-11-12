@@ -1,14 +1,14 @@
 # Architecture
 
-A short map of the code for people who want to read or change it. Pixon is a Swift package with one
-executable target (`Sources/Pixon`), no third-party dependencies, and a SwiftUI interface over a Core
+A short map of the code for people who want to read or change it. Halfstop is a Swift package with one
+executable target (`Sources/Halfstop`), no third-party dependencies, and a SwiftUI interface over a Core
 Image / Metal pipeline.
 
 ## Source layout
 
 | Folder | Contents |
 | --- | --- |
-| `App/` | App entry point and menu commands (`PixonApp.swift`), the in-app Help window (`HelpView.swift`), and the headless command line modes: `SelfTest.swift` (`--selftest`, `--make-samples`, `--snapshot`) and `Bench.swift` (`--bench`) |
+| `App/` | App entry point and menu commands (`HalfstopApp.swift`), the in-app Help window (`HelpView.swift`), and the headless command line modes: `SelfTest.swift` (`--selftest`, `--make-samples`, `--snapshot`) and `Bench.swift` (`--bench`) |
 | `Model/` | Plain data types: `Adjustments` (every slider, curve, HSL value, crop and mask), `Photo` (per-photo sidecar, flags, ratings, history steps, supported file extensions), `Catalog` (the library index, folder watching) and `HistoryLabel` (names edit history steps) |
 | `Library/` | `LibraryStore` (the central observable state: selection, filters, edits, saving, undo, trash), the import scan and options (`Importer.swift`, `ImportSheet.swift`), the sidebar, and the library grid and export UI |
 | `Editor/` | The editing screen: `EditorView` and the preview area, `AdjustPanel` (sliders and mask controls), `PreviewRenderer` (Metal preview view), `CropOverlay` and `HistoryPanel` |
@@ -28,20 +28,20 @@ Image / Metal pipeline.
 
 ## Storage
 
-Pixon never writes to the photo files themselves.
+Halfstop never writes to the photo files themselves.
 
-- **Sidecars:** `<folder>/.pixon/<filename>.json` holds a photo's `Adjustments`, rating, flag and
+- **Sidecars:** `<folder>/.halfstop/<filename>.json` holds a photo's `Adjustments`, rating, flag and
   snapshots, written ~0.5 s after any change. The edit history is in `<filename>.history.json`, written
   only when the history changes, with each brush stroke stored once however many steps share it
   (`Model/SidecarFiles.swift`). Sidecars from before the split (history inline) still load and move their
   history out on the next save. Decoding is tolerant, so older sidecars still load when new fields are
   added. Keep it that way when you add settings: give new fields defaults.
-- **Catalog:** `~/Library/Application Support/Pixon/catalog.json` lists imported folders and
+- **Catalog:** `~/Library/Application Support/Halfstop/catalog.json` lists imported folders and
   collections. A photo is identified by `PhotoRef` (folder identity plus relative path), so moving a
   folder only changes the folder's stored path. An unreadable catalog is copied aside rather than
   overwritten.
-- **Presets:** `~/Library/Application Support/Pixon/presets.json`.
-- Folder watching ignores `.pixon/`, so saving edits does not trigger rescans.
+- **Presets:** `~/Library/Application Support/Halfstop/presets.json`.
+- Folder watching ignores `.halfstop/`, so saving edits does not trigger rescans.
 
 ## Testing
 
@@ -49,7 +49,7 @@ There is no XCTest target. The app checks itself:
 
 ```bash
 ./scripts/bundle.sh
-build/Pixon.app/Contents/MacOS/Pixon --selftest /tmp/pixon-test
+build/Halfstop.app/Contents/MacOS/Halfstop --selftest /tmp/halfstop-test
 ```
 
 `--selftest` runs pipeline assertions (`SelfTest.run`) and library tests (`LibraryTest`) and prints
@@ -58,7 +58,7 @@ model, add a case there. `--bench` measures per-frame cost and is useful for per
 
 ## Keeping things in step
 
-- Shortcuts live in `KeyHandler` and `PixonCommands`. The Help window (`HelpView.swift`) and the
+- Shortcuts live in `KeyHandler` and `HalfstopCommands`. The Help window (`HelpView.swift`) and the
   shortcut table in the README must match them.
 - Supported file types are listed in `Model/Photo.swift` (`ImageFormats`).
 

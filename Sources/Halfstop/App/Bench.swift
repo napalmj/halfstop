@@ -3,7 +3,7 @@ import CoreImage
 import Metal
 import QuartzCore
 
-/// Editing-speed benchmark: `Pixon --bench <dir> [--file <photo>]`.
+/// Editing-speed benchmark: `Halfstop --bench <dir> [--file <photo>]`.
 ///
 /// Times what one live-preview frame costs while dragging a control: building the
 /// develop graph on the main thread (`cpu`), and the whole frame until the GPU
@@ -113,7 +113,7 @@ enum Bench {
 
     /// Library-size costs paid on every slider tick: finding the current photo, the visible list.
     static func benchStore() {
-        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("pixon-bench-\(UUID().uuidString).json")
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("halfstop-bench-\(UUID().uuidString).json")
         let store = LibraryStore(catalogURL: tmp, watch: false)
         let folder = UUID()
         let photos = (0..<10_000).map { i in

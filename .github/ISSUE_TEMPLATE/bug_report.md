@@ -1,6 +1,6 @@
 ---
 name: Bug report
-about: Something in Pixon doesn't work as expected
+about: Something in Halfstop doesn't work as expected
 labels: bug
 ---
 
@@ -15,7 +15,7 @@ A clear description of the problem.
 **Expected behavior**
 
 **Environment**
-- Pixon: (commit hash or version)
+- Halfstop: (commit hash or version)
 - macOS version:
 - Mac model (Apple Silicon / Intel):
 - Photo file type involved (for example Sony ARW, iPhone HEIC):

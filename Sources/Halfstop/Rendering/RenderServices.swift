@@ -10,9 +10,9 @@ enum Render {
     static let device: MTLDevice = MTLCreateSystemDefaultDevice()!
     static let commandQueue: MTLCommandQueue = device.makeCommandQueue()!
     /// GPU context for the live preview (keeps intermediates so RAW decodes are reused).
-    static let preview = CIContext(mtlCommandQueue: commandQueue, options: [.cacheIntermediates: true, .name: "pixon.preview"])
+    static let preview = CIContext(mtlCommandQueue: commandQueue, options: [.cacheIntermediates: true, .name: "halfstop.preview"])
     /// Context for thumbnails, histograms and exports.
-    static let background = CIContext(mtlDevice: device, options: [.cacheIntermediates: false, .name: "pixon.background"])
+    static let background = CIContext(mtlDevice: device, options: [.cacheIntermediates: false, .name: "halfstop.background"])
     static let sRGB = CGColorSpace(name: CGColorSpace.sRGB)!
     static let displayP3 = CGColorSpace(name: CGColorSpace.displayP3)!
 }
@@ -96,17 +96,17 @@ final class ThumbnailService: @unchecked Sendable {
     }
 }
 
-/// Thumbnails kept between launches in `~/Library/Caches/Pixon/Thumbnails`, so the grid doesn't
+/// Thumbnails kept between launches in `~/Library/Caches/Halfstop/Thumbnails`, so the grid doesn't
 /// re-extract every RAW preview and re-develop every edited thumbnail at each start.
 /// Keyed by the file (path, size, modification date) and the exact adjustments.
 final class ThumbnailDiskCache: @unchecked Sendable {
     static let shared = ThumbnailDiskCache()
     /// Overridable for tests.
     nonisolated(unsafe) static var directory: URL = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-        .appendingPathComponent("Pixon/Thumbnails", isDirectory: true)
+        .appendingPathComponent("Halfstop/Thumbnails", isDirectory: true)
     static let maxBytes: Int64 = 1 << 30
 
-    private let writes = DispatchQueue(label: "pixon.thumbcache", qos: .utility)
+    private let writes = DispatchQueue(label: "halfstop.thumbcache", qos: .utility)
 
     init() {
         writes.async { Self.trim() }
@@ -337,7 +337,7 @@ struct ExportSettings: Codable {
 enum Exporter {
     static func export(_ photo: (url: URL, adjustments: Adjustments), settings: ExportSettings, to folder: URL) throws -> URL {
         guard let source = ImageSource(url: photo.url, maxPixelSize: nil) else {
-            throw NSError(domain: "Pixon", code: 1, userInfo: [NSLocalizedDescriptionKey: "Could not decode \(photo.url.lastPathComponent)"])
+            throw NSError(domain: "Halfstop", code: 1, userInfo: [NSLocalizedDescriptionKey: "Could not decode \(photo.url.lastPathComponent)"])
         }
         var img = source.developed(photo.adjustments, exporting: true)
         if settings.longEdge > 0 {

@@ -160,7 +160,7 @@ extension LibraryStore {
         var staged: [(tmp: URL, from: String, to: String)] = []
         for (from, to) in plan.sorted(by: { $0.key < $1.key }) where from != to {
             let src = URL(fileURLWithPath: root).appendingPathComponent(from)
-            let tmp = src.deletingLastPathComponent().appendingPathComponent(".pixon-rename-\(UUID().uuidString)")
+            let tmp = src.deletingLastPathComponent().appendingPathComponent(".halfstop-rename-\(UUID().uuidString)")
             do {
                 try fm.moveItem(at: src, to: tmp)
                 staged.append((tmp, from, to))

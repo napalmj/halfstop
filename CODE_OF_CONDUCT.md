@@ -2,7 +2,7 @@
 
 ## Our pledge
 
-We want Pixon to be a friendly, welcoming project for everyone who contributes or uses it, whatever
+We want Halfstop to be a friendly, welcoming project for everyone who contributes or uses it, whatever
 their background, experience, age, identity, ability or opinions.
 
 ## Expected behavior

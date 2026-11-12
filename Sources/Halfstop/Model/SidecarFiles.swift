@@ -1,6 +1,6 @@
 import Foundation
 
-/// A photo's files in `<folder>/.pixon/`:
+/// A photo's files in `<folder>/.halfstop/`:
 /// - `<name>.json`: rating, flag, current adjustments and snapshots. Small; written about
 ///   0.5 s after any change.
 /// - `<name>.history.json`: the edit history, written only when the history itself changes.
@@ -10,16 +10,22 @@ import Foundation
 /// Older sidecars kept the history inline in `<name>.json`; they still load, and move to
 /// the separate file on their next save.
 enum SidecarFiles {
+    static let folderName = ".halfstop"
+
+    /// `<folder>/.halfstop/`, after moving any sidecars saved under the app's old name.
+    static func folder(for photo: URL) -> URL {
+        let parent = photo.deletingLastPathComponent()
+        let dir = parent.appendingPathComponent(folderName, isDirectory: true)
+        LegacyNames.migrateSidecars(in: parent, to: dir)
+        return dir
+    }
+
     static func mainURL(for photo: URL) -> URL {
-        photo.deletingLastPathComponent()
-            .appendingPathComponent(".pixon", isDirectory: true)
-            .appendingPathComponent(photo.lastPathComponent + ".json")
+        folder(for: photo).appendingPathComponent(photo.lastPathComponent + ".json")
     }
 
     static func historyURL(for photo: URL) -> URL {
-        photo.deletingLastPathComponent()
-            .appendingPathComponent(".pixon", isDirectory: true)
-            .appendingPathComponent(photo.lastPathComponent + ".history.json")
+        folder(for: photo).appendingPathComponent(photo.lastPathComponent + ".history.json")
     }
 
     /// Every sidecar file a photo can have (for renames and trashing).

@@ -1,13 +1,13 @@
-# Pixon user guide
+# Halfstop user guide
 
 This guide walks through a typical session. For installation see the [README](../README.md). Inside
-the app, **Help ▸ Pixon Help (⌘?)** has a searchable list of every shortcut.
+the app, **Help ▸ Halfstop Help (⌘?)** has a searchable list of every shortcut.
 
 ## Importing photos
 
 Choose **File ▸ Import Photos… (⌘I)**, or drop a folder onto the window.
 
-Pixon works on photos **where they are**. Nothing is copied. It remembers the folder and picks up new
+Halfstop works on photos **where they are**. Nothing is copied. It remembers the folder and picks up new
 files added to it later. The import sheet offers:
 
 | Option | What it does |
@@ -19,7 +19,7 @@ files added to it later. The import sheet offers:
 | Add to collection | Files the imported photos into a collection |
 
 If you move an imported folder, right-click it in the sidebar and choose **Locate folder…** to point
-Pixon at the new place. Your edits come along because they are stored next to the photos.
+Halfstop at the new place. Your edits come along because they are stored next to the photos.
 
 ## The library
 
@@ -82,35 +82,35 @@ or **16-bit TIFF**. JPEG and HEIC have a quality slider. Your originals are neve
 ## Deleting
 
 **⌘⌫** (or **Delete** in the library grid, outside a collection) and **Photo ▸ Delete Rejected
-Photos…** move photos and their edits to the macOS Trash after asking. Pixon never erases files
+Photos…** move photos and their edits to the macOS Trash after asking. Halfstop never erases files
 itself. To restore a photo, use Finder's **Put Back**, and put back the matching `.json` file from
-the `.pixon` folder too if you want to keep its edits.
+the `.halfstop` folder too if you want to keep its edits.
 
-## Where Pixon keeps things
+## Where Halfstop keeps things
 
-- Edits, ratings and flags: `<photo folder>/.pixon/<filename>.json`; edit history: `<filename>.history.json` next to it
-- Library index (folders, collections): `~/Library/Application Support/Pixon/catalog.json`
-- Presets: `~/Library/Application Support/Pixon/presets.json`
+- Edits, ratings and flags: `<photo folder>/.halfstop/<filename>.json`; edit history: `<filename>.history.json` next to it
+- Library index (folders, collections): `~/Library/Application Support/Halfstop/catalog.json`
+- Presets: `~/Library/Application Support/Halfstop/presets.json`
 
-To back up your work, include the hidden `.pixon` folders with your photos, and the `Pixon` folder in
-Application Support. To move your library to another Mac, copy the photo folders (with `.pixon`) and
-the `Pixon` support folder, and use **Locate folder…** in the sidebar if the folders end up in different places.
+To back up your work, include the hidden `.halfstop` folders with your photos, and the `Halfstop` folder in
+Application Support. To move your library to another Mac, copy the photo folders (with `.halfstop`) and
+the `Halfstop` support folder, and use **Locate folder…** in the sidebar if the folders end up in different places.
 
 ## Troubleshooting
 
 **The app won't open on another Mac.** The build is ad-hoc signed and not notarized. Right-click the
 app, choose **Open**, then confirm. Builds made on the same Mac open normally.
 
-**A RAW file won't open or looks wrong.** Pixon decodes RAW through macOS, so a camera must be supported
+**A RAW file won't open or looks wrong.** Halfstop decodes RAW through macOS, so a camera must be supported
 by your version of macOS. Update macOS, or check that Preview can open the file.
 
 **Sliders feel slow on large files.** Use a release build (`./scripts/bundle.sh`, not `debug`). Preview
 speed also depends on the size of the photo and the GPU; see the performance notes in
 [HANDOFF-ux-performance.md](HANDOFF-ux-performance.md).
 
-**My library list is empty after an update.** If Pixon cannot read `catalog.json` it copies the file to
+**My library list is empty after an update.** If Halfstop cannot read `catalog.json` it copies the file to
 `catalog.unreadable-<timestamp>.json` in the same folder instead of overwriting it. Your photos and
-their `.pixon` sidecars are untouched, so you can re-import the folders, or attach that file to a bug report.
+their `.halfstop` sidecars are untouched, so you can re-import the folders, or attach that file to a bug report.
 
 **Reporting a problem.** Please open an issue with your macOS version, Mac model, the photo's file
 type, and the steps to reproduce. See [CONTRIBUTING.md](../CONTRIBUTING.md).

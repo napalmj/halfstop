@@ -691,7 +691,7 @@ final class LibraryStore {
         trashRequest = TrashRequest(urls: items.map(\.url), rejectedOnly: true)
     }
 
-    /// Moves the photo files (and their `.pixon` sidecars) to the Trash, where Finder can put them back,
+    /// Moves the photo files (and their `.halfstop` sidecars) to the Trash, where Finder can put them back,
     /// and drops them from the library, collections and last import. Returns the files that couldn't be moved.
     @discardableResult
     func moveToTrash(_ urls: [URL]) -> [String] {
@@ -1114,7 +1114,7 @@ final class LibraryStore {
 
     private static var presetsURL: URL {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("Pixon", isDirectory: true)
+            .appendingPathComponent("Halfstop", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir.appendingPathComponent("presets.json")
     }

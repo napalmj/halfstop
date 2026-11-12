@@ -2,12 +2,12 @@
 import PackageDescription
 
 let package = Package(
-    name: "Pixon",
+    name: "Halfstop",
     platforms: [.macOS(.v14)],
     targets: [
         .executableTarget(
-            name: "Pixon",
-            path: "Sources/Pixon",
+            name: "Halfstop",
+            path: "Sources/Halfstop",
             swiftSettings: [.unsafeFlags(["-Ounchecked"], .when(configuration: .release))]
         )
     ],

@@ -24,7 +24,7 @@ struct ImportSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Import photos").font(.headline)
-            Text("Photos stay where they are. Pixon remembers the folder and picks up new files added to it.")
+            Text("Photos stay where they are. Halfstop remembers the folder and picks up new files added to it.")
                 .font(.system(size: 11.5))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)

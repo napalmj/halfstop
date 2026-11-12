@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// Left-hand panel in the editor (like darktable): snapshots on top, the edit history below.
+/// Left-hand panel in the editor: snapshots on top, the edit history below.
 /// Click a step to go back to it; editing from there trims the later (struck-out) steps.
 struct HistoryPanel: View {
     @Environment(LibraryStore.self) private var store

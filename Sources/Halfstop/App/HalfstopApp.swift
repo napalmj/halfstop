@@ -3,18 +3,21 @@ import AppKit
 import UniformTypeIdentifiers
 
 @main
-struct PixonApp: App {
+struct HalfstopApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
-    @State private var store = LibraryStore(catalogURL: Snapshot.catalogOverride ?? Catalog.defaultURL)
+    @State private var store: LibraryStore
     @State private var renderer = PreviewRenderer()
 
     init() {
         SelfTest.runIfRequested()
         Bench.runIfRequested()
+        // Before the library and settings are read.
+        LegacyNames.migrateAppData()
+        _store = State(initialValue: LibraryStore(catalogURL: Snapshot.catalogOverride ?? Catalog.defaultURL))
     }
 
     var body: some Scene {
-        Window("Pixon", id: "main") {
+        Window("Halfstop", id: "main") {
             ContentView()
                 .environment(store)
                 .environment(renderer)
@@ -23,9 +26,9 @@ struct PixonApp: App {
         }
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1440, height: 900)
-        .commands { PixonCommands(store: store) }
+        .commands { HalfstopCommands(store: store) }
 
-        Window("Pixon Help", id: "help") {
+        Window("Halfstop Help", id: "help") {
             HelpView()
                 .preferredColorScheme(.dark)
         }
@@ -136,8 +139,8 @@ enum TrashText {
         let wanted = Set(r.urls)
         let edited = photos.filter { wanted.contains($0.url) && !$0.adjustments.isDefault }.count
         var text = names.count == 1
-            ? "“\(names[0])” will be moved from its folder to the Trash, along with its Pixon edits."
-            : "\(list(names)) will be moved from their folders to the Trash, along with their Pixon edits."
+            ? "“\(names[0])” will be moved from its folder to the Trash, along with its Halfstop edits."
+            : "\(list(names)) will be moved from their folders to the Trash, along with their Halfstop edits."
         if edited > 0 && names.count > 1 { text += " \(edited) of them \(edited == 1 ? "has" : "have") edits." }
         let one = names.count == 1
         text += one ? " It’s also removed from your collections." : " They’re also removed from your collections."
@@ -240,13 +243,13 @@ enum KeyHandler {
     }
 }
 
-struct PixonCommands: Commands {
+struct HalfstopCommands: Commands {
     let store: LibraryStore
     @Environment(\.openWindow) private var openWindow
 
     var body: some Commands {
         CommandGroup(replacing: .help) {
-            Button("Pixon Help") { openWindow(id: "help") }
+            Button("Halfstop Help") { openWindow(id: "help") }
                 .keyboardShortcut("?", modifiers: .command)
         }
         CommandGroup(replacing: .newItem) {

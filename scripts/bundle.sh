@@ -1,14 +1,14 @@
 #!/bin/zsh
-# Builds Pixon and wraps the binary into a proper macOS .app bundle.
+# Builds Halfstop and wraps the binary into a proper macOS .app bundle.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 CONFIG="${1:-release}"
 swift build -c "$CONFIG"
-BIN="$(swift build -c "$CONFIG" --show-bin-path)/Pixon"
-APP="build/Pixon.app"
+BIN="$(swift build -c "$CONFIG" --show-bin-path)/Halfstop"
+APP="build/Halfstop.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp "$BIN" "$APP/Contents/MacOS/Pixon"
+cp "$BIN" "$APP/Contents/MacOS/Halfstop"
 # App icon (regenerate with: swift scripts/make-icon.swift [aperture|wheel|landscape])
 if [ -f Resources/AppIcon.icns ]; then cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"; fi
 cat > "$APP/Contents/Info.plist" <<PLIST
@@ -16,10 +16,10 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>CFBundleName</key><string>Pixon</string>
-  <key>CFBundleDisplayName</key><string>Pixon</string>
-  <key>CFBundleIdentifier</key><string>dev.pixon.app</string>
-  <key>CFBundleExecutable</key><string>Pixon</string>
+  <key>CFBundleName</key><string>Halfstop</string>
+  <key>CFBundleDisplayName</key><string>Halfstop</string>
+  <key>CFBundleIdentifier</key><string>dev.halfstop.app</string>
+  <key>CFBundleExecutable</key><string>Halfstop</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundleIconName</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
