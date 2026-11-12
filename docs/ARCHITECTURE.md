@@ -61,5 +61,3 @@ model, add a case there. `--bench` measures per-frame cost and is useful for per
 - Shortcuts live in `KeyHandler` and `HalfstopCommands`. The Help window (`HelpView.swift`) and the
   shortcut table in the README must match them.
 - Supported file types are listed in `Model/Photo.swift` (`ImageFormats`).
-
-For performance and usability plans see [HANDOFF-ux-performance.md](HANDOFF-ux-performance.md).

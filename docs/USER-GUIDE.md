@@ -105,11 +105,12 @@ app, choose **Open**, then confirm. Builds made on the same Mac open normally.
 by your version of macOS. Update macOS, or check that Preview can open the file.
 
 **Sliders feel slow on large files.** Use a release build (`./scripts/bundle.sh`, not `debug`). Preview
-speed also depends on the size of the photo and the GPU; see the performance notes in
-[HANDOFF-ux-performance.md](HANDOFF-ux-performance.md).
+speed also depends on the size of the photo and the GPU.
 
 **My library list is empty after an update.** If Halfstop cannot read `catalog.json` it copies the file to
-`catalog.unreadable-<timestamp>.json` in the same folder instead of overwriting it. Your photos and
+`catalog.unreadable-<timestamp>.json` in the same folder instead of overwriting it. If only some entries
+can't be read, it keeps the rest and copies the original to `catalog.partial-<code>.json` first (sidecars
+and `presets.json` get the same treatment). Your photos and
 their `.halfstop` sidecars are untouched, so you can re-import the folders, or attach that file to a bug report.
 
 **Reporting a problem.** Please open an issue with your macOS version, Mac model, the photo's file
