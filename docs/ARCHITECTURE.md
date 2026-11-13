@@ -8,11 +8,11 @@ Image / Metal pipeline.
 
 | Folder | Contents |
 | --- | --- |
-| `App/` | App entry point and menu commands (`HalfstopApp.swift`), the in-app Help window (`HelpView.swift`), and the headless command line modes: `SelfTest.swift` (`--selftest`, `--make-samples`, `--snapshot`) and `Bench.swift` (`--bench`) |
+| `App/` | App entry point and menu commands (`HalfstopApp.swift`), the in-app Help window (`HelpView.swift`), and the headless command line modes: `SelfTest.swift` (`--selftest`, `--make-samples`, `--snapshot`) and `Bench.swift` (`--bench`, preview frames and auto adjustments) |
 | `Model/` | Plain data types: `Adjustments` (every slider, curve, HSL value, crop and mask), `Photo` (per-photo sidecar, flags, ratings, history steps, supported file extensions), `Catalog` (the library index, folder watching) and `HistoryLabel` (names edit history steps) |
 | `Library/` | `LibraryStore` (the central observable state: selection, filters, edits, saving, undo, trash), the import scan and options (`Importer.swift`, `ImportSheet.swift`), the sidebar, and the library grid and export UI |
 | `Editor/` | The editing screen: `EditorView` and the preview area, `AdjustPanel` (sliders and mask controls), `PreviewRenderer` (Metal preview view), `CropOverlay` and `HistoryPanel` |
-| `Rendering/` | The develop pipeline: `ImageSource` (decodes RAW and raster files, builds the Core Image filter graph), `ColorLUT` (bakes tone and color adjustments into one 3D lookup table), `MaskRenderer` (turns mask descriptions into grayscale images), and `RenderServices` (thumbnails, histogram, export) |
+| `Rendering/` | The develop pipeline: `ImageSource` (decodes RAW and raster files, builds the Core Image filter graph), `ColorLUT` (bakes tone and color adjustments into one 3D lookup table), `MaskRenderer` (turns mask descriptions into grayscale images), `RenderServices` (thumbnails, histogram, export), and `AutoAdjust` / `AutoEngine` (one-click auto adjustments, measured on a small decode of the photo off the main thread and cached) |
 | `Components/` | Reusable views: adjustment slider and `Theme`, curve editor, histogram, thumbnails |
 
 ## How a frame is produced

@@ -53,6 +53,13 @@ enum LibraryFilter: String, CaseIterable, Identifiable {
     }
 }
 
+/// An auto action in flight, for the progress state on its chip.
+struct AutoRun: Equatable {
+    let url: URL
+    let kind: AutoKind
+    let id: UUID
+}
+
 @MainActor
 @Observable
 final class LibraryStore {
@@ -120,6 +127,8 @@ final class LibraryStore {
     var showClipping = false
     /// The next click on the photo sets white balance from that spot (W).
     var pickingWhite = false
+    /// The auto action measuring right now, if any (its chip shows progress).
+    private(set) var autoRun: AutoRun?
     /// Move to the next photo after rating or flagging one (⇧ with the key does it once).
     var autoAdvance = UserDefaults.standard.bool(forKey: "autoAdvance") {
         didSet { UserDefaults.standard.set(autoAdvance, forKey: "autoAdvance") }
@@ -967,31 +976,39 @@ final class LibraryStore {
     // MARK: - Auto adjustments
 
     /// White balance that makes the clicked spot neutral gray (`p` normalized in the cropped photo).
-    func pickWhiteBalance(at p: NormPoint, using source: ImageSource) {
+    func pickWhiteBalance(at p: NormPoint) {
         pickingWhite = false
-        guard let photo = current else { return }
         let half = 0.008
-        let region = CGRect(x: p.x - half, y: p.y - half, width: half * 2, height: half * 2)
-        let wb = AutoAdjust.whiteBalance(source: source, adjustments: photo.adjustments, region: region)
-        var a = photo.adjustments
-        a.temperature = wb.temperature; a.tint = wb.tint
-        applyStep(photo, a, label: "White balance (picked)")
+        runAuto(.pickedWhite(NormRect(x: p.x - half, y: p.y - half, width: half * 2, height: half * 2)))
     }
 
-    func autoWhiteBalance(using source: ImageSource) {
-        guard let photo = current else { return }
-        let wb = AutoAdjust.whiteBalance(source: source, adjustments: photo.adjustments, region: nil)
-        var a = photo.adjustments
-        a.temperature = wb.temperature; a.tint = wb.tint
-        applyStep(photo, a, label: "Auto white balance")
+    /// Measures in the background, then applies the result as one history step, unless the user
+    /// moved to another photo or changed the edits meanwhile (then the result is dropped).
+    /// The returned task says whether it was applied.
+    @discardableResult
+    func runAuto(_ kind: AutoKind) -> Task<Bool, Never>? {
+        guard let photo = current, !isAutoRunning else { return nil }
+        commitPending(photo)
+        let start = photo.adjustments
+        let request = AutoRequest(url: photo.url, kind: kind, adjustments: start)
+        let run = AutoRun(url: photo.url, kind: kind, id: UUID())
+        autoRun = run
+        return Task { [weak self] in
+            let result = await AutoEngine.shared.result(for: request)
+            guard let self else { return false }
+            if self.autoRun == run { self.autoRun = nil }
+            return self.finishAuto(request, start: start, result: result)
+        }
     }
 
-    func autoTone(using source: ImageSource) {
-        guard let photo = current else { return }
-        let t = AutoAdjust.tone(source: source, adjustments: photo.adjustments)
-        var a = photo.adjustments
-        a.exposure = t.exposure; a.contrast = t.contrast; a.highlights = t.highlights; a.shadows = t.shadows
-        applyStep(photo, a, label: "Auto tone")
+    /// True while an auto action runs for the photo being edited (its row is disabled).
+    var isAutoRunning: Bool { autoRun != nil && autoRun?.url == currentID }
+
+    /// Applies a finished measurement if the photo and its edits are still what it measured.
+    func finishAuto(_ request: AutoRequest, start: Adjustments, result: AutoResult?) -> Bool {
+        guard let result, let photo = current, photo.url == request.url, photo.adjustments == start else { return false }
+        applyStep(photo, result.applied(to: start), label: request.kind.label)
+        return true
     }
 
     private func applyStep(_ photo: Photo, _ adjustments: Adjustments, label: String) {

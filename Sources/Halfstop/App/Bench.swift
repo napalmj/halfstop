@@ -85,7 +85,31 @@ enum Bench {
             var a = Adjustments(); a.masks = [m]; return a
         }
 
+        benchAuto(url: url, preview: src)
         benchStore()
+    }
+
+    /// One-click auto adjustments, measured on the already-decoded preview source (as the buttons do).
+    static func benchAuto(url: URL, preview src: ImageSource) {
+        func time(_ name: String, runs: Int = 5, _ body: () -> Void) {
+            body()   // warm up
+            var t: [Double] = []
+            for _ in 0..<runs { let t0 = CACurrentMediaTime(); body(); t.append((CACurrentMediaTime() - t0) * 1000) }
+            print("  " + name.padding(toLength: 34, withPad: " ", startingAt: 0) + String(format: "%7.2f ms", median(t)))
+        }
+        let engine = AutoEngine.shared
+        func request(_ kind: AutoKind) -> AutoRequest { AutoRequest(url: url, kind: kind, adjustments: Adjustments()) }
+        // First use of a photo: decodes the small measurement copy.
+        engine.clear(sources: true)
+        let t0 = CACurrentMediaTime()
+        _ = engine.resultNow(for: request(.tone))
+        print("  " + "auto tone, first (incl. decode)".padding(toLength: 34, withPad: " ", startingAt: 0)
+              + String(format: "%7.2f ms", (CACurrentMediaTime() - t0) * 1000))
+        // Decoded, nothing cached: what a click costs on the photo being edited.
+        for kind in [AutoKind.whiteBalance, .tone] {
+            time("auto \(kind == .tone ? "tone" : "WB") (background, uncached)") { engine.clear(); _ = engine.resultNow(for: request(kind)) }
+        }
+        time("auto tone (cached)") { _ = engine.resultNow(for: request(.tone)) }
     }
 
     /// One preview frame through the same code path the editor uses.

@@ -116,6 +116,20 @@ enum SelfTest {
         return RGB(r: Double(p[0]), g: Double(p[1]), b: Double(p[2]))
     }
 
+    /// Sorted sRGB-encoded luminance of every pixel: the reference the histogram is checked against.
+    static func sortedLuminances(_ image: CIImage) -> [Double] {
+        let e = image.extent.integral
+        let w = Int(e.width), h = Int(e.height)
+        var px = [UInt8](repeating: 0, count: w * h * 4)
+        Render.background.render(image, toBitmap: &px, rowBytes: w * 4, bounds: e, format: .RGBA8, colorSpace: Render.sRGB)
+        var out = [Double]()
+        out.reserveCapacity(w * h)
+        for i in stride(from: 0, to: px.count, by: 4) {
+            out.append((0.2126 * Double(px[i]) + 0.7152 * Double(px[i + 1]) + 0.0722 * Double(px[i + 2])) / 255)
+        }
+        return out.sorted()
+    }
+
     static func run(dir: URL) -> Bool {
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let url = dir.appendingPathComponent("selftest.jpg")
@@ -444,9 +458,54 @@ enum SelfTest {
         if let dim = variant("dim.jpg", { $0.applyingFilter("CIExposureAdjust", parameters: [kCIInputEVKey: -1.8]) }) {
             let t = AutoAdjust.tone(source: dim, adjustments: Adjustments())
             var a = Adjustments(); a.exposure = t.exposure
-            let lum = AutoAdjust.luminances(dim.developed(a, renderScale: 0.25))
-            let m = lum[lum.count / 2]
+            let m = AutoAdjust.measure(dim.developed(a, renderScale: 0.25))?.percentile(0.5) ?? 0
             check("auto tone lifts a dark photo", t.exposure > 0.3 && abs(m - 0.42) < 0.08, String(format: "ev %.2f, median %.2f", t.exposure, m))
+
+            // The histogram's percentiles are the ones sorting every pixel gave.
+            var worst = 0.0
+            for image in [dim.developed(Adjustments(), renderScale: 0.3), base.cropped(to: CGRect(x: 0, y: 0, width: 700, height: 500))] {
+                guard let stats = AutoAdjust.measure(image) else { worst = 1; continue }
+                let sorted = sortedLuminances(image)
+                for p in [0.0, 0.005, 0.05, 0.25, 0.5, 0.75, 0.95, 0.995, 1] {
+                    worst = max(worst, abs(stats.percentile(p) - sorted[min(sorted.count - 1, Int(Double(sorted.count - 1) * p))]))
+                }
+            }
+            check("histogram percentiles match sorting within 1/255", worst <= 1.0 / 255, String(format: "worst %.4f", worst))
+        }
+
+        // White balance solver: few renders, and the end of the range when there's no root inside.
+        do {
+            var renders = 0
+            let root = AutoAdjust.solveNeutral { x in
+                renders += 1
+                return SIMD2(0.004 * (x.x - 37) + 0.0006 * (x.y + 12), 0.003 * (x.y + 12) - 0.0005 * (x.x - 37) + 0.00001 * (x.y + 12) * (x.y + 12))
+            }
+            check("white balance solve converges in few renders", abs(root.x - 37) < 1 && abs(root.y + 12) < 1 && renders <= 6,
+                  String(format: "(%.2f, %.2f) after %d renders", root.x, root.y, renders))
+            renders = 0
+            let pinned = AutoAdjust.solveNeutral { x in renders += 1; return SIMD2(0.004 * (x.x - 160), 0.003 * x.y) }
+            check("white balance solve stops at the end of the range", pinned.x > 99 && abs(pinned.y) < 1 && renders <= 12,
+                  String(format: "(%.2f, %.2f) after %d renders", pinned.x, pinned.y, renders))
+        }
+
+        // The engine measures off its own decode and caches by the inputs that matter.
+        do {
+            let engine = AutoEngine()
+            var a = Adjustments(); a.temperature = 10
+            let first = engine.resultNow(for: AutoRequest(url: url, kind: .tone, adjustments: a))
+            a.vignette = -30; a.saturation = 20
+            let again = engine.resultNow(for: AutoRequest(url: url, kind: .tone, adjustments: a))
+            check("auto results are cached across unrelated edits", first != nil && first == again && engine.measurementCount == 1,
+                  "\(engine.measurementCount) measurements")
+            a.temperature = -20
+            _ = engine.resultNow(for: AutoRequest(url: url, kind: .tone, adjustments: a))
+            a.crop.rect = NormRect(x: 0.1, y: 0.1, width: 0.5, height: 0.5)
+            _ = engine.resultNow(for: AutoRequest(url: url, kind: .tone, adjustments: a))
+            check("auto measures again when its inputs change", engine.measurementCount == 3, "\(engine.measurementCount) measurements")
+            let wbA = engine.resultNow(for: AutoRequest(url: url, kind: .whiteBalance, adjustments: Adjustments()))?.whiteBalance
+            let wbB = AutoAdjust.whiteBalance(source: src, adjustments: Adjustments(), region: nil)
+            check("measurement decode gives the same white balance as full size", wbA.map { abs($0.temperature - wbB.temperature) <= 2 && abs($0.tint - wbB.tint) <= 2 } == true,
+                  "\(String(describing: wbA)) vs \(wbB)")
         }
 
         // Export keeps metadata (optionally without location), and parallel exports never share a name.
@@ -893,6 +952,43 @@ enum LibraryTest {
                   && again?.snapshots.first?.name == "Muted", "\(again?.history.count ?? -1) steps")
             store.clearHistory()
             check("clear keeps current edits", photo.history.count == 1 && photo.adjustments.saturation == -30)
+            store.resetAdjustments()
+            store.mode = .library
+        }
+
+        // Auto actions: measured off the main thread, applied as one step, dropped when stale.
+        if store.photos.count >= 2 {
+            let photo = store.photos[0], other = store.photos[1]
+            store.mode = .edit
+            store.select(photo)
+            store.resetAdjustments()
+            store.commitPending(photo)
+            let steps = photo.history.count, before = photo.adjustments
+            let task = store.runAuto(.tone)
+            check("auto runs in the background", task != nil && photo.adjustments == before && store.isAutoRunning)
+            check("auto ignores a second tap while running", store.runAuto(.whiteBalance) == nil)
+            let applied = await task?.value ?? false
+            check("auto tone is one labelled step", applied && !store.isAutoRunning && photo.history.count == steps + 1
+                  && photo.history.last?.label == "Auto tone" && photo.adjustments != before,
+                  photo.history.suffix(2).map(\.label).joined(separator: " | "))
+            store.undo()
+            check("auto tone undoes in one step", photo.adjustments == before)
+
+            let stale = store.runAuto(.whiteBalance)
+            store.edit { $0.vignette = -20 }
+            let staleApplied = await stale?.value ?? true
+            check("auto result is dropped when the edits changed", !staleApplied && photo.adjustments.vignette == -20
+                  && photo.adjustments.temperature == before.temperature)
+
+            store.commitPending(photo)
+            let otherSteps = other.history.count, otherBefore = other.adjustments
+            let moved = store.runAuto(.tone)
+            store.select(other)
+            check("another photo's row isn't blocked", !store.isAutoRunning)
+            let movedApplied = await moved?.value ?? true
+            check("auto result is dropped after switching photos", !movedApplied && other.history.count == otherSteps
+                  && other.adjustments == otherBefore && photo.adjustments.exposure == before.exposure)
+            store.select(photo)
             store.resetAdjustments()
             store.mode = .library
         }

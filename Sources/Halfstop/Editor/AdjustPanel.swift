@@ -134,22 +134,38 @@ private struct QuickPanel: View {
 /// Auto tone, auto white balance and the white-balance picker.
 private struct AutoRow: View {
     @Environment(LibraryStore.self) private var store
-    @Environment(PreviewRenderer.self) private var renderer
 
     var body: some View {
-        let source = store.current.flatMap { renderer.source(for: $0.url) }
+        let running = store.isAutoRunning ? store.autoRun?.kind : nil
         HStack(spacing: 4) {
-            Button("Auto tone") { if let source { store.autoTone(using: source) } }
+            Button { store.runAuto(.tone) } label: { AutoChipLabel(title: "Auto tone", busy: running == .tone) }
                 .help("Set exposure, contrast, highlights and shadows from the photo")
-            Button("Auto WB") { if let source { store.autoWhiteBalance(using: source) } }
+            Button { store.runAuto(.whiteBalance) } label: { AutoChipLabel(title: "Auto WB", busy: running == .whiteBalance) }
                 .help("Neutral white balance from the whole frame")
-            Button { store.pickingWhite.toggle() } label: { Image(systemName: "eyedropper") }
+            Button { store.pickingWhite.toggle() } label: {
+                AutoChipLabel(systemImage: "eyedropper", busy: { if case .pickedWhite = running { true } else { false } }())
+            }
                 .buttonStyle(ChipStyle(selected: store.pickingWhite))
                 .frame(width: 34)
                 .help("Pick white balance: click something gray (W)")
         }
         .buttonStyle(ChipStyle(selected: false))
-        .disabled(source == nil)
+        .disabled(store.current == nil || running != nil)
+    }
+}
+
+/// A chip's title, swapped for a small spinner while its action measures (same size either way).
+private struct AutoChipLabel: View {
+    var title: String? = nil
+    var systemImage: String? = nil
+    var busy: Bool
+
+    var body: some View {
+        Group {
+            if let systemImage { Image(systemName: systemImage) } else { Text(title ?? "") }
+        }
+        .opacity(busy ? 0 : 1)
+        .overlay { if busy { ProgressView().controlSize(.mini) } }
     }
 }
 

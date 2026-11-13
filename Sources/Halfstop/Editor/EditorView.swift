@@ -92,9 +92,7 @@ struct PreviewArea: View {
             let contentSize = PreviewLayout.contentSize(source.size, a, mode)
             let rect = PreviewLayout.fit(contentSize, in: size)
             if store.pickingWhite && !store.isCropping && store.activeMaskID == nil {
-                WhitePicker(imageRect: rect) { p in
-                    if let s = renderer.source(for: url) { store.pickWhiteBalance(at: p, using: s) }
-                }
+                WhitePicker(imageRect: rect) { p in store.pickWhiteBalance(at: p) }
             } else if store.isCropping {
                 CropOverlay(
                     imageRect: rect,
