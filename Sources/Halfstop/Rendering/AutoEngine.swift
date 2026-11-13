@@ -3,6 +3,8 @@ import CoreImage
 
 /// A one-click auto action.
 enum AutoKind: Hashable, Sendable {
+    /// White balance, tone, whites/blacks and vibrance together (the ✦ Auto chip).
+    case auto
     case tone
     case whiteBalance
     /// White balance from a clicked spot (normalized, top-left origin, in the cropped photo).
@@ -11,6 +13,7 @@ enum AutoKind: Hashable, Sendable {
     /// The history step it makes.
     var label: String {
         switch self {
+        case .auto: "Auto"
         case .tone: "Auto tone"
         case .whiteBalance: "Auto white balance"
         case .pickedWhite: "White balance (picked)"
@@ -19,11 +22,20 @@ enum AutoKind: Hashable, Sendable {
 }
 
 /// What an auto action decided, plus what it measured. `nil` parts aren't touched when applied.
+///
+/// Extending it: add the new decision as another optional part (a learned per-user offset, say)
+/// and set it in `applied(to:)`; add what it was based on next to `stats` and `hints`.
 struct AutoResult: Equatable, Sendable {
     var whiteBalance: AutoAdjust.WhiteBalance?
     var tone: AutoAdjust.Tone?
-    /// The measurement the tone decisions were based on.
+    var levels: AutoAdjust.Levels?
+    var color: AutoAdjust.ColorBoost?
+    /// How the photo was read (decides how hard tone pushes).
+    var scene: AutoAdjust.Scene?
+    /// The measurement the tone and color decisions were based on (after white balance).
     var stats: ImageStats?
+    /// What else was known about the photo (faces…).
+    var hints = AutoHints()
 
     /// `a` with this result's sliders set; everything else (curve, masks, crop…) stays.
     func applied(to a: Adjustments) -> Adjustments {
@@ -32,6 +44,8 @@ struct AutoResult: Equatable, Sendable {
         if let t = tone {
             out.exposure = t.exposure; out.contrast = t.contrast; out.highlights = t.highlights; out.shadows = t.shadows
         }
+        if let l = levels { out.whites = l.whites; out.blacks = l.blacks }
+        if let c = color { out.vibrance = c.vibrance; out.saturation = c.saturation }
         return out
     }
 }
@@ -50,6 +64,8 @@ struct AutoRequest: Hashable, Sendable {
         var inputs = Adjustments()
         inputs.crop = a.crop
         switch kind {
+        case .auto:
+            break   // starts from defaults: only the crop matters
         case .tone:
             inputs.temperature = a.temperature
             inputs.tint = a.tint
@@ -156,14 +172,19 @@ extension AutoAdjust {
     /// Measures and decides one auto action. `inputs` holds only what `AutoRequest` keeps.
     static func compute(_ kind: AutoKind, source: ImageSource, inputs: Adjustments) -> AutoResult {
         switch kind {
+        case .auto:
+            return auto(source: source, inputs: inputs)
         case .whiteBalance:
             return AutoResult(whiteBalance: whiteBalance(source: source, adjustments: inputs, region: nil))
         case .pickedWhite(let r):
             let region = CGRect(x: r.x, y: r.y, width: r.width, height: r.height)
             return AutoResult(whiteBalance: whiteBalance(source: source, adjustments: inputs, region: region))
         case .tone:
-            let stats = measure(measurementImage(source, inputs))
-            return AutoResult(tone: stats.map(tone) ?? Tone(exposure: 0, contrast: 0, highlights: 0, shadows: 0), stats: stats)
+            guard let stats = measure(measurementImage(source, inputs)) else {
+                return AutoResult(tone: Tone(exposure: 0, contrast: 0, highlights: 0, shadows: 0))
+            }
+            let scene = scene(stats)
+            return AutoResult(tone: tone(stats, scene: scene), scene: scene, stats: stats)
         }
     }
 }

@@ -508,6 +508,132 @@ enum SelfTest {
                   "\(String(describing: wbA)) vs \(wbB)")
         }
 
+        // Auto: scene-aware choices on synthetic photos with known exposure.
+        do {
+            func synthetic(_ name: String, _ draw: (CGContext, CGFloat, CGFloat) -> Void) -> ImageSource? {
+                let cs = CGColorSpace(name: CGColorSpace.sRGB)!
+                guard let ctx = CGContext(data: nil, width: 900, height: 600, bitsPerComponent: 8, bytesPerRow: 0, space: cs,
+                                          bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+                draw(ctx, 900, 600)
+                guard let cg = ctx.makeImage() else { return nil }
+                let u = dir.appendingPathComponent(name)
+                write(cg, to: u)
+                return ImageSource(url: u, maxPixelSize: nil)
+            }
+            func gray(_ v: Double) -> CGColor { CGColor(colorSpace: Render.sRGB, components: [v, v, v, 1])! }
+            func color(_ h: Double, _ sat: Double, _ b: Double) -> CGColor {
+                let c = NSColorShim.hsb(h, sat, b)
+                return CGColor(colorSpace: Render.sRGB, components: [c.0, c.1, c.2, 1])!
+            }
+            func ramp(_ ctx: CGContext, _ H: CGFloat, _ from: Double, _ to: Double) {
+                let g = CGGradient(colorsSpace: Render.sRGB, colors: [gray(from), gray(to)] as CFArray, locations: [0, 1])!
+                ctx.drawLinearGradient(g, start: .zero, end: CGPoint(x: 0, y: H), options: [.drawsBeforeStartLocation, .drawsAfterEndLocation])
+            }
+            func describe(_ r: AutoResult) -> String {
+                let t = r.tone, l = r.levels, c = r.color, wb = r.whiteBalance
+                return String(format: "%@ ev %.2f c %.0f h %.0f s %.0f w %.0f b %.0f vib %.0f sat %.0f wb %.0f/%.0f",
+                              r.scene?.rawValue ?? "-", t?.exposure ?? .nan, t?.contrast ?? .nan, t?.highlights ?? .nan, t?.shadows ?? .nan,
+                              l?.whites ?? .nan, l?.blacks ?? .nan, c?.vibrance ?? .nan, c?.saturation ?? .nan,
+                              wb?.temperature ?? .nan, wb?.tint ?? .nan)
+            }
+
+            // Weights line up with the render: the top half of a red-over-blue frame reads red.
+            if let split = synthetic("split.jpg", { ctx, W, H in
+                ctx.setFillColor(color(0.66, 0.9, 0.8)); ctx.fill(CGRect(x: 0, y: 0, width: W, height: H / 2))
+                ctx.setFillColor(color(0, 0.9, 0.8)); ctx.fill(CGRect(x: 0, y: H / 2, width: W, height: H / 2))
+            }), let bm = AutoAdjust.readback(AutoAdjust.measurementImage(split, Adjustments())) {
+                var mask = [UInt8](repeating: 0, count: bm.width * bm.height)
+                for i in 0..<(bm.width * bm.height / 2) { mask[i] = 255 }
+                let image = AutoAdjust.measurementImage(split, Adjustments())
+                let weighted = image.applyingFilter("CIMultiplyCompositing",
+                                                    parameters: [kCIInputBackgroundImageKey: AutoAdjust.weightImage(mask, like: bm)]).cropped(to: image.extent)
+                let (r, _, b) = AutoAdjust.average(weighted, region: nil)
+                check("white balance weights line up with the photo", r > b * 4, String(format: "r %.3f b %.3f", r, b))
+            }
+
+                if let fine = synthetic("well-exposed.jpg", { ctx, W, H in
+                ramp(ctx, H, 0.03, 0.96)
+                for i in 0..<6 {
+                    ctx.setFillColor(color(Double(i) / 6, 0.45, 0.7))
+                    ctx.fillEllipse(in: CGRect(x: 40 + CGFloat(i) * 140, y: H * 0.4, width: 90, height: 90))
+                }
+            }) {
+                let r = AutoAdjust.auto(source: fine, inputs: Adjustments())
+                let t = r.tone!, l = r.levels!, wb = r.whiteBalance!
+                let small = [t.contrast, t.highlights, t.shadows, l.whites, l.blacks].allSatisfy { abs($0) <= 10 }
+                check("auto leaves a well-exposed photo nearly alone", abs(t.exposure) <= 0.15 && small
+                      && abs(wb.temperature) <= 5 && abs(wb.tint) <= 5, describe(r))
+            }
+
+            if let lowKey = synthetic("low-key.jpg", { ctx, W, H in
+                ramp(ctx, H, 0.02, 0.25)
+                ctx.setFillColor(gray(0.9)); ctx.fill(CGRect(x: W * 0.6, y: H * 0.5, width: W * 0.25, height: H * 0.25))
+            }) {
+                let r = AutoAdjust.auto(source: lowKey, inputs: Adjustments())
+                check("auto keeps a low-key photo dark", r.scene == .lowKey && r.tone!.exposure <= 0.6, describe(r))
+            }
+
+            if let night = synthetic("night.jpg", { ctx, W, H in
+                ramp(ctx, H, 0.02, 0.12)
+                ctx.setFillColor(gray(1))
+                for i in 0..<24 { ctx.fillEllipse(in: CGRect(x: 30 + CGFloat(i % 12) * 72, y: H * (i < 12 ? 0.3 : 0.6), width: 16, height: 16)) }
+            }) {
+                let r = AutoAdjust.auto(source: night, inputs: Adjustments())
+                let t = r.tone!
+                check("auto treats a night scene gently", r.scene == .night && t.highlights == 0 && t.shadows <= 20 && t.exposure <= 0.3
+                      && r.levels!.whites == 0, describe(r))
+            }
+
+            if let highKey = synthetic("high-key.jpg", { ctx, W, H in
+                ramp(ctx, H, 0.72, 0.95)
+                ctx.setFillColor(gray(0.1)); ctx.fill(CGRect(x: W * 0.4, y: H * 0.3, width: W * 0.2, height: H * 0.4))
+            }) {
+                let r = AutoAdjust.auto(source: highKey, inputs: Adjustments())
+                check("auto keeps a high-key photo bright", r.scene == .highKey && r.tone!.exposure >= -0.4, describe(r))
+            }
+
+            if let flat = synthetic("flat.jpg", { ctx, W, H in
+                ramp(ctx, H, 0.3, 0.6)
+                for i in 0..<6 {
+                    ctx.setFillColor(color(Double(i) / 6, 0.22, 0.55))
+                    ctx.fill(CGRect(x: CGFloat(i) * 150, y: H * 0.35, width: 150, height: H * 0.3))
+                }
+            }) {
+                let r = AutoAdjust.auto(source: flat, inputs: Adjustments())
+                check("auto stretches a flat, muted photo", r.levels!.whites > 0 && r.levels!.blacks < 0 && r.tone!.contrast > 0
+                      && r.color!.vibrance > 5, describe(r))
+            }
+
+            // The sky-heavy test scene has a neutral gray ramp: auto balances on it rather than the
+            // whole-frame average (which warms it a lot).
+            let gw = AutoAdjust.whiteBalance(source: src, adjustments: Adjustments(), region: nil)
+            let sceneAuto = AutoAdjust.auto(source: src, inputs: Adjustments())
+            check("auto white balance trusts the grays over a blue sky", abs(sceneAuto.whiteBalance!.temperature) < abs(gw.temperature) / 2,
+                  "auto \(describe(sceneAuto)), whole frame \(gw.temperature)")
+
+            // Vibrance: toward typical colorfulness, careful with skin and faces, never on black and white.
+            if let base = sceneAuto.stats {
+                var muted = base; muted.meanChroma = 0.02; muted.skinFraction = 0
+                var skin = muted; skin.skinFraction = 0.35
+                var mono = muted; mono.meanChroma = 0.003; mono.chroma = [mono.pixelCount] + Array(repeating: 0, count: ImageStats.chromaBins - 1)
+                let m = AutoAdjust.color(muted), sk = AutoAdjust.color(skin)
+                let face = AutoAdjust.color(muted, hints: AutoHints(faces: [CGRect(x: 0.4, y: 0.3, width: 0.2, height: 0.3)]))
+                check("vibrance lifts muted color", m.vibrance >= 12 && m.saturation > 0 && m.saturation <= 5, "\(m)")
+                check("vibrance holds back on skin", sk.vibrance < m.vibrance && sk.saturation == 0, "\(sk)")
+                check("vibrance holds back on faces, saturation never rises", face.vibrance <= min(15, m.vibrance / 2 + 0.5)
+                      && face.saturation == 0, "\(face)")
+                check("no vibrance on black and white", AutoAdjust.color(mono) == AutoAdjust.ColorBoost(vibrance: 0, saturation: 0), "")
+            }
+
+            // Auto starts from defaults, so pressing it again on its own result is a cache hit and no change.
+            let engine = AutoEngine()
+            let first = engine.resultNow(for: AutoRequest(url: url, kind: .auto, adjustments: Adjustments()))
+            let applied = first?.applied(to: Adjustments()) ?? Adjustments()
+            let second = engine.resultNow(for: AutoRequest(url: url, kind: .auto, adjustments: applied))
+            check("auto twice changes nothing more", first != nil && second?.applied(to: applied) == applied && engine.measurementCount == 1,
+                  "\(engine.measurementCount) measurements")
+        }
+
         // Export keeps metadata (optionally without location), and parallel exports never share a name.
         let exportDir = dir.appendingPathComponent("export-out")
         try? FileManager.default.removeItem(at: exportDir)
@@ -716,6 +842,17 @@ enum Snapshot {
             store.source = .all
             store.mode = .edit
             await wait(2)
+            // The Basic panel with its auto row, then after ✦ Auto.
+            let tab = store.panelTab
+            store.panelTab = .quick
+            await wait(0.5)
+            shot("3b-basic-panel")
+            _ = await store.runAuto(.auto)?.value
+            await wait(0.8)
+            shot("3c-after-auto")
+            store.undo()
+            store.panelTab = tab
+            await wait(0.5)
             store.addMask(.brush)
             var s1 = BrushStroke(radius: 0.05, feather: 0.4)
             s1.points = [NormPoint(x: 0.15, y: 0.25), NormPoint(x: 0.3, y: 0.3), NormPoint(x: 0.4, y: 0.25)]
@@ -973,6 +1110,12 @@ enum LibraryTest {
                   photo.history.suffix(2).map(\.label).joined(separator: " | "))
             store.undo()
             check("auto tone undoes in one step", photo.adjustments == before)
+
+            let all = await store.runAuto(.auto)?.value ?? false
+            check("✦ Auto is one step labelled Auto", all && photo.history.count == steps + 1 && photo.history.last?.label == "Auto",
+                  photo.history.suffix(2).map(\.label).joined(separator: " | "))
+            store.undo()
+            check("✦ Auto undoes in one step", photo.adjustments == before)
 
             let stale = store.runAuto(.whiteBalance)
             store.edit { $0.vignette = -20 }

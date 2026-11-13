@@ -131,17 +131,21 @@ private struct QuickPanel: View {
     }
 }
 
-/// Auto tone, auto white balance and the white-balance picker.
+/// Auto (everything at once), auto tone, auto white balance and the white-balance picker.
 private struct AutoRow: View {
     @Environment(LibraryStore.self) private var store
 
     var body: some View {
         let running = store.isAutoRunning ? store.autoRun?.kind : nil
         HStack(spacing: 4) {
-            Button { store.runAuto(.tone) } label: { AutoChipLabel(title: "Auto tone", busy: running == .tone) }
-                .help("Set exposure, contrast, highlights and shadows from the photo")
-            Button { store.runAuto(.whiteBalance) } label: { AutoChipLabel(title: "Auto WB", busy: running == .whiteBalance) }
-                .help("Neutral white balance from the whole frame")
+            Button { store.runAuto(.auto) } label: { AutoChipLabel(title: "✦ Auto", busy: running == .auto) }
+                .buttonStyle(ChipStyle(selected: true))
+                .accessibilityLabel("Auto")
+                .help("Auto: white balance, tone, whites and blacks, and vibrance in one step")
+            Button { store.runAuto(.tone) } label: { AutoChipLabel(title: "Tone", busy: running == .tone) }
+                .help("Auto tone: set exposure, contrast, highlights and shadows from the photo")
+            Button { store.runAuto(.whiteBalance) } label: { AutoChipLabel(title: "WB", busy: running == .whiteBalance) }
+                .help("Auto white balance: neutral white balance from the whole frame")
             Button { store.pickingWhite.toggle() } label: {
                 AutoChipLabel(systemImage: "eyedropper", busy: { if case .pickedWhite = running { true } else { false } }())
             }

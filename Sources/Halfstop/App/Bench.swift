@@ -106,10 +106,17 @@ enum Bench {
         print("  " + "auto tone, first (incl. decode)".padding(toLength: 34, withPad: " ", startingAt: 0)
               + String(format: "%7.2f ms", (CACurrentMediaTime() - t0) * 1000))
         // Decoded, nothing cached: what a click costs on the photo being edited.
-        for kind in [AutoKind.whiteBalance, .tone] {
-            time("auto \(kind == .tone ? "tone" : "WB") (background, uncached)") { engine.clear(); _ = engine.resultNow(for: request(kind)) }
+        for (kind, name) in [(AutoKind.whiteBalance, "WB"), (.tone, "tone"), (.auto, "✦ Auto")] {
+            time("auto \(name) (background, uncached)") { engine.clear(); _ = engine.resultNow(for: request(kind)) }
         }
-        time("auto tone (cached)") { _ = engine.resultNow(for: request(.tone)) }
+        time("auto ✦ Auto (cached)") { _ = engine.resultNow(for: request(.auto)) }
+        // What it decided, to sanity-check real photos passed with --file.
+        if let r = engine.resultNow(for: request(.auto)) {
+            let a = r.applied(to: Adjustments())
+            print("  ✦ Auto on this photo: " + (r.scene?.rawValue ?? "?") + String(format:
+                ", temp %.0f tint %.0f, exposure %.2f, contrast %.0f, highlights %.0f, shadows %.0f, whites %.0f, blacks %.0f, vibrance %.0f, saturation %.0f",
+                a.temperature, a.tint, a.exposure, a.contrast, a.highlights, a.shadows, a.whites, a.blacks, a.vibrance, a.saturation))
+        }
     }
 
     /// One preview frame through the same code path the editor uses.

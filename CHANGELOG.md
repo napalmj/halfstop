@@ -12,8 +12,15 @@ All notable changes to Halfstop are listed here. The format follows
 - Auto tone, Auto WB and the white balance picker measure in the background, so the editor stays
   responsive; the chip shows a spinner meanwhile. They are much faster (auto white balance went
   from about 640 ms to under 10 ms on a 24 MP JPEG), and repeating one, or undo then redo, is instant.
+- The auto row reads `[✦ Auto] [Tone] [WB] [eyedropper]`; "Auto tone" and "Auto WB" are now "Tone" and
+  "WB" (full names in their tooltips). Auto tone leaves a well-exposed photo nearly alone and no longer
+  drags low-key, high-key or night photos toward middle gray.
 
 ### Added
+- ✦ Auto at the top of the Basic panel: white balance (balanced on the photo's grayest pixels),
+  exposure, contrast, highlights, shadows, whites, blacks and vibrance in one undoable step. It
+  reads the scene, so a well-exposed photo barely changes and low-key, high-key and night photos
+  keep their mood; vibrance holds back on skin tones.
 - README with install and usage instructions, a user guide and an architecture overview.
 - MIT license, contributing guide, code of conduct, security policy and GitHub issue and pull
   request templates.

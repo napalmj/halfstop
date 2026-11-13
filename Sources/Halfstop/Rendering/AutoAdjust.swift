@@ -21,7 +21,10 @@ enum AutoAdjust {
 
     /// Temperature and tint that make the average color of `region` neutral gray.
     /// - Parameter region: normalized, top-left origin, in the cropped photo; nil = the whole frame (gray world).
-    static func whiteBalance(source: ImageSource, adjustments: Adjustments, region: CGRect?) -> WhiteBalance {
+    /// - Parameter weights: a grayscale image over the measurement render (`measurementImage`'s extent):
+    ///   only the pixels it covers count toward the average. Auto uses it to balance on the grayest
+    ///   pixels; it's also the place to weight toward faces.
+    static func whiteBalance(source: ImageSource, adjustments: Adjustments, region: CGRect?, weights: CIImage? = nil) -> WhiteBalance {
         var base = Adjustments()
         base.crop = adjustments.crop
         base.exposure = adjustments.exposure
@@ -31,11 +34,17 @@ enum AutoAdjust {
             var a = base
             a.temperature = x.x
             a.tint = x.y
-            let (r, g, b) = average(source.developed(a, geometry: .full, renderScale: renderScale), region: region)
+            var image = source.developed(a, geometry: .full, renderScale: renderScale)
+            if let weights {
+                // Scaling every pixel by its weight scales the channel sums alike, so the ratios hold.
+                image = image.applyingFilter("CIMultiplyCompositing", parameters: [kCIInputBackgroundImageKey: weights])
+                    .cropped(to: image.extent)
+            }
+            let (r, g, b) = average(image, region: region)
             return SIMD2(log(max(b, 1e-6) / max(r, 1e-6)), log(max(g, 1e-6) / max((r * b).squareRoot(), 1e-6)))
         }
         let x = solveNeutral(error)
-        return WhiteBalance(temperature: x.x.rounded(), tint: x.y.rounded())
+        return WhiteBalance(temperature: x.x.rounded() + 0, tint: x.y.rounded() + 0)
     }
 
     static let sliderRange = -100.0...100.0
@@ -120,33 +129,253 @@ enum AutoAdjust {
         var shadows: Double
     }
 
-    /// Exposure to put the median near middle gray, then highlights/shadows/contrast from how much
-    /// of the frame sits at the ends and how spread out it is. Starts from the current white balance.
+    /// Whites and blacks: where the ends of the range land.
+    struct Levels: Equatable, Sendable {
+        var whites: Double
+        var blacks: Double
+    }
+
+    /// What kind of exposure a photo has, which decides how far auto pushes it.
+    enum Scene: String, Equatable, Sendable {
+        case normal
+        /// Already fine: auto stays close to zero.
+        case wellExposed
+        /// Dark on purpose, with exposed highlights: not dragged up to middle gray.
+        case lowKey
+        /// Bright on purpose, with real darks: not dragged down to middle gray.
+        case highKey
+        /// A low-light scene with point lights: little shadow lift, no highlight recovery.
+        case night
+    }
+
+    /// Medians in this band (sRGB-encoded) are a matter of taste: exposure leaves them alone.
+    static let medianBand = 0.36...0.56
+
+    /// Starts from the current white balance, otherwise from defaults.
     static func tone(source: ImageSource, adjustments: Adjustments) -> Tone {
         var a = Adjustments()
         a.crop = adjustments.crop
         a.temperature = adjustments.temperature
         a.tint = adjustments.tint
         guard let stats = measure(measurementImage(source, a)) else { return Tone(exposure: 0, contrast: 0, highlights: 0, shadows: 0) }
-        return tone(stats)
+        return tone(stats, scene: scene(stats))
     }
 
-    static func tone(_ stats: ImageStats) -> Tone {
-        guard stats.pixelCount > 16 else { return Tone(exposure: 0, contrast: 0, highlights: 0, shadows: 0) }
-        let median = stats.percentile(0.5)
-        var ev = log2(linear(0.42) / max(linear(median), 1e-4))
-        ev = (min(max(ev, -3), 3) / 0.05).rounded() * 0.05
+    static func scene(_ s: ImageStats) -> Scene {
+        guard s.pixelCount > 16 else { return .normal }
+        let median = s.percentile(0.5), lo = s.percentile(0.005), hi = s.percentile(0.995)
+        let lights = s.fraction { $0 >= 0.85 }, clipped = s.fraction { $0 >= 0.98 }
+        if median < 0.16, hi >= 0.8, lights < 0.03 { return .night }
+        if median < 0.3, s.percentile(0.99) >= 0.7 { return .lowKey }
+        if median > 0.6, s.percentile(0.05) < 0.3, clipped < 0.03 { return .highKey }
+        if medianBand.contains(median), lo <= 0.08, hi >= 0.88, clipped < 0.01 { return .wellExposed }
+        return .normal
+    }
+
+    /// Exposure from the median and how much room the highlights have, then contrast, highlights
+    /// and shadows from the shifted distribution, each held back according to the scene.
+    static func tone(_ s: ImageStats, scene: Scene) -> Tone {
+        guard s.pixelCount > 16 else { return Tone(exposure: 0, contrast: 0, highlights: 0, shadows: 0) }
+        let median = s.percentile(0.5), hi = s.percentile(0.995)
+        func evTo(_ target: Double) -> Double { log2(linear(target) / max(linear(median), 1e-4)) }
+        // To the nearest edge of the band; zero inside it.
+        let toBand = median < medianBand.lowerBound ? evTo(medianBand.lowerBound)
+            : median > medianBand.upperBound ? evTo(medianBand.upperBound) : 0
+        // How far the top 0.5% could rise before reaching white.
+        let headroom = log2(linear(0.96) / max(linear(hi), 1e-4))
+
+        var ev: Double
+        switch scene {
+        case .night:
+            ev = min(max(toBand * 0.2, -0.3), 0.3)
+        case .lowKey:
+            // The highlights are where they should be: never push them into clipping.
+            ev = min(toBand * 0.35, max(headroom - 0.05, 0), 0.6)
+        case .highKey:
+            ev = max(toBand * 0.35, -0.4)
+        case .wellExposed, .normal:
+            if toBand >= 0 {
+                // Dark: lift to the band, and when nothing reaches the highlights (an underexposed
+                // frame), on toward the middle of it, without clipping more than the highlights can recover.
+                ev = max(toBand, min(headroom - 0.2, evTo(0.45)))
+                ev = min(ev, headroom + 0.3)
+                ev = max(ev, 0)
+            } else {
+                ev = toBand
+            }
+        }
+        ev = (min(max(ev, -3), 3) * 20).rounded() / 20   // 0.05 EV steps, like the slider
         let k = pow(2, ev)
         // Exposure is monotonic, so the shifted distribution is the same histogram with moved levels.
         func shifted(_ v: Double) -> Double { encoded(min(1, linear(v) * k)) }
 
-        let blown = stats.fraction { shifted($0) >= 0.97 }
-        let dark = stats.fraction { shifted($0) <= 0.06 }
-        let spread = shifted(stats.percentile(0.95)) - shifted(stats.percentile(0.05))
-        return Tone(exposure: ev,
-                    contrast: min(max((0.7 - spread) * 80, -20), 35).rounded(),
-                    highlights: -min(blown * 1500, 70).rounded(),
-                    shadows: min(dark * 300, 60).rounded())
+        let blown = s.fraction { shifted($0) >= 0.97 }
+        let dark = s.fraction { shifted($0) <= 0.06 }
+        let spread = shifted(s.percentile(0.95)) - shifted(s.percentile(0.05))
+        var contrast = spread < 0.6 ? (0.6 - spread) * 70 : spread > 0.88 ? -(spread - 0.88) * 80 : 0
+        var highlights = -max(0, blown - 0.004) * 1500
+        var shadows = max(0, dark - 0.02) * 300
+        switch scene {
+        case .night: highlights = 0; shadows = min(shadows * 0.25, 20); contrast = min(contrast, 10)
+        case .lowKey: shadows *= 0.5; contrast = min(contrast, 15)
+        case .highKey: highlights *= 0.5; contrast = min(contrast, 15)
+        case .wellExposed: contrast *= 0.5; highlights *= 0.5; shadows *= 0.5
+        case .normal: break
+        }
+        // (`+ 0` turns -0 into 0, so a slider never reads "-0".)
+        return Tone(exposure: ev + 0,
+                    contrast: min(max(contrast, -15), 30).rounded() + 0,
+                    highlights: min(max(highlights, -70), 0).rounded() + 0,
+                    shadows: min(max(shadows, 0), 50).rounded() + 0)
+    }
+
+    /// Whites and blacks that put the 99.5th and 0.5th percentiles (after `tone`) near the ends of
+    /// the range, so it's used without clipping more than about 0.5%. Only ever stretches: a photo
+    /// that already reaches black and white keeps zero.
+    static func levels(_ s: ImageStats, tone: Tone, scene: Scene) -> Levels {
+        guard s.pixelCount > 16 else { return Levels(whites: 0, blacks: 0) }
+        let k = pow(2, tone.exposure)
+        func shifted(_ v: Double) -> Double { encoded(min(1, linear(v) * k)) }
+        let hi = shifted(s.percentile(0.995)), lo = shifted(s.percentile(0.005))
+        var a = Adjustments()
+        a.contrast = tone.contrast
+        // Where a level lands through the real tone table (contrast, whites, blacks).
+        func output(_ v: Double, whites: Double, blacks: Double) -> Double {
+            a.whites = whites; a.blacks = blacks
+            let table = ColorLUT.toneTable(ColorLUTKey(a), size: 256)
+            let p = min(max(v, 0), 1) * 255
+            let i = min(Int(p), 254)
+            return Double(table[i]) + Double(table[i + 1] - table[i]) * (p - Double(i))
+        }
+        // Monotonic in the slider, so bisect for the slider value that lands `v` on `target`.
+        func slider(_ range: ClosedRange<Double>, _ v: Double, _ target: Double, _ out: (Double) -> Double) -> Double {
+            var lo = range.lowerBound, hi = range.upperBound
+            let rising = out(hi) > out(lo)
+            for _ in 0..<10 {
+                let mid = (lo + hi) / 2
+                if (out(mid) < target) == rising { lo = mid } else { hi = mid }
+            }
+            return ((lo + hi) / 2).rounded() + 0
+        }
+        var whites = 0.0, blacks = 0.0
+        if scene != .night, scene != .highKey, hi < 0.93, output(hi, whites: 0, blacks: 0) < 0.95 {
+            whites = slider(0...30, hi, 0.97) { output(hi, whites: $0, blacks: 0) }
+        }
+        if scene != .lowKey, lo > 0.06, output(lo, whites: whites, blacks: 0) > 0.04 {
+            // A bright, airy photo keeps its soft darks.
+            blacks = slider(scene == .highKey ? -15...0 : -30...0, lo, 0.03) { output(lo, whites: whites, blacks: $0) }
+        }
+        return Levels(whites: whites, blacks: blacks)
+    }
+
+    // MARK: Color
+
+    struct ColorBoost: Equatable, Sendable {
+        var vibrance: Double
+        var saturation: Double
+    }
+
+    /// Mean perceptual chroma auto aims vibrance at: a typical, pleasantly colorful photo.
+    static let targetChroma = 0.065
+
+    /// Vibrance toward a typical colorfulness, held back when there's skin (or faces), and at most a
+    /// light touch of saturation.
+    static func color(_ s: ImageStats, hints: AutoHints = AutoHints()) -> ColorBoost {
+        let mean = s.meanChroma
+        // Black and white, or as good as (even its most colorful pixels are near gray): nothing to boost.
+        guard s.pixelCount > 16, s.chromaPercentile(0.95) >= 0.012 else { return ColorBoost(vibrance: 0, saturation: 0) }
+        var vibrance = (targetChroma - mean) / targetChroma * 30
+        if vibrance > 0 {
+            vibrance *= max(0.3, 1 - s.skinFraction * 2)
+        } else {
+            // Only rein in colors that are actually garish.
+            vibrance = -max(0, s.chromaPercentile(0.9) - 0.22) * 100
+        }
+        var saturation = 0.0
+        if hints.faces.isEmpty {
+            if s.skinFraction < 0.05 { saturation = min(max(vibrance * 0.15, 0), 5) }
+        } else {
+            vibrance = min(vibrance * 0.5, 15)
+        }
+        return ColorBoost(vibrance: min(max(vibrance, -10), 25).rounded() + 0, saturation: saturation.rounded() + 0)
+    }
+
+    // MARK: Auto
+
+    /// White balance, then tone, whites/blacks and vibrance measured with that white balance.
+    /// Everything starts from defaults (only the crop is kept), so the result doesn't depend on the
+    /// current sliders and pressing Auto again changes nothing.
+    static func auto(source: ImageSource, inputs: Adjustments, hints: AutoHints = AutoHints()) -> AutoResult {
+        var base = Adjustments()
+        base.crop = inputs.crop
+        var wb = WhiteBalance(temperature: 0, tint: 0)
+        if let asShot = readback(measurementImage(source, base)) {
+            if let weights = neutralWeights(asShot) {
+                wb = whiteBalance(source: source, adjustments: base, region: nil, weights: weights)
+            } else {
+                // No convincing neutrals: the whole-frame average is only a guess (a sunset would turn
+                // gray), so go half way, and not far.
+                let g = whiteBalance(source: source, adjustments: base, region: nil)
+                func half(_ v: Double) -> Double { (v * 0.5).clamped(to: -20...20).rounded() + 0 }
+                wb = WhiteBalance(temperature: half(g.temperature), tint: half(g.tint))
+            }
+        }
+        var balanced = base
+        balanced.temperature = wb.temperature
+        balanced.tint = wb.tint
+        guard let stats = measure(measurementImage(source, balanced)) else { return AutoResult(whiteBalance: wb) }
+        let scene = scene(stats)
+        let tone = tone(stats, scene: scene)
+        return AutoResult(whiteBalance: wb, tone: tone, levels: levels(stats, tone: tone, scene: scene),
+                          color: color(stats, hints: hints), scene: scene, stats: stats, hints: hints)
+    }
+
+    /// Share of the well-exposed pixels auto white balance treats as neutral candidates.
+    static let neutralShare = 0.06
+
+    /// The grayest well-exposed pixels of an as-shot render (the least chromatic `neutralShare`, and
+    /// only if they're close to neutral), as weights for `whiteBalance`. nil when too few qualify.
+    static func neutralWeights(_ bm: Bitmap) -> CIImage? {
+        let n = bm.width * bm.height
+        guard n > 0 else { return nil }
+        var toLinear = [Double](repeating: 0, count: 256)
+        for i in 0..<256 { toLinear[i] = linear(Double(i) / 255) }
+        let binWidth = 0.0025, bins = 80
+        var chroma = [Float](repeating: -1, count: n)
+        var hist = [Int](repeating: 0, count: bins)
+        var valid = 0
+        bm.pixels.withUnsafeBufferPointer { px in
+            for i in 0..<n {
+                let r8 = px[i * 4], g8 = px[i * 4 + 1], b8 = px[i * 4 + 2]
+                guard max(r8, g8, b8) < 250 else { continue }   // clipped: its color is unknown
+                let lab = Oklab(toLinear[Int(r8)], toLinear[Int(g8)], toLinear[Int(b8)])
+                guard lab.L > 0.25, lab.L < 0.95 else { continue }
+                let c = (lab.a * lab.a + lab.b * lab.b).squareRoot()
+                chroma[i] = Float(c)
+                hist[min(Int(c / binWidth), bins - 1)] += 1
+                valid += 1
+            }
+        }
+        guard Double(valid) >= Double(n) * 0.05 else { return nil }
+        var cumulative = 0, threshold = 0.0
+        for (i, c) in hist.enumerated() {
+            cumulative += c
+            if Double(cumulative) >= Double(valid) * neutralShare { threshold = Double(i + 1) * binWidth; break }
+        }
+        threshold = min(threshold, 0.05)
+        var mask = [UInt8](repeating: 0, count: n)
+        var chosen = 0
+        for i in 0..<n where chroma[i] >= 0 && Double(chroma[i]) <= threshold { mask[i] = 255; chosen += 1 }
+        guard Double(chosen) >= Double(n) * 0.02 else { return nil }
+        return weightImage(mask, like: bm)
+    }
+
+    /// A grayscale image laid over `bm`'s render, from one byte per pixel in the same row order.
+    static func weightImage(_ mask: [UInt8], like bm: Bitmap) -> CIImage {
+        // Both bitmaps store the top row first, so rows line up without flipping.
+        CIImage(bitmapData: Data(mask), bytesPerRow: bm.width, size: CGSize(width: bm.width, height: bm.height),
+                format: .L8, colorSpace: nil)
+            .transformed(by: CGAffineTransform(translationX: bm.extent.minX, y: bm.extent.minY))
     }
 
     // MARK: Measuring
@@ -179,16 +408,37 @@ enum AutoAdjust {
         return (Double(p[0]), Double(p[1]), Double(p[2]))
     }
 
-    /// Reads `image` back once (it should be measurement-sized) and summarizes it: a luminance
-    /// histogram (vImage), mean color, and chroma and skin-tone statistics.
-    static func measure(_ image: CIImage) -> ImageStats? {
+    /// 8-bit sRGB pixels of a measurement render, top row first.
+    struct Bitmap {
+        var pixels: [UInt8]
+        var width: Int
+        var height: Int
+        /// Where it sits in Core Image coordinates.
+        var extent: CGRect
+    }
+
+    /// Renders `image` (it should be measurement-sized) into memory once.
+    static func readback(_ image: CIImage) -> Bitmap? {
         let e = image.extent.integral
         let w = Int(e.width), h = Int(e.height)
         guard w > 0, h > 0, w * h < 4_000_000 else { return nil }
         var px = [UInt8](repeating: 0, count: w * h * 4)
         Render.background.render(image, toBitmap: &px, rowBytes: w * 4, bounds: e, format: .RGBA8, colorSpace: Render.sRGB)
-        return ImageStats(rgba: px, width: w, height: h)
+        return Bitmap(pixels: px, width: w, height: h, extent: e)
     }
+
+    /// Reads `image` back once and summarizes it: a luminance histogram (vImage), mean color, and
+    /// chroma and skin-tone statistics.
+    static func measure(_ image: CIImage) -> ImageStats? {
+        readback(image).map(ImageStats.init)
+    }
+}
+
+/// Extra knowledge about the photo for `AutoAdjust.auto`. Empty means none.
+struct AutoHints: Equatable, Sendable {
+    /// Face rectangles, normalized with a top-left origin in the cropped photo. With faces, vibrance
+    /// is held back and saturation never raised. (Nothing detects faces yet; a detector fills this.)
+    var faces: [CGRect] = []
 }
 
 /// What one measurement render of a photo looks like, in numbers. Everything auto decides is
@@ -240,7 +490,8 @@ struct ImageStats: Equatable, Sendable {
         return hist.count - 1
     }
 
-    init(rgba px: [UInt8], width w: Int, height h: Int) {
+    init(_ bm: AutoAdjust.Bitmap) {
+        let px = bm.pixels, w = bm.width, h = bm.height
         // Luminance histogram: a weighted channel sum into one plane, then vImage's histogram.
         var hist = [vImagePixelCount](repeating: 0, count: 256)
         var plane = [UInt8](repeating: 0, count: w * h)
