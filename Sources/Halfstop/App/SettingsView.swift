@@ -31,7 +31,7 @@ private struct LocalControlSection: View {
         @Bindable var control = control
         Section("Local AI control (MCP)") {
             Toggle("Let AI apps on this Mac edit the open photo", isOn: $control.enabled)
-            Text("Runs a local MCP server for an AI app you use on this Mac, such as Claude Code or Claude Desktop. It listens on 127.0.0.1 only (nothing on your network can reach it), needs the token below, and can only read and edit the photo open in the editor, one undoable step at a time. Halfstop itself sends nothing anywhere.")
+            Text("Runs a local MCP server for an AI app you use on this Mac, such as Claude Code. It listens on 127.0.0.1 only (nothing on your network can reach it), needs the token below, and can only read and edit the photo open in the editor, one undoable step at a time. Halfstop itself sends nothing anywhere.")
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)

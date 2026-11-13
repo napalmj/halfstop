@@ -268,7 +268,8 @@ struct KeychainTokenStore: ControlTokenStore {
         let data = Data(token.utf8)
         let update = SecItemUpdate(query as CFDictionary, [kSecValueData: data] as CFDictionary)
         if update == errSecSuccess { return }
-        guard update == errSecItemNotFound else { throw KeychainError(status: update) }
+        // An item this build may not change (made by an earlier build, access denied): replace it.
+        if update != errSecItemNotFound { SecItemDelete(query as CFDictionary) }
         var add = query
         add[kSecValueData] = data
         add[kSecAttrLabel] = "Halfstop local AI control token"

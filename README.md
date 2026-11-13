@@ -20,6 +20,14 @@ touches a photo file's name is the optional rename on import, which is off by de
   star ratings, pick/reject flags, filters, multi-select and drag to collections.
 - **Quick and Detailed editing.** Quick has the everyday sliders. Detailed adds full light and color,
   color grading wheels, tone curve, HSL and detail.
+- **One-click auto.** ✦ Auto sets white balance, tone, whites and blacks, and vibrance in one undoable
+  step. It reads the scene (well-exposed, low-key, high-key, night) and finds faces on your Mac to
+  protect skin tones. Tone and WB do just those, and Auto straighten levels a tilted horizon.
+- **Learns your style.** With Learn from my edits (on by default), ✦ Auto adapts to how you finish
+  similar photos once you have edited 20, from your own edits only and entirely on your Mac.
+- **Local AI control (optional, off by default).** Let an AI app on your Mac, such as Claude Code,
+  look at and edit the photo open in the editor through a local [MCP](https://modelcontextprotocol.io)
+  server, one undoable step at a time. See the [user guide](docs/USER-GUIDE.md#local-ai-control-mcp).
 - **Masks.** Brush, linear, radial, subject (Apple Vision) and sky masks, each with its own sliders.
   Combine several gradients (add, subtract, intersect), pick individual subjects, grow, shrink and
   soften automatic masks, and refine any mask with brush strokes.
@@ -99,7 +107,7 @@ Press **⌘?** (Help ▸ Halfstop Help) for a searchable list of every shortcut.
 | ⌘⌫ | Move selected photos to Trash (asks first) |
 | ⇧⌘S | Show / hide the sidebar (library) or history (editor) |
 | ⌘S | Save now |
-| ⌘, | Settings |
+| ⌘, | Settings (Learn from my edits, Local AI control) |
 
 ## Where your data lives
 
@@ -109,10 +117,17 @@ Press **⌘?** (Help ▸ Halfstop Help) for a searchable list of every shortcut.
 | Edits, ratings, flags, history | `<photo folder>/.halfstop/<filename>.json` plus `<filename>.history.json`, small JSON sidecars per photo |
 | Library index (folders, collections, what ✦ Auto learned from your edits) | `~/Library/Application Support/Halfstop/catalog.json` |
 | Presets | `~/Library/Application Support/Halfstop/presets.json` |
+| Local AI control token (only if you turn it on) | Your login keychain, as "Halfstop local AI control token" |
 | Thumbnail cache | `~/Library/Caches/Halfstop/Thumbnails` (safe to delete; kept under 1 GB) |
 
 To back up your work, back up your photo folders (hidden `.halfstop` folders included) and the
-`Halfstop` folder in Application Support. Nothing is uploaded anywhere; Halfstop makes no network requests.
+`Halfstop` folder in Application Support.
+
+**Privacy.** Nothing is uploaded anywhere: Halfstop makes no network requests to outside services
+and stores no API keys. Face detection and "Learn from my edits" run on your Mac. The optional local
+AI control server (Settings, **off by default**) listens on loopback (127.0.0.1) only, so nothing
+else on your network can reach it, and every request needs a random token that only you hand to
+your AI app.
 
 ## Development
 
@@ -134,6 +149,10 @@ build/Halfstop.app/Contents/MacOS/Halfstop --make-samples /tmp/halfstop-samples
 
 # Time a live-preview frame while a control is dragged.
 build/Halfstop.app/Contents/MacOS/Halfstop --bench /tmp/halfstop-bench [--file photo.jpg]
+
+# Run the local AI control (MCP) server on throwaway sample photos, with a one-off token,
+# to try an MCP client or curl against it.
+build/Halfstop.app/Contents/MacOS/Halfstop --serve-control /tmp/halfstop-mcp [--port 47615] [--seconds 120]
 
 # Capture window snapshots of the main UI states against a throwaway catalog.
 build/Halfstop.app/Contents/MacOS/Halfstop --snapshot /tmp/halfstop-snap --catalog /tmp/snap-catalog.json --samples /tmp/halfstop-samples

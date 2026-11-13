@@ -17,7 +17,7 @@ All notable changes to Halfstop are listed here. The format follows
   drags low-key, high-key or night photos toward middle gray.
 
 ### Added
-- ✦ Auto at the top of the Basic panel: white balance (balanced on the photo's grayest pixels),
+- ✦ Auto at the top of the Basic panel (and of Light in Detailed): white balance (balanced on the photo's grayest pixels),
   exposure, contrast, highlights, shadows, whites, blacks and vibrance in one undoable step. It
   reads the scene, so a well-exposed photo barely changes and low-key, high-key and night photos
   keep their mood; vibrance holds back on skin tones.
@@ -26,9 +26,20 @@ All notable changes to Halfstop are listed here. The format follows
   as a second opinion that nudges its values a little, never replacing them.
 - Auto straighten in Crop & straighten: levels a tilted horizon (up to 10°) as one undoable step
   "Auto straighten", or shows "No horizon found". ✦ Auto never changes the crop or angle.
-- Learn from my edits (Settings, on by default): once you have edited 20 photos, ✦ Auto adds what
-  you usually change on similar photos, from your own edits only and entirely on this Mac. Its
-  tooltip then reads "Auto (adapted to your edits)".
+- Learn from my edits (Settings, on by default): once 20 photos you edited have been measured
+  (each is measured in the background after you edit it), ✦ Auto adds what you usually change on
+  similar photos, from your own edits only and entirely on this Mac. Its tooltip then reads "Auto
+  (adapted to your edits)".
+- Local AI control (Settings ▸ Local AI control (MCP), off by default): a local MCP server that lets
+  an AI app on this Mac, such as Claude Code, read and edit the photo open in the editor. It can read
+  the photo's name, size, slider values and auto analysis, look at a small preview without metadata,
+  set the global sliders (clamped to their ranges), run ✦ Auto and Auto straighten, and undo. Each
+  change is one undoable history step. It listens on 127.0.0.1 only, needs a random token kept in
+  the login keychain (Copy and Regenerate in Settings), refuses web pages and other hosts, and stops
+  as soon as it's turned off. Settings offer a ready-made `claude mcp add` command and JSON config.
+  Halfstop still makes no network requests to outside services and stores no API keys.
+- `--serve-control` command line mode: the local AI control server on throwaway sample photos, for
+  trying an MCP client against it.
 - A Settings window (⌘,).
 - README with install and usage instructions, a user guide and an architecture overview.
 - MIT license, contributing guide, code of conduct, security policy and GitHub issue and pull
