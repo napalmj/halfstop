@@ -54,6 +54,20 @@ enum LibraryFilter: String, CaseIterable, Identifiable {
 }
 
 /// An auto action in flight, for the progress state on its chip.
+/// How an auto action ended.
+enum AutoOutcome: Equatable, Sendable {
+    /// Applied as one history step.
+    case applied
+    /// Measured, but it would change nothing (no step added).
+    case unchanged
+    /// Auto straighten found no horizon it trusts (shown as a hint).
+    case noHorizon
+    /// Dropped: the user moved to another photo or changed the edits meanwhile.
+    case stale
+    /// The photo couldn't be read.
+    case unreadable
+}
+
 struct AutoRun: Equatable {
     let url: URL
     let kind: AutoKind
@@ -987,6 +1001,12 @@ final class LibraryStore {
     /// The returned task says whether it was applied.
     @discardableResult
     func runAuto(_ kind: AutoKind) -> Task<Bool, Never>? {
+        guard let task = performAuto(kind) else { return nil }
+        return Task { await task.value == .applied }
+    }
+
+    /// `runAuto` with the full outcome (for callers that report it, like a tool layer).
+    func performAuto(_ kind: AutoKind) -> Task<AutoOutcome, Never>? {
         guard let photo = current, !isAutoRunning else { return nil }
         commitPending(photo)
         let start = photo.adjustments
@@ -995,7 +1015,7 @@ final class LibraryStore {
         autoRun = run
         return Task { [weak self] in
             let result = await AutoEngine.shared.result(for: request)
-            guard let self else { return false }
+            guard let self else { return .stale }
             if self.autoRun == run { self.autoRun = nil }
             return self.finishAuto(request, start: start, result: result)
         }
@@ -1005,10 +1025,35 @@ final class LibraryStore {
     var isAutoRunning: Bool { autoRun != nil && autoRun?.url == currentID }
 
     /// Applies a finished measurement if the photo and its edits are still what it measured.
-    func finishAuto(_ request: AutoRequest, start: Adjustments, result: AutoResult?) -> Bool {
-        guard let result, let photo = current, photo.url == request.url, photo.adjustments == start else { return false }
-        applyStep(photo, result.applied(to: start), label: request.kind.label)
-        return true
+    @discardableResult
+    func finishAuto(_ request: AutoRequest, start: Adjustments, result: AutoResult?) -> AutoOutcome {
+        guard let photo = current, photo.url == request.url, photo.adjustments == start else { return .stale }
+        guard let result else { return .unreadable }
+        if request.kind == .straighten {
+            guard result.angle != nil else {
+                showHint("No horizon found")
+                return .noHorizon
+            }
+        }
+        let next = result.applied(to: start)
+        guard next != start else {
+            if request.kind == .straighten { showHint("Horizon already level") }
+            return .unchanged
+        }
+        applyStep(photo, next, label: request.kind.label)
+        return .applied
+    }
+
+    /// A short message over the photo (where the editor shows its hints), gone after a moment.
+    private(set) var hint: String?
+    @ObservationIgnored private var hintTimer: DispatchWorkItem?
+
+    func showHint(_ text: String) {
+        hintTimer?.cancel()
+        hint = text
+        let work = DispatchWorkItem { [weak self] in self?.hint = nil }
+        hintTimer = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5, execute: work)
     }
 
     private func applyStep(_ photo: Photo, _ adjustments: Adjustments, label: String) {

@@ -696,6 +696,12 @@ private struct CropPanel: View {
             AdjustSlider(title: "Straighten", value: a.crop.angle, range: -45...45, step: 0.1,
                          format: { String(format: "%.1f°", $0) },
                          onBegin: store.checkpoint, onChange: { v in store.edit { $0.crop.angle = v } })
+            Button { store.runAuto(.straighten) } label: {
+                AutoChipLabel(title: "Auto straighten", busy: store.isAutoRunning && store.autoRun?.kind == .straighten)
+            }
+                .buttonStyle(ChipStyle(selected: false))
+                .disabled(store.current == nil || store.isAutoRunning)
+                .help("Auto straighten: level the horizon (up to 10°), if one is found")
             HStack {
                 Spacer()
                 Button("Done") { store.isCropping = false }

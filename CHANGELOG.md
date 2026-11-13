@@ -21,6 +21,11 @@ All notable changes to Halfstop are listed here. The format follows
   exposure, contrast, highlights, shadows, whites, blacks and vibrance in one undoable step. It
   reads the scene, so a well-exposed photo barely changes and low-key, high-key and night photos
   keep their mood; vibrance holds back on skin tones.
+- ✦ Auto finds faces on the device: it keeps skin from turning green or magenta, leans exposure
+  toward the faces, and holds vibrance back. It also takes Core Image's own auto-enhance suggestions
+  as a second opinion that nudges its values a little, never replacing them.
+- Auto straighten in Crop & straighten: levels a tilted horizon (up to 10°) as one undoable step
+  "Auto straighten", or shows "No horizon found". ✦ Auto never changes the crop or angle.
 - README with install and usage instructions, a user guide and an architecture overview.
 - MIT license, contributing guide, code of conduct, security policy and GitHub issue and pull
   request templates.

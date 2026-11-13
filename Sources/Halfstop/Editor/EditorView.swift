@@ -47,7 +47,10 @@ struct PreviewArea: View {
                 }
             }
         }
-        .onAppear(perform: prepare)
+        .onAppear {
+            prepare()
+            AutoVision.shared.warmUp()
+        }
         .onChange(of: store.currentID) { prepare() }
     }
 
@@ -108,7 +111,8 @@ struct PreviewArea: View {
 
         VStack {
             HStack {
-                if store.pickingWhite { badge("Click something that should be neutral gray · Esc cancels") }
+                if let hint = store.hint { badge(hint) }
+                else if store.pickingWhite { badge("Click something that should be neutral gray · Esc cancels") }
                 else if store.showBefore { badge("Before") }
                 else if clipping { badge("Clipping: red = blown, blue = crushed (J)") }
                 else if let mask = store.activeMask { badge("Editing \(mask.name)") }

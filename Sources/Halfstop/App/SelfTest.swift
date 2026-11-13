@@ -26,6 +26,8 @@ enum SelfTest {
             // Keep test thumbnails out of the real cache.
             ThumbnailDiskCache.directory = dir.appendingPathComponent("thumbcache", isDirectory: true)
             try? FileManager.default.removeItem(at: ThumbnailDiskCache.directory)
+            // Vision's output isn't part of the test: faces and horizons come from the test hook.
+            AutoVision.shared.visionEnabled = false
             let pipelineOK = run(dir: dir)
             var libraryOK = false
             var done = false
@@ -632,6 +634,128 @@ enum SelfTest {
             let second = engine.resultNow(for: AutoRequest(url: url, kind: .auto, adjustments: applied))
             check("auto twice changes nothing more", first != nil && second?.applied(to: applied) == applied && engine.measurementCount == 1,
                   "\(engine.measurementCount) measurements")
+
+            // Faces (installed through the Vision test hook): exposure leans toward them, skin
+            // stays out of green and magenta, and vibrance holds back.
+            let faceBox = CGRect(x: 0.4, y: 0.25, width: 0.2, height: 0.3)   // top-left origin
+            func portrait(_ name: String, skin: (Double, Double, Double)) -> ImageSource? {
+                synthetic(name) { ctx, W, H in
+                    ramp(ctx, H, 0.15, 0.95)
+                    ctx.setFillColor(CGColor(colorSpace: Render.sRGB, components: [skin.0, skin.1, skin.2, 1])!)
+                    // CG's origin is bottom-left.
+                    ctx.fill(CGRect(x: faceBox.minX * W, y: (1 - faceBox.maxY) * H, width: faceBox.width * W, height: faceBox.height * H))
+                }
+            }
+            if let dark = portrait("face-dark.jpg", skin: (0.30, 0.20, 0.15)) {
+                AutoVision.shared.install(faces: [], for: dark.url)
+                let plain = AutoAdjust.auto(source: dark, inputs: Adjustments())
+                AutoVision.shared.install(faces: [faceBox], for: dark.url)
+                let withFace = AutoAdjust.auto(source: dark, inputs: Adjustments())
+                check("a dark face pulls exposure up", withFace.tone!.exposure > plain.tone!.exposure
+                      && withFace.tone!.exposure - plain.tone!.exposure <= 0.5 + 1e-9 && withFace.hints.faces == [faceBox],
+                      "\(describe(plain)) -> \(describe(withFace))")
+                check("faces never raise saturation", withFace.color!.saturation == 0, describe(withFace))
+            }
+            if let green = portrait("face-green.jpg", skin: (0.62, 0.62, 0.42)), let normal = portrait("face-normal.jpg", skin: (0.88, 0.67, 0.55)) {
+                AutoVision.shared.install(faces: [faceBox], for: green.url)
+                AutoVision.shared.install(faces: [faceBox], for: normal.url)
+                let g = AutoAdjust.auto(source: green, inputs: Adjustments())
+                let n = AutoAdjust.auto(source: normal, inputs: Adjustments())
+                func faceHue(_ source: ImageSource, _ r: AutoResult) -> Double {
+                    let a = r.applied(to: Adjustments())
+                    let (cr, cg, cb) = AutoAdjust.average(AutoAdjust.measurementImage(source, a), region: AutoAdjust.faceCore(faceBox))
+                    let lab = Oklab(cr, cg, cb)
+                    return atan2(lab.b, lab.a) * 180 / .pi
+                }
+                let noFace = AutoAdjust.auto(source: green, inputs: Adjustments(), hints: AutoHints())
+                check("a greenish face moves the tint toward magenta, within limits", g.whiteBalance!.tint > noFace.whiteBalance!.tint
+                      && g.whiteBalance!.tint - noFace.whiteBalance!.tint <= AutoAdjust.maxSkinTintShift
+                      && faceHue(green, g) < faceHue(green, noFace),
+                      String(format: "tint %.0f -> %.0f, face hue %.1f -> %.1f", noFace.whiteBalance!.tint, g.whiteBalance!.tint,
+                             faceHue(green, noFace), faceHue(green, g)))
+                let nPlain = AutoAdjust.auto(source: normal, inputs: Adjustments(), hints: AutoHints())
+                check("a natural skin tone leaves the tint alone", n.whiteBalance == nPlain.whiteBalance, "\(describe(nPlain)) vs \(describe(n))")
+            }
+            if let fine = ImageSource(url: dir.appendingPathComponent("well-exposed.jpg"), maxPixelSize: nil), let st = AutoAdjust.auto(source: fine, inputs: Adjustments()).stats {
+                let ev = AutoAdjust.faceExposure(0, faceLuminance: 0.5, faceArea: 0.1, stats: st, scene: .normal)
+                let dim = AutoAdjust.faceExposure(0, faceLuminance: 0.15, faceArea: 0.3, stats: st, scene: .normal)
+                let night = AutoAdjust.faceExposure(0, faceLuminance: 0.15, faceArea: 0.3, stats: st, scene: .night)
+                let lowKey = AutoAdjust.faceExposure(0, faceLuminance: 0.15, faceArea: 0.3, stats: st, scene: .lowKey)
+                check("face exposure: alone in the band, capped outside it, off at night", ev == 0 && dim > 0 && dim <= 0.5
+                      && night == 0 && lowKey <= 0.3, "\(ev) \(dim) \(night) \(lowKey)")
+            }
+
+            // Second opinion: a nudge, never a replacement.
+            do {
+                let t = AutoAdjust.Tone(exposure: 0.2, contrast: 10, highlights: -10, shadows: 10)
+                let c = AutoAdjust.ColorBoost(vibrance: 10, saturation: 2)
+                let o = AutoAdjust.SecondOpinion(exposure: 1.5, vibrance: 60, shadows: 60, highlights: -60)
+                let (nt, nc) = AutoAdjust.nudged(t, c, by: o, scene: .normal, faces: false)
+                check("second opinion nudges by small capped steps", abs(nt.exposure - 0.35) < 1e-9 && nt.shadows == 18 && nt.highlights == -18
+                      && nc.vibrance == 15 && nt.contrast == 10 && nc.saturation == 2, "\(nt) \(nc)")
+                let (wt, wc) = AutoAdjust.nudged(t, c, by: o, scene: .wellExposed, faces: false)
+                let (ft, fc) = AutoAdjust.nudged(t, c, by: o, scene: .night, faces: true)
+                check("second opinion leaves well-exposed photos, night tone and faces' vibrance alone", wt == t && wc == c
+                      && ft.exposure == t.exposure && ft.shadows == t.shadows && ft.highlights == t.highlights && fc.vibrance <= c.vibrance, "\(ft) \(fc)")
+                check("tone curve midpoint reads as EV", abs((AutoAdjust.curveValue([CGPoint(x: 0, y: 0), CGPoint(x: 0.4, y: 0.5), CGPoint(x: 1, y: 1)], at: 0.5) ?? 0) - 7.0 / 12) < 1e-9, "")
+                let opinion = sceneAuto.opinion
+                check("second opinion is read from Core Image", opinion != nil, "\(String(describing: opinion))")
+            }
+
+            // Auto straighten: only a confident, modest tilt; sets only the angle; ignores the crop.
+            check("straighten trusts confident, modest horizons only",
+                  AutoAdjust.straightenAngle(.init(angle: 4.87, confidence: 0.9)) == 4.9
+                  && AutoAdjust.straightenAngle(.init(angle: -10, confidence: 0.6)) == -10
+                  && AutoAdjust.straightenAngle(.init(angle: 12, confidence: 1)) == nil
+                  && AutoAdjust.straightenAngle(.init(angle: 3, confidence: 0.3)) == nil
+                  && AutoAdjust.straightenAngle(nil) == nil, "")
+            do {
+                let engine = AutoEngine()
+                AutoVision.shared.install(horizon: .init(angle: -3.24, confidence: 0.95), for: url)
+                var cropped = Adjustments(); cropped.crop.rect = NormRect(x: 0.1, y: 0.1, width: 0.5, height: 0.5); cropped.exposure = 1
+                let level = engine.resultNow(for: AutoRequest(url: url, kind: .straighten, adjustments: cropped))
+                let again = engine.resultNow(for: AutoRequest(url: url, kind: .straighten, adjustments: Adjustments()))
+                var expect = cropped; expect.crop.angle = -3.2
+                check("auto straighten sets only the angle", level?.angle == -3.2 && level?.applied(to: cropped) == expect
+                      && again == level && engine.measurementCount == 1, "\(String(describing: level))")
+                let auto = engine.resultNow(for: AutoRequest(url: url, kind: .auto, adjustments: cropped))
+                check("✦ Auto never straightens", auto?.angle == nil && auto?.applied(to: cropped).crop == cropped.crop, "")
+                AutoVision.shared.install(horizon: nil, for: url)
+                engine.clear()
+                check("no horizon, no angle", engine.resultNow(for: AutoRequest(url: url, kind: .straighten, adjustments: Adjustments()))?.angle == nil, "")
+                AutoVision.shared.removeOverrides(for: url)
+            }
+
+            // The real horizon detector, when it finds the synthetic horizon: the sign must level it.
+            // (Skipped, not failed, when Vision finds nothing: the test mustn't depend on the model.)
+            if let tilted = synthetic("tilted.jpg", { ctx, W, H in
+                ctx.setFillColor(color(0.58, 0.45, 0.95)); ctx.fill(CGRect(x: 0, y: 0, width: W, height: H))
+                ctx.setFillColor(color(0.3, 0.5, 0.35))
+                ctx.beginPath(); ctx.move(to: .zero); ctx.addLine(to: CGPoint(x: 0, y: H * 0.4))
+                ctx.addLine(to: CGPoint(x: W, y: H * 0.4 + tan(5 * .pi / 180) * W)); ctx.addLine(to: CGPoint(x: W, y: 0)); ctx.fillPath()
+            }) {
+                AutoVision.shared.visionEnabled = true
+                let found = AutoAdjust.straighten(source: tilted)
+                if let angle = found.angle {
+                    // Where the ground starts (first green-over-blue row from the top) near each side.
+                    func edgeRows(_ a: Adjustments) -> (Int, Int)? {
+                        guard let bm = AutoAdjust.readback(tilted.developed(a, geometry: .full, renderScale: 1)) else { return nil }
+                        func row(_ x: Int) -> Int {
+                            for y in 0..<bm.height { let i = (y * bm.width + x) * 4; if bm.pixels[i + 1] > bm.pixels[i + 2] { return y } }
+                            return bm.height
+                        }
+                        return (row(bm.width / 5), row(bm.width * 4 / 5))
+                    }
+                    var a = Adjustments(); a.crop.angle = angle
+                    let before = edgeRows(Adjustments()), after = edgeRows(a)
+                    check("auto straighten levels a horizon rising to the right", angle > 3 && angle < 7
+                          && before.map { $0.0 - $0.1 > 30 } == true && after.map { abs($0.0 - $0.1) <= 4 } == true,
+                          String(format: "angle %.1f, ", angle) + "edge rows \(String(describing: before)) -> \(String(describing: after))")
+                } else {
+                    print("SKIP  auto straighten sign check (Vision found no horizon: \(String(describing: found.horizon)))")
+                }
+                AutoVision.shared.visionEnabled = false
+            }
         }
 
         // Export keeps metadata (optionally without location), and parallel exports never share a name.
@@ -851,6 +975,13 @@ enum Snapshot {
             await wait(0.8)
             shot("3c-after-auto")
             store.undo()
+            // The crop panel with Auto straighten (the samples have no horizon: its hint shows).
+            store.isCropping = true
+            await wait(0.8)
+            _ = await store.runAuto(.straighten)?.value
+            await wait(0.3)
+            shot("3d-crop-auto-straighten")
+            store.isCropping = false
             store.panelTab = tab
             await wait(0.5)
             store.addMask(.brush)
@@ -1132,6 +1263,26 @@ enum LibraryTest {
             check("auto result is dropped after switching photos", !movedApplied && other.history.count == otherSteps
                   && other.adjustments == otherBefore && photo.adjustments.exposure == before.exposure)
             store.select(photo)
+
+            // Auto straighten: one step that sets only the angle; without a horizon, a hint and no step.
+            store.resetAdjustments()
+            store.commitPending(photo)
+            AutoEngine.shared.clear()
+            AutoVision.shared.install(horizon: .init(angle: 2.54, confidence: 0.9), for: photo.url)
+            let flat = photo.adjustments, flatSteps = photo.history.count
+            let leveled = await store.performAuto(.straighten)?.value
+            var expect = flat; expect.crop.angle = 2.5
+            check("auto straighten is one step that sets only the angle", leveled == .applied && photo.adjustments == expect
+                  && photo.history.count == flatSteps + 1 && photo.history.last?.label == "Auto straighten",
+                  "\(String(describing: leveled)) angle \(photo.adjustments.crop.angle)")
+            store.undo()
+            AutoEngine.shared.clear()
+            AutoVision.shared.install(horizon: nil, for: photo.url)
+            let none = await store.performAuto(.straighten)?.value
+            check("no horizon: a hint and no step", none == .noHorizon && store.hint == "No horizon found"
+                  && photo.adjustments == flat && photo.history.count == flatSteps + 1, "\(String(describing: none))")
+            AutoVision.shared.removeOverrides(for: photo.url)
+            AutoEngine.shared.clear()
             store.resetAdjustments()
             store.mode = .library
         }

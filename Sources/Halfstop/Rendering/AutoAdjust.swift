@@ -305,11 +305,20 @@ enum AutoAdjust {
     /// White balance, then tone, whites/blacks and vibrance measured with that white balance.
     /// Everything starts from defaults (only the crop is kept), so the result doesn't depend on the
     /// current sliders and pressing Auto again changes nothing.
-    static func auto(source: ImageSource, inputs: Adjustments, hints: AutoHints = AutoHints()) -> AutoResult {
+    ///
+    /// Faces (found with Vision on the as-shot measurement render, unless `hints` already gives
+    /// them) keep skin from going green or magenta, pull exposure toward the faces, and hold
+    /// vibrance back. Core Image's own auto-enhance suggestions are then read as a second opinion
+    /// that nudges, but never replaces, these values.
+    static func auto(source: ImageSource, inputs: Adjustments, hints given: AutoHints? = nil) -> AutoResult {
         var base = Adjustments()
         base.crop = inputs.crop
         var wb = WhiteBalance(temperature: 0, tint: 0)
+        var hints = given ?? AutoHints()
+        var asShotMean: SIMD3<Double>?
         if let asShot = readback(measurementImage(source, base)) {
+            asShotMean = meanLinear(asShot)
+            if given == nil { hints.faces = AutoVision.shared.faces(in: asShot, url: source.url) }
             if let weights = neutralWeights(asShot) {
                 wb = whiteBalance(source: source, adjustments: base, region: nil, weights: weights)
             } else {
@@ -319,15 +328,51 @@ enum AutoAdjust {
                 func half(_ v: Double) -> Double { (v * 0.5).clamped(to: -20...20).rounded() + 0 }
                 wb = WhiteBalance(temperature: half(g.temperature), tint: half(g.tint))
             }
+            if let mask = faceMask(hints.faces, like: asShot) {
+                var balanced = base
+                balanced.temperature = wb.temperature
+                balanced.tint = wb.tint
+                wb.tint = skinTint(source: source, adjustments: balanced, weights: weightImage(mask, like: asShot))
+            }
         }
         var balanced = base
         balanced.temperature = wb.temperature
         balanced.tint = wb.tint
-        guard let stats = measure(measurementImage(source, balanced)) else { return AutoResult(whiteBalance: wb) }
+        guard let bm = readback(measurementImage(source, balanced)) else {
+            return AutoResult(whiteBalance: wb, hints: hints, asShotMean: asShotMean)
+        }
+        let stats = ImageStats(bm)
         let scene = scene(stats)
-        let tone = tone(stats, scene: scene)
+        var tone = tone(stats, scene: scene)
+        if let face = faceLuminance(bm, faces: hints.faces) {
+            tone.exposure = faceExposure(tone.exposure, faceLuminance: face.luminance, faceArea: face.area, stats: stats, scene: scene)
+        }
+        var color = color(stats, hints: hints)
+        let opinion = secondOpinion(bm)
+        if let opinion {
+            (tone, color) = nudged(tone, color, by: opinion, scene: scene, faces: !hints.faces.isEmpty)
+        }
         return AutoResult(whiteBalance: wb, tone: tone, levels: levels(stats, tone: tone, scene: scene),
-                          color: color(stats, hints: hints), scene: scene, stats: stats, hints: hints)
+                          color: color, scene: scene, stats: stats, hints: hints, opinion: opinion, asShotMean: asShotMean)
+    }
+
+    /// Mean linear RGB of a render, from every other pixel each way.
+    static func meanLinear(_ bm: Bitmap) -> SIMD3<Double> {
+        var toLinear = [Double](repeating: 0, count: 256)
+        for i in 0..<256 { toLinear[i] = linear(Double(i) / 255) }
+        var sum = SIMD3<Double>(0, 0, 0)
+        var n = 0
+        bm.pixels.withUnsafeBufferPointer { px in
+            for y in stride(from: 0, to: bm.height, by: 2) {
+                var i = y * bm.width * 4
+                for _ in stride(from: 0, to: bm.width, by: 2) {
+                    sum += SIMD3(toLinear[Int(px[i])], toLinear[Int(px[i + 1])], toLinear[Int(px[i + 2])])
+                    n += 1
+                    i += 8
+                }
+            }
+        }
+        return n > 0 ? sum / Double(n) : sum
     }
 
     /// Share of the well-exposed pixels auto white balance treats as neutral candidates.
@@ -436,8 +481,9 @@ enum AutoAdjust {
 
 /// Extra knowledge about the photo for `AutoAdjust.auto`. Empty means none.
 struct AutoHints: Equatable, Sendable {
-    /// Face rectangles, normalized with a top-left origin in the cropped photo. With faces, vibrance
-    /// is held back and saturation never raised. (Nothing detects faces yet; a detector fills this.)
+    /// Face rectangles, normalized with a top-left origin in the cropped photo, largest first.
+    /// With faces, white balance keeps skin tones natural, exposure leans toward the faces,
+    /// vibrance is held back and saturation never raised. Filled by `AutoVision`.
     var faces: [CGRect] = []
 }
 

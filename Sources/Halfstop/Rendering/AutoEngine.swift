@@ -9,6 +9,8 @@ enum AutoKind: Hashable, Sendable {
     case whiteBalance
     /// White balance from a clicked spot (normalized, top-left origin, in the cropped photo).
     case pickedWhite(NormRect)
+    /// Level the horizon (sets only the Straighten angle). Not part of ✦ Auto: geometry changes surprise people.
+    case straighten
 
     /// The history step it makes.
     var label: String {
@@ -17,6 +19,7 @@ enum AutoKind: Hashable, Sendable {
         case .tone: "Auto tone"
         case .whiteBalance: "Auto white balance"
         case .pickedWhite: "White balance (picked)"
+        case .straighten: "Auto straighten"
         }
     }
 }
@@ -36,8 +39,17 @@ struct AutoResult: Equatable, Sendable {
     var stats: ImageStats?
     /// What else was known about the photo (faces…).
     var hints = AutoHints()
+    /// Core Image's auto-enhance suggestions ✦ Auto was nudged toward.
+    var opinion: AutoAdjust.SecondOpinion?
+    /// Mean linear RGB of the as-shot measurement render (before auto white balance).
+    var asShotMean: SIMD3<Double>?
+    /// Auto straighten's decision: the Straighten angle, or nil to leave it.
+    var angle: Double?
+    /// The horizon Auto straighten found (also when it was too uncertain or steep to use).
+    var horizon: AutoVision.Horizon?
 
-    /// `a` with this result's sliders set; everything else (curve, masks, crop…) stays.
+    /// `a` with this result's sliders set; everything else (curve, masks, crop…) stays,
+    /// except the straighten angle when `angle` is set.
     func applied(to a: Adjustments) -> Adjustments {
         var out = a
         if let wb = whiteBalance { out.temperature = wb.temperature; out.tint = wb.tint }
@@ -46,6 +58,7 @@ struct AutoResult: Equatable, Sendable {
         }
         if let l = levels { out.whites = l.whites; out.blacks = l.blacks }
         if let c = color { out.vibrance = c.vibrance; out.saturation = c.saturation }
+        if let angle { out.crop.angle = angle.clamped(to: EditLimits.straighten) }
         return out
     }
 }
@@ -62,10 +75,12 @@ struct AutoRequest: Hashable, Sendable {
         self.url = url
         self.kind = kind
         var inputs = Adjustments()
-        inputs.crop = a.crop
+        if kind != .straighten { inputs.crop = a.crop }
         switch kind {
         case .auto:
             break   // starts from defaults: only the crop matters
+        case .straighten:
+            break   // the uncropped, undeveloped photo: nothing of the edits matters
         case .tone:
             inputs.temperature = a.temperature
             inputs.tint = a.tint
@@ -179,6 +194,8 @@ extension AutoAdjust {
         case .pickedWhite(let r):
             let region = CGRect(x: r.x, y: r.y, width: r.width, height: r.height)
             return AutoResult(whiteBalance: whiteBalance(source: source, adjustments: inputs, region: region))
+        case .straighten:
+            return straighten(source: source)
         case .tone:
             guard let stats = measure(measurementImage(source, inputs)) else {
                 return AutoResult(tone: Tone(exposure: 0, contrast: 0, highlights: 0, shadows: 0))
@@ -186,5 +203,30 @@ extension AutoAdjust {
             let scene = scene(stats)
             return AutoResult(tone: tone(stats, scene: scene), scene: scene, stats: stats)
         }
+    }
+}
+
+/// What the auto measurements know about a photo: tone and color statistics, the scene, faces
+/// and the horizon. For showing or reporting (a tool layer's "get photo"), not for editing.
+struct PhotoInsight: Equatable, Sendable {
+    /// Measured after ✦ Auto's white balance, at exposure 0, on the cropped photo.
+    var stats: ImageStats?
+    var scene: AutoAdjust.Scene?
+    /// Normalized, top-left origin, in the cropped photo; largest first.
+    var faces: [CGRect]
+    /// nil when no horizon was found.
+    var horizon: AutoVision.Horizon?
+    /// What Auto straighten would set the Straighten angle to; nil when it would do nothing.
+    var straightenAngle: Double?
+}
+
+extension AutoEngine {
+    /// Everything `PhotoInsight` holds, measured off the main thread (and cached: it's the same
+    /// work ✦ Auto and Auto straighten do). nil if the photo can't be read.
+    func insight(url: URL, adjustments: Adjustments) async -> PhotoInsight? {
+        guard let auto = await result(for: AutoRequest(url: url, kind: .auto, adjustments: adjustments)) else { return nil }
+        let level = await result(for: AutoRequest(url: url, kind: .straighten, adjustments: adjustments))
+        return PhotoInsight(stats: auto.stats, scene: auto.scene, faces: auto.hints.faces,
+                            horizon: level?.horizon, straightenAngle: level?.angle)
     }
 }

@@ -95,7 +95,7 @@ enum Bench {
             body()   // warm up
             var t: [Double] = []
             for _ in 0..<runs { let t0 = CACurrentMediaTime(); body(); t.append((CACurrentMediaTime() - t0) * 1000) }
-            print("  " + name.padding(toLength: 34, withPad: " ", startingAt: 0) + String(format: "%7.2f ms", median(t)))
+            print("  " + name.padding(toLength: 38, withPad: " ", startingAt: 0) + String(format: "%7.2f ms", median(t)))
         }
         let engine = AutoEngine.shared
         func request(_ kind: AutoKind) -> AutoRequest { AutoRequest(url: url, kind: kind, adjustments: Adjustments()) }
@@ -105,8 +105,14 @@ enum Bench {
         _ = engine.resultNow(for: request(.tone))
         print("  " + "auto tone, first (incl. decode)".padding(toLength: 34, withPad: " ", startingAt: 0)
               + String(format: "%7.2f ms", (CACurrentMediaTime() - t0) * 1000))
+        // The first face request of a session loads Vision's model (the editor warms it up on open).
+        engine.clear()
+        let tv = CACurrentMediaTime()
+        _ = engine.resultNow(for: request(.auto))
+        print("  " + "auto ✦ Auto, first Vision use".padding(toLength: 34, withPad: " ", startingAt: 0)
+              + String(format: "%7.2f ms", (CACurrentMediaTime() - tv) * 1000))
         // Decoded, nothing cached: what a click costs on the photo being edited.
-        for (kind, name) in [(AutoKind.whiteBalance, "WB"), (.tone, "tone"), (.auto, "✦ Auto")] {
+        for (kind, name) in [(AutoKind.whiteBalance, "WB"), (.tone, "tone"), (.auto, "✦ Auto"), (.straighten, "straighten")] {
             time("auto \(name) (background, uncached)") { engine.clear(); _ = engine.resultNow(for: request(kind)) }
         }
         time("auto ✦ Auto (cached)") { _ = engine.resultNow(for: request(.auto)) }
@@ -116,6 +122,11 @@ enum Bench {
             print("  ✦ Auto on this photo: " + (r.scene?.rawValue ?? "?") + String(format:
                 ", temp %.0f tint %.0f, exposure %.2f, contrast %.0f, highlights %.0f, shadows %.0f, whites %.0f, blacks %.0f, vibrance %.0f, saturation %.0f",
                 a.temperature, a.tint, a.exposure, a.contrast, a.highlights, a.shadows, a.whites, a.blacks, a.vibrance, a.saturation))
+            print("    faces \(r.hints.faces.count), second opinion \(r.opinion.map { String(describing: $0) } ?? "none")")
+        }
+        if let s = engine.resultNow(for: request(.straighten)) {
+            print("  Auto straighten on this photo: " + (s.horizon.map { String(format: "horizon %.2f° (confidence %.2f)", $0.angle, $0.confidence) } ?? "no horizon")
+                  + (s.angle.map { String(format: ", sets %.1f°", $0) } ?? ", leaves the angle"))
         }
     }
 
