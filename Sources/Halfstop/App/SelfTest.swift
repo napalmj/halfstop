@@ -16,6 +16,22 @@ enum SelfTest {
             makeSamples(in: URL(fileURLWithPath: args[i + 1]))
             exit(0)
         }
+        if let i = args.firstIndex(of: "--serve-control"), i + 1 < args.count {
+            let dir = URL(fileURLWithPath: args[i + 1])
+            guard TestOutput.claim(dir) else {
+                print("--serve-control: \(dir.path) isn't empty and wasn't made by a test run. Choose a new or empty folder.")
+                exit(2)
+            }
+            ThumbnailDiskCache.directory = dir.appendingPathComponent("thumbcache", isDirectory: true)
+            func option(_ name: String) -> Int? { args.firstIndex(of: name).flatMap { $0 + 1 < args.count ? Int(args[$0 + 1]) : nil } }
+            var done = false
+            Task { @MainActor in
+                await ControlDemo.run(dir: dir, port: option("--port") ?? LocalControl.defaultPort, seconds: option("--seconds") ?? 120)
+                done = true
+            }
+            while !done { RunLoop.main.run(until: Date().addingTimeInterval(0.05)) }
+            exit(0)
+        }
         if let i = args.firstIndex(of: "--selftest"), i + 1 < args.count {
             let dir = URL(fileURLWithPath: args[i + 1])
             // The test deletes and recreates folders inside `dir`: never let it loose on one it didn't make.
@@ -1147,16 +1163,31 @@ enum Snapshot {
                 print("snapshot 11-help")
             }
             help.close()
-            let settings = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 440, height: 160), styleMask: [.titled],
+            let settings = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: 560), styleMask: [.titled],
                                     backing: .buffered, defer: false)
             settings.appearance = NSAppearance(named: .darkAqua)
-            settings.contentView = NSHostingView(rootView: SettingsView().environment(store).preferredColorScheme(.dark))
+            // A throwaway control (in-memory token, nothing remembered), shown off, then on.
+            let control = LocalControl(runner: StoreToolRunner(store: store), tokenStore: MemoryTokenStore(), defaults: nil)
+            settings.contentView = NSHostingView(rootView: SettingsView().environment(store).environment(control)
+                .preferredColorScheme(.dark))
             settings.orderFront(nil)
+            func shotSettings(_ name: String) {
+                if let view = settings.contentView, let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
+                    view.cacheDisplay(in: view.bounds, to: rep)
+                    try? rep.representation(using: .png, properties: [:])?.write(to: dir.appendingPathComponent(name + ".png"))
+                    print("snapshot \(name)")
+                }
+            }
             await wait(1)
-            if let view = settings.contentView, let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
-                view.cacheDisplay(in: view.bounds, to: rep)
-                try? rep.representation(using: .png, properties: [:])?.write(to: dir.appendingPathComponent("12-settings.png"))
-                print("snapshot 12-settings")
+            shotSettings("12-settings")
+            if let port = LibraryTest.freeLoopbackPort() {
+                control.port = port
+                control.enabled = true
+                await wait(1.5)
+                settings.setContentSize(settings.contentView?.fittingSize ?? settings.frame.size)
+                await wait(0.5)
+                shotSettings("12b-settings-ai-control-on")
+                control.enabled = false
             }
             settings.close()
             store.flushSaves()
@@ -1511,6 +1542,7 @@ enum LibraryTest {
         check("sort by rating puts the best first", store.visiblePhotos.first?.rating == 5, "")
         store.sortOrder = savedSort; store.sortDescending = savedDesc
 
+        await controlChecks(store: store, check: check)
         await sidecarChecks(dir: dir.appendingPathComponent("sidecars"), check: check)
         await scaleChecks(dir: dir.appendingPathComponent("scale"), check: check)
         toleranceChecks(dir: dir.appendingPathComponent("tolerance"), check: check)

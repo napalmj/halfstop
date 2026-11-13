@@ -7,6 +7,7 @@ struct HalfstopApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     @State private var store: LibraryStore
     @State private var renderer = PreviewRenderer()
+    @State private var localControl: LocalControl
 
     init() {
         SelfTest.runIfRequested()
@@ -16,6 +17,9 @@ struct HalfstopApp: App {
         let store = LibraryStore(catalogURL: Snapshot.catalogOverride ?? Catalog.defaultURL)
         LibraryStore.appStore = store
         _store = State(initialValue: store)
+        // Off unless the user switched it on in Settings. Snapshots never start it.
+        _localControl = State(initialValue: LocalControl(runner: StoreToolRunner(store: store),
+                                                         defaults: Snapshot.outputDir == nil ? .standard : nil))
     }
 
     var body: some Scene {
@@ -33,6 +37,7 @@ struct HalfstopApp: App {
         Settings {
             SettingsView()
                 .environment(store)
+                .environment(localControl)
                 .preferredColorScheme(.dark)
         }
 

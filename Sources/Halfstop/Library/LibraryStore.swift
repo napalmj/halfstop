@@ -1085,6 +1085,17 @@ final class LibraryStore {
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.5, execute: work)
     }
 
+    /// Sets the open photo's edits as one labelled history step (local AI control).
+    /// Returns false, adding no step, when there's no photo or nothing would change.
+    @discardableResult
+    func applyToCurrent(_ adjustments: Adjustments, label: String) -> Bool {
+        guard let photo = current else { return false }
+        commitPending(photo)
+        guard adjustments != photo.adjustments else { return false }
+        applyStep(photo, adjustments, label: label)
+        return true
+    }
+
     private func applyStep(_ photo: Photo, _ adjustments: Adjustments, label: String) {
         commitPending(photo)
         photo.adjustments = adjustments

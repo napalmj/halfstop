@@ -13,6 +13,7 @@ Image / Metal pipeline.
 | `Library/` | `LibraryStore` (the central observable state: selection, filters, edits, saving, undo, trash), the import scan and options (`Importer.swift`, `ImportSheet.swift`), the sidebar, and the library grid and export UI |
 | `Editor/` | The editing screen: `EditorView` and the preview area, `AdjustPanel` (sliders and mask controls), `PreviewRenderer` (Metal preview view), `CropOverlay` and `HistoryPanel` |
 | `Rendering/` | The develop pipeline: `ImageSource` (decodes RAW and raster files, builds the Core Image filter graph), `ColorLUT` (bakes tone and color adjustments into one 3D lookup table), `MaskRenderer` (turns mask descriptions into grayscale images), `RenderServices` (thumbnails, histogram, export), and `AutoAdjust` / `AutoEngine` (one-click auto adjustments, measured on a small decode of the photo off the main thread and cached), with `AutoVision` (faces and horizon, via Vision, with a test hook) and `AutoRefine` (face-aware exposure and skin tint, the auto-enhance second opinion, Auto straighten) and `StyleLearner` ("Learn from my edits": per-photo features and a nearest-neighbour model of what the user changes over ✦ Auto) |
+| `Control/` | Local AI control, the opt-in MCP server (off by default): `ControlServer` (a Network.framework listener bound to 127.0.0.1, connection and rate limits, the `LocalControl` setting and the Keychain token store), `ControlHTTP` (a strict one-request-per-connection HTTP/1.1 parser and the Host / Origin / bearer-token gate), `ControlProtocol` (MCP JSON-RPC, one JSON reply per request), `ControlTools` (the tools, acting on the photo open in the editor) and `JSONValue` |
 | `Components/` | Reusable views: adjustment slider and `Theme`, curve editor, histogram, thumbnails |
 
 ## How a frame is produced
@@ -42,6 +43,9 @@ Halfstop never writes to the photo files themselves.
   changes the folder's stored path. An unreadable catalog is copied aside rather than
   overwritten.
 - **Presets:** `~/Library/Application Support/Halfstop/presets.json`.
+- **Local AI control:** the on/off switch and port are in the app's user defaults
+  (`localControlEnabled`, `localControlPort`); the token is a generic password in the login
+  keychain (service `dev.halfstop.app.local-ai-control`).
 - Folder watching ignores `.halfstop/`, so saving edits does not trigger rescans.
 
 ## Testing
@@ -56,6 +60,34 @@ build/Halfstop.app/Contents/MacOS/Halfstop --selftest /tmp/halfstop-test
 `--selftest` runs pipeline assertions (`SelfTest.run`) and library tests (`LibraryTest`) and prints
 `EVERYTHING PASSED` with exit code 0 on success. When you change the develop pipeline or the library
 model, add a case there. `--bench` measures per-frame cost and is useful for performance work.
+`--serve-control <dir> [--port N] [--seconds N]` runs the local AI control server on a throwaway
+library of sample photos with a one-off token, for trying an MCP client or `curl` against it without
+touching your library, settings or Keychain.
+
+## Local AI control (MCP)
+
+An opt-in MCP server so an AI app on the same Mac can edit the open photo. Halfstop itself makes no
+outbound requests and holds no API key: the user's own client connects in.
+
+- **Transport:** MCP Streamable HTTP at `http://127.0.0.1:<port>/mcp` (default port 47615), POST only,
+  one JSON reply per request, no event streams or sessions. It follows revision 2026-07-28
+  (stateless: `_meta` version, `MCP-Protocol-Version` / `Mcp-Method` / `Mcp-Name` headers checked
+  against the body, `server/discover`) and also answers the handshake revisions 2025-03-26 to
+  2025-11-25 (`initialize`, `notifications/initialized`, `ping`), which most clients still use.
+- **Security:** the listener is bound to 127.0.0.1 and the loopback interface only. Every request
+  needs `Authorization: Bearer <token>` (256 random bits, compared in constant time), a `Host` of
+  `127.0.0.1:<port>` or `localhost:<port>`, and no `Origin` other than a localhost page (DNS
+  rebinding). Heads over 16 KB, bodies over 1 MB, chunked bodies, duplicate security headers and
+  JSON nested deeper than 32 levels are refused; a request must arrive within 10 s; at most 16
+  connections and about 20 requests a second. The checks run before the body is read.
+- **Tools** run on the main actor against `LibraryStore.current`, only in the editor, and every
+  change is one history step (`applyToCurrent`, `performAuto`, `undo`). Only the 13 global sliders in
+  `ControlTools.fields` can be set; values are clamped to `EditLimits`. Previews are encoded off the
+  main thread and stripped of metadata.
+- **No entitlement is needed:** the app isn't sandboxed (ad-hoc signed, no entitlements). A sandboxed
+  build would need `com.apple.security.network.server`.
+- Keychain reads and writes happen off the main thread: macOS may ask once whether a rebuilt
+  (re-signed) Halfstop may use its token.
 
 ## Keeping things in step
 
