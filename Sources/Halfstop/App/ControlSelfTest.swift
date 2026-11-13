@@ -1,6 +1,7 @@
 import Foundation
 import ImageIO
 import Darwin
+import Security
 
 // MARK: - Local AI control (MCP)
 
@@ -324,6 +325,28 @@ extension LibraryTest {
         let (again, _) = await post(initialize, token: control.token ?? "")
         check("control: restarts on the same port at once", control.runningPort == port && again == 200, "\(control.status) \(again)")
         control.enabled = false
+        // A Regenerate that can't save its new token still revokes the old one: the server stops
+        // and says why, rather than keep accepting a token the user wanted gone. Retrying works.
+        let flakyStore = FlakyTokenStore()
+        let flaky = LocalControl(runner: StoreToolRunner(store: store), tokenStore: flakyStore, defaults: nil)
+        flaky.port = port
+        flaky.enabled = true
+        for _ in 0..<60 where flaky.runningPort == nil { try? await Task.sleep(for: .milliseconds(50)) }
+        let flakyOld = flaky.token ?? ""
+        flakyStore.failSaves = true
+        flaky.regenerateToken()
+        for _ in 0..<60 where flaky.token != nil { try? await Task.sleep(for: .milliseconds(50)) }
+        var failedStatus = false
+        if case .failed = flaky.status { failedStatus = true }
+        let (revoked, _) = await post(initialize, token: flakyOld)
+        check("control: a failed regenerate revokes the old token and stops", !flakyOld.isEmpty && failedStatus && flaky.token == nil
+              && revoked != 200 && !flaky.tokenBox.matches(flakyOld) && !canConnect("127.0.0.1", port), "\(flaky.status) \(revoked)")
+        flakyStore.failSaves = false
+        flaky.regenerateToken()
+        for _ in 0..<60 where flaky.runningPort == nil { try? await Task.sleep(for: .milliseconds(50)) }
+        let (retried, _) = await post(initialize, token: flaky.token ?? "")
+        check("control: regenerating again starts it with the new token", retried == 200 && flaky.token != flakyOld, "\(flaky.status) \(retried)")
+        flaky.enabled = false
         session.invalidateAndCancel()
     }
 
@@ -396,6 +419,24 @@ extension LibraryTest {
 
 private extension Result where Success == (HTTPHead, Int), Failure == HTTPResponse {
     var failureStatus: Int? { if case .failure(let r) = self { return r.status }; return nil }
+}
+
+/// A token store whose saves can be made to fail, like a Keychain that refuses the write.
+private final class FlakyTokenStore: ControlTokenStore, @unchecked Sendable {
+    private let lock = NSLock()
+    private var token: String?
+    private var _failSaves = false
+    var failSaves: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return _failSaves }
+        set { lock.lock(); _failSaves = newValue; lock.unlock() }
+    }
+    func load() throws -> String? { lock.lock(); defer { lock.unlock() }; return token }
+    func save(_ t: String) throws {
+        lock.lock(); defer { lock.unlock() }
+        if _failSaves { throw KeychainError(status: errSecWrPerm) }
+        token = t
+    }
+    func delete() { lock.lock(); token = nil; lock.unlock() }
 }
 
 /// `--serve-control <dir> [--port N] [--seconds N]`: the local AI control server on a throwaway

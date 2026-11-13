@@ -48,7 +48,8 @@ struct StyleOffset: Equatable, Sendable {
 
 /// What a photo looks like, as a dozen numbers of similar scale, from ✦ Auto's measurement.
 enum StyleFeatures {
-    /// Bump when the features or ✦ Auto's decisions change: older samples are measured again.
+    /// Bump when the features or ✦ Auto's decisions change: older samples stop counting, and each
+    /// photo is measured again the next time it's edited (nothing rescans the catalog).
     static let version = 1
     static let count = 12
 
@@ -124,6 +125,13 @@ struct StyleModel {
 
     var count: Int { entries.count }
     var isActive: Bool { entries.count >= Self.minimumSamples }
+
+    /// Whether `predict` can act for this photo: enough edited photos besides itself (its own
+    /// entry never counts toward its prediction).
+    func isActive(for key: String?) -> Bool {
+        let own = key.map { entries[$0] != nil } ?? false
+        return entries.count - (own ? 1 : 0) >= Self.minimumSamples
+    }
 
     /// Records (or replaces) a photo: its sample and its current sliders. Removed when it isn't
     /// edited by hand or the sample doesn't fit.

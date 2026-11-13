@@ -439,8 +439,16 @@ final class LocalControl {
                 case .success(let t):
                     self.setToken(t)
                     // A server that couldn't start for want of a token can start now.
-                    if self.enabled, self.server == nil { self.apply() }
+                    if self.enabled, self.server == nil { self.apply() } else if !self.enabled { self.status = .off }
                 case .failure(let e):
+                    // The user asked for the old token to stop working (it may have leaked), so it
+                    // stops now even though no new one could be saved: the server stops with it,
+                    // and the status shows why (Regenerate stays available to try again).
+                    self.generation += 1
+                    self.server?.stop()
+                    self.server = nil
+                    self.token = nil
+                    self.tokenBox.set(nil)
                     self.status = .failed(e.message)
                 }
             }

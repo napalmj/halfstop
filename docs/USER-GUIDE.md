@@ -81,7 +81,8 @@ ones, within modest limits, and its tooltip reads "Auto (adapted to your edits)"
 
 - It learns on this Mac, from your own edits only. Nothing is uploaded, and there is no training data
   from anyone else. What it learned is kept in the library index (`catalog.json`).
-- Photos count once you edit them (any history step, undo or redo). Photos edited before this
+- Photos count once you edit them (any history step, undo or redo). Pasting settings or applying a
+  preset to many photos at once only measures the one that's open. Photos edited before this
   feature existed aren't measured until you change them again.
 - Only ✦ Auto adapts; Tone and WB stay as they are. Turning the setting off stops collecting and
   using it immediately, and keeps what was learned in case you turn it back on.

@@ -30,8 +30,7 @@ extension AutoAdjust {
     /// faces cover. nil without faces.
     static func faceLuminance(_ bm: Bitmap, faces: [CGRect]) -> (luminance: Double, area: Double)? {
         guard let mask = faceMask(faces, like: bm) else { return nil }
-        var toLinear = [Double](repeating: 0, count: 256)
-        for i in 0..<256 { toLinear[i] = linear(Double(i) / 255) }
+        let toLinear = linearTable
         var sum = 0.0, n = 0
         bm.pixels.withUnsafeBufferPointer { px in
             for i in 0..<mask.count where mask[i] != 0 {

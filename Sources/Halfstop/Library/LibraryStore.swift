@@ -53,7 +53,6 @@ enum LibraryFilter: String, CaseIterable, Identifiable {
     }
 }
 
-/// An auto action in flight, for the progress state on its chip.
 /// How an auto action ended.
 enum AutoOutcome: Equatable, Sendable {
     /// Applied as one history step.
@@ -68,6 +67,7 @@ enum AutoOutcome: Equatable, Sendable {
     case unreadable
 }
 
+/// An auto action in flight, for the progress state on its chip.
 struct AutoRun: Equatable {
     let url: URL
     let kind: AutoKind
@@ -1411,8 +1411,11 @@ struct TrashRequest: Identifiable {
 // MARK: - Learn from my edits
 
 extension LibraryStore {
-    /// ✦ Auto's tooltip says it adapts once this is true.
-    var autoIsAdapted: Bool { learnFromEdits && styleActive }
+    /// ✦ Auto's tooltip says it adapts once this is true: learning is on and there are enough
+    /// edited photos besides the open one (its own edit never feeds its own prediction).
+    var autoIsAdapted: Bool {
+        learnFromEdits && styleActive && styleModel.isActive(for: current?.ref.key)
+    }
 
     /// What learning adds to ✦ Auto's result for `photo` (nil when off, with too few edited
     /// photos, or nothing to add). Microseconds: a search over the in-memory index.
@@ -1445,7 +1448,9 @@ extension LibraryStore {
         let sample = catalog.styleSamples[photo.ref.key]
         styleModel.update(photo.ref.key, sample: sample, adjustments: photo.adjustments)
         updateStyleActive()
-        if StyleSliders.isEdited(photo.adjustments), sample?.isUsable(crop: photo.adjustments.crop) != true {
+        // Only the photo being edited is measured: pasting or applying a preset to a large
+        // selection would otherwise queue one background ✦ Auto per photo ahead of the next click.
+        if photo === current, StyleSliders.isEdited(photo.adjustments), sample?.isUsable(crop: photo.adjustments.crop) != true {
             scheduleStyleSample(photo)
         }
     }

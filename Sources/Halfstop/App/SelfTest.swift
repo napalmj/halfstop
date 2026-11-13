@@ -622,6 +622,29 @@ enum SelfTest {
                       && r.color!.vibrance > 5, describe(r))
             }
 
+            // Frames with no detail at all (a lens-cap black, a fully blown white) and tiny ones:
+            // auto stays finite and leaves exposure and the tone sliders alone.
+            for (name, v) in [("all-black.jpg", 0.0), ("all-white.jpg", 1.0)] {
+                if let blank = synthetic(name, { ctx, W, H in ctx.setFillColor(gray(v)); ctx.fill(CGRect(x: 0, y: 0, width: W, height: H)) }) {
+                    let r = AutoAdjust.auto(source: blank, inputs: Adjustments())
+                    let out = StyleSliders.values(r.applied(to: Adjustments()))
+                    check("auto leaves a blank \(v == 0 ? "black" : "white") frame alone", out.allSatisfy { $0 == 0 }, describe(r))
+                }
+            }
+            do {
+                let cs = CGColorSpace(name: CGColorSpace.sRGB)!
+                if let ctx = CGContext(data: nil, width: 3, height: 2, bitsPerComponent: 8, bytesPerRow: 0, space: cs,
+                                       bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) {
+                    ctx.setFillColor(gray(0.2)); ctx.fill(CGRect(x: 0, y: 0, width: 3, height: 2))
+                    let u = dir.appendingPathComponent("tiny.jpg")
+                    if let cg = ctx.makeImage() { write(cg, to: u) }
+                    let r = ImageSource(url: u, maxPixelSize: nil).map { AutoAdjust.auto(source: $0, inputs: Adjustments()) }
+                    let out = r.map { StyleSliders.values($0.applied(to: Adjustments())) } ?? [.nan]
+                    check("auto on a 3×2 pixel photo is finite and leaves tone alone", out.allSatisfy(\.isFinite) && r?.tone?.exposure == 0,
+                          r.map(describe) ?? "unreadable")
+                }
+            }
+
             // The sky-heavy test scene has a neutral gray ramp: auto balances on it rather than the
             // whole-frame average (which warms it a lot).
             let gw = AutoAdjust.whiteBalance(source: src, adjustments: Adjustments(), region: nil)
@@ -801,6 +824,11 @@ enum SelfTest {
             few.set("last", features: features(), delta: [0, 0, 0.5, 0, 0, 0, 0, 0, 10, 0])
             check("no learning below \(StyleModel.minimumSamples) edited photos", tooFew == nil && few.isActive && few.predict(features()) != nil
                   && few.predict(features(), excluding: "last") == nil, "")
+
+            // The open photo's own entry never counts toward its own prediction, so "adapted" is
+            // judged without it: exactly the minimum, one of them the photo itself, isn't enough.
+            check("adapted only with enough other edited photos", few.isActive(for: "new") && !few.isActive(for: "last")
+                  && few.predict(features(), excluding: "last") == nil && !few.isActive(for: "last") == (few.predict(features(), excluding: "last") == nil), "")
 
             var wild = StyleModel()
             for i in 0..<30 { wild.set("p\(i)", features: features(), delta: [80, -80, 3, 0, 0, 0, 0, 0, 90, 0]) }
@@ -1171,7 +1199,7 @@ enum Snapshot {
             settings.contentView = NSHostingView(rootView: SettingsView().environment(store).environment(control)
                 .preferredColorScheme(.dark))
             settings.orderFront(nil)
-            func shotSettings(_ name: String) {
+            @MainActor func shotSettings(_ name: String) {
                 if let view = settings.contentView, let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
                     view.cacheDisplay(in: view.bounds, to: rep)
                     try? rep.representation(using: .png, properties: [:])?.write(to: dir.appendingPathComponent(name + ".png"))

@@ -55,6 +55,10 @@ private struct LocalControlSection: View {
                         copyButton("Copy", token, id: "token")
                         Button("Regenerate") { control.regenerateToken() }
                             .help("Make a new token. AI apps set up with the old one stop working until you give them the new one.")
+                    } else if case .failed = control.status {
+                        // The Keychain couldn't be read or written: the error says to regenerate.
+                        Button("Regenerate") { control.regenerateToken() }
+                            .help("Make a new token and save it in the Keychain.")
                     } else {
                         Text("Made when you turn this on").foregroundStyle(.secondary)
                     }

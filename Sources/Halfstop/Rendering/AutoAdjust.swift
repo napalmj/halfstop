@@ -41,6 +41,9 @@ enum AutoAdjust {
                     .cropped(to: image.extent)
             }
             let (r, g, b) = average(image, region: region)
+            // A render with non-finite values says nothing about the cast: treat it as neutral
+            // rather than let NaN steer the solve to the end of the range.
+            guard r.isFinite, g.isFinite, b.isFinite else { return .zero }
             return SIMD2(log(max(b, 1e-6) / max(r, 1e-6)), log(max(g, 1e-6) / max((r * b).squareRoot(), 1e-6)))
         }
         let x = solveNeutral(error)
@@ -153,12 +156,14 @@ enum AutoAdjust {
 
     /// Starts from the current white balance, otherwise from defaults.
     static func tone(source: ImageSource, adjustments: Adjustments) -> Tone {
-        var a = Adjustments()
-        a.crop = adjustments.crop
-        a.temperature = adjustments.temperature
-        a.tint = adjustments.tint
-        guard let stats = measure(measurementImage(source, a)) else { return Tone(exposure: 0, contrast: 0, highlights: 0, shadows: 0) }
-        return tone(stats, scene: scene(stats))
+        let inputs = AutoRequest(url: source.url, kind: .tone, adjustments: adjustments).inputs
+        return compute(.tone, source: source, inputs: inputs).tone ?? Tone(exposure: 0, contrast: 0, highlights: 0, shadows: 0)
+    }
+
+    /// Nothing but black, or nothing but clipped white: there's no detail for tone, levels or the
+    /// second opinion to work with, so auto leaves exposure and the tone sliders alone.
+    static func isBlank(_ s: ImageStats) -> Bool {
+        s.percentile(0.995) <= 1.0 / 255 || s.percentile(0.005) >= 254.0 / 255
     }
 
     static func scene(_ s: ImageStats) -> Scene {
@@ -175,7 +180,7 @@ enum AutoAdjust {
     /// Exposure from the median and how much room the highlights have, then contrast, highlights
     /// and shadows from the shifted distribution, each held back according to the scene.
     static func tone(_ s: ImageStats, scene: Scene) -> Tone {
-        guard s.pixelCount > 16 else { return Tone(exposure: 0, contrast: 0, highlights: 0, shadows: 0) }
+        guard s.pixelCount > 16, !isBlank(s) else { return Tone(exposure: 0, contrast: 0, highlights: 0, shadows: 0) }
         let median = s.percentile(0.5), hi = s.percentile(0.995)
         func evTo(_ target: Double) -> Double { log2(linear(target) / max(linear(median), 1e-4)) }
         // To the nearest edge of the band; zero inside it.
@@ -233,7 +238,7 @@ enum AutoAdjust {
     /// the range, so it's used without clipping more than about 0.5%. Only ever stretches: a photo
     /// that already reaches black and white keeps zero.
     static func levels(_ s: ImageStats, tone: Tone, scene: Scene) -> Levels {
-        guard s.pixelCount > 16 else { return Levels(whites: 0, blacks: 0) }
+        guard s.pixelCount > 16, !isBlank(s) else { return Levels(whites: 0, blacks: 0) }
         let k = pow(2, tone.exposure)
         func shifted(_ v: Double) -> Double { encoded(min(1, linear(v) * k)) }
         let hi = shifted(s.percentile(0.995)), lo = shifted(s.percentile(0.005))
@@ -344,11 +349,13 @@ enum AutoAdjust {
         let stats = ImageStats(bm)
         let scene = scene(stats)
         var tone = tone(stats, scene: scene)
-        if let face = faceLuminance(bm, faces: hints.faces) {
+        // Too few pixels, or nothing but black or white: tone measured nothing, so nothing nudges it either.
+        let measurable = stats.pixelCount > 16 && !isBlank(stats)
+        if measurable, let face = faceLuminance(bm, faces: hints.faces) {
             tone.exposure = faceExposure(tone.exposure, faceLuminance: face.luminance, faceArea: face.area, stats: stats, scene: scene)
         }
         var color = color(stats, hints: hints)
-        let opinion = secondOpinion(bm)
+        let opinion = measurable ? secondOpinion(bm) : nil
         if let opinion {
             (tone, color) = nudged(tone, color, by: opinion, scene: scene, faces: !hints.faces.isEmpty)
         }
@@ -358,8 +365,7 @@ enum AutoAdjust {
 
     /// Mean linear RGB of a render, from every other pixel each way.
     static func meanLinear(_ bm: Bitmap) -> SIMD3<Double> {
-        var toLinear = [Double](repeating: 0, count: 256)
-        for i in 0..<256 { toLinear[i] = linear(Double(i) / 255) }
+        let toLinear = linearTable
         var sum = SIMD3<Double>(0, 0, 0)
         var n = 0
         bm.pixels.withUnsafeBufferPointer { px in
@@ -383,8 +389,7 @@ enum AutoAdjust {
     static func neutralWeights(_ bm: Bitmap) -> CIImage? {
         let n = bm.width * bm.height
         guard n > 0 else { return nil }
-        var toLinear = [Double](repeating: 0, count: 256)
-        for i in 0..<256 { toLinear[i] = linear(Double(i) / 255) }
+        let toLinear = linearTable
         let binWidth = 0.0025, bins = 80
         var chroma = [Float](repeating: -1, count: n)
         var hist = [Int](repeating: 0, count: bins)
@@ -435,6 +440,8 @@ enum AutoAdjust {
     }
 
     static func linear(_ v: Double) -> Double { v <= 0.04045 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4) }
+    /// `linear` of each 8-bit sRGB level, for reading measurement bitmaps.
+    static let linearTable: [Double] = (0..<256).map { linear(Double($0) / 255) }
     static func encoded(_ v: Double) -> Double { v <= 0.0031308 ? v * 12.92 : 1.055 * pow(v, 1 / 2.4) - 0.055 }
 
     /// Linear average color of a region (normalized, top-left origin).
@@ -557,8 +564,7 @@ struct ImageStats: Equatable, Sendable {
         pixelCount = w * h
 
         // Color statistics from every other pixel in each direction: plenty for averages.
-        var toLinear = [Double](repeating: 0, count: 256)
-        for i in 0..<256 { toLinear[i] = AutoAdjust.linear(Double(i) / 255) }
+        let toLinear = AutoAdjust.linearTable
         var sum = SIMD3<Double>(0, 0, 0)
         var chromaSum = 0.0, skin = 0, n = 0
         var chromaHist = [Int](repeating: 0, count: Self.chromaBins)
