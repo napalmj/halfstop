@@ -141,7 +141,7 @@ private struct AutoRow: View {
             Button { store.runAuto(.auto) } label: { AutoChipLabel(title: "✦ Auto", busy: running == .auto) }
                 .buttonStyle(ChipStyle(selected: true))
                 .accessibilityLabel("Auto")
-                .help("Auto: white balance, tone, whites and blacks, and vibrance in one step")
+                .help(store.autoIsAdapted ? "Auto (adapted to your edits)" : "Auto: white balance, tone, whites and blacks, and vibrance in one step")
             Button { store.runAuto(.tone) } label: { AutoChipLabel(title: "Tone", busy: running == .tone) }
                 .help("Auto tone: set exposure, contrast, highlights and shadows from the photo")
             Button { store.runAuto(.whiteBalance) } label: { AutoChipLabel(title: "WB", busy: running == .whiteBalance) }

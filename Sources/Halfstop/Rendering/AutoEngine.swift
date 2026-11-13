@@ -47,6 +47,8 @@ struct AutoResult: Equatable, Sendable {
     var angle: Double?
     /// The horizon Auto straighten found (also when it was too uncertain or steep to use).
     var horizon: AutoVision.Horizon?
+    /// What "Learn from my edits" adds on top (set by the store after measuring, never cached).
+    var learned: StyleOffset?
 
     /// `a` with this result's sliders set; everything else (curve, masks, crop…) stays,
     /// except the straighten angle when `angle` is set.
@@ -59,6 +61,7 @@ struct AutoResult: Equatable, Sendable {
         if let l = levels { out.whites = l.whites; out.blacks = l.blacks }
         if let c = color { out.vibrance = c.vibrance; out.saturation = c.saturation }
         if let angle { out.crop.angle = angle.clamped(to: EditLimits.straighten) }
+        if let learned { out = learned.applied(to: out) }
         return out
     }
 }

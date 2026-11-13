@@ -30,6 +30,12 @@ struct HalfstopApp: App {
         .defaultSize(width: 1440, height: 900)
         .commands { HalfstopCommands(store: store) }
 
+        Settings {
+            SettingsView()
+                .environment(store)
+                .preferredColorScheme(.dark)
+        }
+
         Window("Halfstop Help", id: "help") {
             HelpView()
                 .preferredColorScheme(.dark)

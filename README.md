@@ -99,6 +99,7 @@ Press **⌘?** (Help ▸ Halfstop Help) for a searchable list of every shortcut.
 | ⌘⌫ | Move selected photos to Trash (asks first) |
 | ⇧⌘S | Show / hide the sidebar (library) or history (editor) |
 | ⌘S | Save now |
+| ⌘, | Settings |
 
 ## Where your data lives
 
@@ -106,7 +107,7 @@ Press **⌘?** (Help ▸ Halfstop Help) for a searchable list of every shortcut.
 | --- | --- |
 | Your photos | Wherever they already are. Halfstop never copies them or changes their contents (export writes new files). |
 | Edits, ratings, flags, history | `<photo folder>/.halfstop/<filename>.json` plus `<filename>.history.json`, small JSON sidecars per photo |
-| Library index (folders, collections) | `~/Library/Application Support/Halfstop/catalog.json` |
+| Library index (folders, collections, what ✦ Auto learned from your edits) | `~/Library/Application Support/Halfstop/catalog.json` |
 | Presets | `~/Library/Application Support/Halfstop/presets.json` |
 | Thumbnail cache | `~/Library/Caches/Halfstop/Thumbnails` (safe to delete; kept under 1 GB) |
 

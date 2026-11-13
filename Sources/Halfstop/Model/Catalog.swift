@@ -101,6 +101,8 @@ struct Catalog: Codable {
     var captureDates: [String: Date] = [:]
     var lastImport: ImportRecord?
     var targetCollection: UUID?
+    /// PhotoRef.key → what "Learn from my edits" measured for an edited photo.
+    var styleSamples: [String: StyleSample] = [:]
 
     init() {}
 
@@ -115,6 +117,7 @@ struct Catalog: Codable {
         captureDates = t.dictionary(.captureDates) ?? [:]
         lastImport = t.optional(.lastImport)
         targetCollection = t.optional(.targetCollection)
+        styleSamples = t.dictionary(.styleSamples) ?? [:]
     }
 
     static var defaultURL: URL {
@@ -151,7 +154,7 @@ struct Catalog: Codable {
     /// Drops every reference to photos that are gone (moved to the Trash).
     mutating func forget(_ refs: Set<PhotoRef>) {
         for i in collections.indices { collections[i].members.removeAll { refs.contains($0) } }
-        for r in refs { fingerprints[r.key] = nil; captureDates[r.key] = nil }
+        for r in refs { fingerprints[r.key] = nil; captureDates[r.key] = nil; styleSamples[r.key] = nil }
         if var record = lastImport {
             record.refs.removeAll { refs.contains($0) }
             lastImport = record
@@ -164,6 +167,7 @@ struct Catalog: Codable {
             collections[i].members = collections[i].members.map { $0 == from ? to : $0 }
         }
         if let fp = fingerprints.removeValue(forKey: from.key) { fingerprints[to.key] = fp }
+        if let sample = styleSamples.removeValue(forKey: from.key) { styleSamples[to.key] = sample }
         if var record = lastImport {
             record.refs = record.refs.map { $0 == from ? to : $0 }
             lastImport = record

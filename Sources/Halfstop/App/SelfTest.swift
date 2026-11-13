@@ -758,6 +758,89 @@ enum SelfTest {
             }
         }
 
+        // Learn from my edits: a nearest-neighbour average of what the user changed over ✦ Auto.
+        do {
+            var seed: UInt64 = 42
+            func rnd() -> Double { seed = seed &* 6364136223846793005 &+ 1442695040888963407; return Double(seed >> 11) / Double(1 << 53) }
+            func features() -> [Double] { (0..<StyleFeatures.count).map { _ in rnd() } }
+            // A fake catalog where every edit is "+0.5 EV and +10 vibrance over auto", with a little noise.
+            var model = StyleModel()
+            for i in 0..<60 {
+                var d = [Double](repeating: 0, count: StyleSliders.count)
+                d[2] = 0.5 + (rnd() - 0.5) * 0.1; d[8] = 10 + (rnd() - 0.5) * 4; d[0] = (rnd() - 0.5) * 2
+                model.set("p\(i)", features: features(), delta: d)
+            }
+            var worst = (ev: 0.0, vib: 0.0, other: 0.0)
+            for _ in 0..<20 {
+                guard let o = model.predict(features())?.values else { worst = (9, 99, 99); break }
+                worst.ev = max(worst.ev, abs(o[2] - 0.5)); worst.vib = max(worst.vib, abs(o[8] - 10))
+                worst.other = max(worst.other, (0..<o.count).filter { $0 != 2 && $0 != 8 }.map { abs(o[$0]) }.max() ?? 0)
+            }
+            check("learned style converges to +0.5 EV and +10 vibrance", worst.ev <= 0.1 && worst.vib <= 2 && worst.other <= 1,
+                  String(format: "worst off by %.2f EV, %.1f vibrance, %.1f elsewhere", worst.ev, worst.vib, worst.other))
+
+            var few = StyleModel()
+            for i in 0..<(StyleModel.minimumSamples - 1) { few.set("p\(i)", features: features(), delta: [0, 0, 0.5, 0, 0, 0, 0, 0, 10, 0]) }
+            let tooFew = few.predict(features())
+            few.set("last", features: features(), delta: [0, 0, 0.5, 0, 0, 0, 0, 0, 10, 0])
+            check("no learning below \(StyleModel.minimumSamples) edited photos", tooFew == nil && few.isActive && few.predict(features()) != nil
+                  && few.predict(features(), excluding: "last") == nil, "")
+
+            var wild = StyleModel()
+            for i in 0..<30 { wild.set("p\(i)", features: features(), delta: [80, -80, 3, 0, 0, 0, 0, 0, 90, 0]) }
+            let clamped = wild.predict(features())?.values ?? []
+            check("learned changes are clamped", clamped == [25, -20, 1.0, 0, 0, 0, 0, 0, 30, 0], "\(clamped)")
+
+            // Nearest neighbours win: two clusters with opposite habits.
+            var two = StyleModel()
+            for i in 0..<30 {
+                var f = features(); f[2] = 0.2 + rnd() * 0.05
+                two.set("dark\(i)", features: f, delta: [0, 0, 0.6, 0, 0, 0, 0, 0, 0, 0])
+                var g = features(); g[2] = 0.8 + rnd() * 0.05
+                two.set("light\(i)", features: g, delta: [0, 0, -0.4, 0, 0, 0, 0, 0, 0, 0])
+            }
+            var q = [Double](repeating: 0.5, count: StyleFeatures.count); q[2] = 0.21
+            check("similar photos decide", (two.predict(q)?.values[2] ?? 0) > 0.2, "\(String(describing: two.predict(q)))")
+
+            // Index entries: only hand-edited photos with a current sample for the same crop.
+            let sample = StyleSample(features: features(), auto: [5, 0, 0.3, 10, -5, 5, 10, -10, 12, 0], crop: CropSettings())
+            var edited = Adjustments(); edited.exposure = 0.8; edited.vibrance = 22; edited.temperature = 5
+            var idx = StyleModel()
+            idx.update("a", sample: sample, adjustments: edited)
+            let delta = idx.entries["a"]?.delta ?? []
+            idx.update("b", sample: sample, adjustments: Adjustments())
+            var recropped = edited; recropped.crop.rect = NormRect(x: 0, y: 0, width: 0.5, height: 0.5)
+            idx.update("c", sample: sample, adjustments: recropped)
+            var old = sample; old.version = 0
+            idx.update("d", sample: old, adjustments: edited)
+            check("only hand-edited photos with a current sample are learned from", idx.count == 1
+                  && abs(delta[2] - 0.5) < 1e-9 && delta[8] == 10 && delta[3] == -10, "\(delta)")
+
+            do {
+                let f = StyleFeatures.make(AutoAdjust.auto(source: src, inputs: Adjustments()), isRAW: false) ?? []
+                check("style features are a dozen finite numbers", f.count == StyleFeatures.count && f.allSatisfy { $0.isFinite && abs($0) <= 1.0001 }, "\(f)")
+            }
+            var adapted = AutoResult(); adapted.learned = StyleOffset(values: [0, 0, 0.5, 0, 0, 0, 0, 0, 10, 0])
+            var start = Adjustments(); start.exposure = 4.8; start.vibrance = 95
+            let applied = adapted.applied(to: start)
+            check("a learned offset stays within slider ranges", applied.exposure == 5 && applied.vibrance == 100, "")
+
+            // Catalogs from before learning still load; a bad sample is dropped on its own.
+            let oldCatalog = #"{"version":1,"folders":[{"id":"6F9619FF-8B86-D011-B42D-00CF4FC964FF","path":"/tmp/x"}],"fingerprints":{"a":"b"}}"#
+            let newCatalog = #"{"version":1,"folders":[],"styleSamples":{"good":{"version":1,"features":[0,0,0,0,0,0,0,0,0,0,0,0],"auto":[0,0,0,0,0,0,0,0,0,0]},"bad":{"version":1,"auto":[1]}}}"#
+            let report = DecodeReport()
+            let o = try? JSONDecoder.reporting(into: DecodeReport()).decode(Catalog.self, from: Data(oldCatalog.utf8))
+            let n = try? JSONDecoder.reporting(into: report).decode(Catalog.self, from: Data(newCatalog.utf8))
+            check("catalogs without style samples still load", o?.folders.count == 1 && o?.styleSamples.isEmpty == true && o?.fingerprints["a"] == "b", "")
+            check("a malformed style sample is dropped on its own", n?.styleSamples.count == 1 && n?.styleSamples["good"]?.crop == CropSettings()
+                  && n?.styleSamples["good"]?.isUsable(crop: CropSettings()) == true && report.dropped == 1, "dropped \(report.dropped)")
+            var cat = Catalog(); cat.styleSamples["k"] = sample
+            let enc = JSONEncoder(); enc.dateEncodingStrategy = .iso8601
+            let dec = JSONDecoder(); dec.dateDecodingStrategy = .iso8601
+            let back = (try? enc.encode(cat)).flatMap { try? dec.decode(Catalog.self, from: $0) }
+            check("style samples round-trip", back?.styleSamples["k"]?.features == sample.features && back?.styleSamples["k"]?.auto == sample.auto, "")
+        }
+
         // Export keeps metadata (optionally without location), and parallel exports never share a name.
         let exportDir = dir.appendingPathComponent("export-out")
         try? FileManager.default.removeItem(at: exportDir)
@@ -1064,6 +1147,18 @@ enum Snapshot {
                 print("snapshot 11-help")
             }
             help.close()
+            let settings = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 440, height: 160), styleMask: [.titled],
+                                    backing: .buffered, defer: false)
+            settings.appearance = NSAppearance(named: .darkAqua)
+            settings.contentView = NSHostingView(rootView: SettingsView().environment(store).preferredColorScheme(.dark))
+            settings.orderFront(nil)
+            await wait(1)
+            if let view = settings.contentView, let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
+                view.cacheDisplay(in: view.bounds, to: rep)
+                try? rep.representation(using: .png, properties: [:])?.write(to: dir.appendingPathComponent("12-settings.png"))
+                print("snapshot 12-settings")
+            }
+            settings.close()
             store.flushSaves()
             print("snapshot done")
             NSApp.terminate(nil)
@@ -1283,6 +1378,49 @@ enum LibraryTest {
                   && photo.adjustments == flat && photo.history.count == flatSteps + 1, "\(String(describing: none))")
             AutoVision.shared.removeOverrides(for: photo.url)
             AutoEngine.shared.clear()
+
+            // Learn from my edits, through the store: a background sample after an edit, then ✦ Auto
+            // adapted by a fake catalog of "+0.5 EV and +10 vibrance" edits, and plain when off.
+            // (The setting lives in the user's defaults: put it back exactly as it was.)
+            let userSetting = UserDefaults.standard.object(forKey: LibraryStore.learnFromEditsKey)
+            store.learnFromEdits = true
+            store.resetAdjustments()
+            store.edit { $0.exposure = 0.3; $0.vibrance = 7 }
+            store.commitPending(photo)
+            await store.measureStyleSample(photo.url)?.value
+            let sample = store.catalog.styleSamples[photo.ref.key]
+            let entry = store.styleModel.entries[photo.ref.key]
+            check("an edited photo's style sample is measured and indexed", sample?.isUsable(crop: photo.adjustments.crop) == true
+                  && entry.map { abs($0.delta[2] - (0.3 - sample!.auto[2])) < 1e-9 && $0.delta[8] == 7 - sample!.auto[8] } == true,
+                  "\(String(describing: sample))")
+            store.flushSaves()
+            let saved = Catalog.load(from: catalogURL).styleSamples[photo.ref.key]
+            check("style samples are saved in the catalog", sample != nil && saved?.features == sample?.features && saved?.auto == sample?.auto
+                  && saved?.crop == sample?.crop)
+
+            store.resetAdjustments()
+            store.commitPending(photo)
+            check("a reset photo leaves the index", store.styleModel.entries[photo.ref.key] == nil && !store.autoIsAdapted)
+            let plainResult = AutoEngine.shared.resultNow(for: AutoRequest(url: photo.url, kind: .auto, adjustments: photo.adjustments))
+            let plain = plainResult?.applied(to: photo.adjustments) ?? Adjustments()
+            if let pf = plainResult.flatMap({ StyleFeatures.make($0, isRAW: false) }) {
+                for i in 0..<25 {
+                    store.styleModel.set("fake\(i)", features: pf.map { $0 + Double(i % 5) * 0.01 },
+                                         delta: [0, 0, 0.5, 0, 0, 0, 0, 0, 10, 0])
+                }
+            }
+            store.updateStyleActive()
+            let adapted = await store.runAuto(.auto)?.value ?? false
+            check("✦ Auto adds what the user usually does", adapted && store.autoIsAdapted
+                  && abs(photo.adjustments.exposure - min(plain.exposure + 0.5, 5)) < 1e-9 && photo.adjustments.vibrance == min(plain.vibrance + 10, 100)
+                  && photo.adjustments.temperature == plain.temperature && photo.history.last?.label == "Auto",
+                  String(format: "exposure %.2f -> %.2f, vibrance %.0f -> %.0f", plain.exposure, photo.adjustments.exposure, plain.vibrance, photo.adjustments.vibrance))
+            store.undo()
+            store.learnFromEdits = false
+            let off = await store.runAuto(.auto)?.value ?? false
+            check("with learning off, ✦ Auto is plain", off && !store.autoIsAdapted && photo.adjustments == plain)
+            store.undo()
+            UserDefaults.standard.set(userSetting, forKey: LibraryStore.learnFromEditsKey)
             store.resetAdjustments()
             store.mode = .library
         }

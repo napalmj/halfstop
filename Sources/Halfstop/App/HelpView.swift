@@ -79,12 +79,14 @@ struct HelpView: View {
             Item(keys: ["Drop a folder"], what: "Import it"),
             Item(keys: ["⌘S"], what: "Save now (edits also save on their own after a moment)"),
             Item(keys: ["⇧⌘E"], what: "Export"),
+            Item(keys: ["⌘,"], what: "Settings (Learn from my edits)"),
         ]),
     ]
 
     private static let notes: [(String, String)] = [
         ("Your files are never changed", "Edits, ratings and history live in a small .halfstop folder next to your photos. Export to get edited copies."),
         ("Deleting goes to the Trash", "Halfstop never erases files. Trashed photos come back with Finder's Put Back until you empty the Trash."),
+        ("✦ Auto learns from your edits", "Once you have edited 20 photos, ✦ Auto adds what you usually change on similar ones. It learns on this Mac only; turn it off in Settings (⌘,)."),
         ("Each photo keeps its own crop", "Paste settings copies everything except the crop. Presets carry only the global look, never crop or masks."),
     ]
 

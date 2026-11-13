@@ -26,6 +26,10 @@ All notable changes to Halfstop are listed here. The format follows
   as a second opinion that nudges its values a little, never replacing them.
 - Auto straighten in Crop & straighten: levels a tilted horizon (up to 10°) as one undoable step
   "Auto straighten", or shows "No horizon found". ✦ Auto never changes the crop or angle.
+- Learn from my edits (Settings, on by default): once you have edited 20 photos, ✦ Auto adds what
+  you usually change on similar photos, from your own edits only and entirely on this Mac. Its
+  tooltip then reads "Auto (adapted to your edits)".
+- A Settings window (⌘,).
 - README with install and usage instructions, a user guide and an architecture overview.
 - MIT license, contributing guide, code of conduct, security policy and GitHub issue and pull
   request templates.

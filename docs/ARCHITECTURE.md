@@ -8,11 +8,11 @@ Image / Metal pipeline.
 
 | Folder | Contents |
 | --- | --- |
-| `App/` | App entry point and menu commands (`HalfstopApp.swift`), the in-app Help window (`HelpView.swift`), and the headless command line modes: `SelfTest.swift` (`--selftest`, `--make-samples`, `--snapshot`) and `Bench.swift` (`--bench`, preview frames and auto adjustments) |
+| `App/` | App entry point and menu commands (`HalfstopApp.swift`), the in-app Help window (`HelpView.swift`), the Settings window (`SettingsView.swift`), and the headless command line modes: `SelfTest.swift` (`--selftest`, `--make-samples`, `--snapshot`) and `Bench.swift` (`--bench`, preview frames and auto adjustments) |
 | `Model/` | Plain data types: `Adjustments` (every slider, curve, HSL value, crop and mask), `Photo` (per-photo sidecar, flags, ratings, history steps, supported file extensions), `Catalog` (the library index, folder watching) and `HistoryLabel` (names edit history steps) |
 | `Library/` | `LibraryStore` (the central observable state: selection, filters, edits, saving, undo, trash), the import scan and options (`Importer.swift`, `ImportSheet.swift`), the sidebar, and the library grid and export UI |
 | `Editor/` | The editing screen: `EditorView` and the preview area, `AdjustPanel` (sliders and mask controls), `PreviewRenderer` (Metal preview view), `CropOverlay` and `HistoryPanel` |
-| `Rendering/` | The develop pipeline: `ImageSource` (decodes RAW and raster files, builds the Core Image filter graph), `ColorLUT` (bakes tone and color adjustments into one 3D lookup table), `MaskRenderer` (turns mask descriptions into grayscale images), `RenderServices` (thumbnails, histogram, export), and `AutoAdjust` / `AutoEngine` (one-click auto adjustments, measured on a small decode of the photo off the main thread and cached), with `AutoVision` (faces and horizon, via Vision, with a test hook) and `AutoRefine` (face-aware exposure and skin tint, the auto-enhance second opinion, Auto straighten) |
+| `Rendering/` | The develop pipeline: `ImageSource` (decodes RAW and raster files, builds the Core Image filter graph), `ColorLUT` (bakes tone and color adjustments into one 3D lookup table), `MaskRenderer` (turns mask descriptions into grayscale images), `RenderServices` (thumbnails, histogram, export), and `AutoAdjust` / `AutoEngine` (one-click auto adjustments, measured on a small decode of the photo off the main thread and cached), with `AutoVision` (faces and horizon, via Vision, with a test hook) and `AutoRefine` (face-aware exposure and skin tint, the auto-enhance second opinion, Auto straighten) and `StyleLearner` ("Learn from my edits": per-photo features and a nearest-neighbour model of what the user changes over ✦ Auto) |
 | `Components/` | Reusable views: adjustment slider and `Theme`, curve editor, histogram, thumbnails |
 
 ## How a frame is produced
@@ -37,8 +37,9 @@ Halfstop never writes to the photo files themselves.
   history out on the next save. Decoding is tolerant, so older sidecars still load when new fields are
   added. Keep it that way when you add settings: give new fields defaults.
 - **Catalog:** `~/Library/Application Support/Halfstop/catalog.json` lists imported folders and
-  collections. A photo is identified by `PhotoRef` (folder identity plus relative path), so moving a
-  folder only changes the folder's stored path. An unreadable catalog is copied aside rather than
+  collections, plus the samples "Learn from my edits" measured for edited photos (`styleSamples`).
+  A photo is identified by `PhotoRef` (folder identity plus relative path), so moving a folder only
+  changes the folder's stored path. An unreadable catalog is copied aside rather than
   overwritten.
 - **Presets:** `~/Library/Application Support/Halfstop/presets.json`.
 - Folder watching ignores `.halfstop/`, so saving edits does not trigger rescans.

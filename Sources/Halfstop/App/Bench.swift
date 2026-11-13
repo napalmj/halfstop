@@ -173,6 +173,19 @@ enum Bench {
         print("  " + "10k photos: 40 slider reads".padding(toLength: 34, withPad: " ", startingAt: 0) + String(format: "%7.2f ms per tick", currentMs))
         print("  " + "10k photos: visiblePhotos".padding(toLength: 34, withPad: " ", startingAt: 0) + String(format: "%7.2f ms per access", visibleMs))
         try? FileManager.default.removeItem(at: tmp)
+
+        // Learn from my edits: one ✦ Auto prediction over 5,000 edited photos.
+        var model = StyleModel()
+        var seed: UInt64 = 7
+        func rnd() -> Double { seed = seed &* 6364136223846793005 &+ 1442695040888963407; return Double(seed >> 11) / Double(1 << 53) }
+        for i in 0..<5000 {
+            model.set("p\(i)", features: (0..<StyleFeatures.count).map { _ in rnd() }, delta: (0..<StyleSliders.count).map { _ in rnd() - 0.5 })
+        }
+        let query = (0..<StyleFeatures.count).map { _ in rnd() }
+        t = CACurrentMediaTime()
+        for _ in 0..<frames { _ = model.predict(query) }
+        let knnMs = (CACurrentMediaTime() - t) * 1000 / Double(frames)
+        print("  " + "learn: k-NN over 5k edited photos".padding(toLength: 34, withPad: " ", startingAt: 0) + String(format: "%7.2f ms per ✦ Auto", knnMs))
     }
 
     static func median(_ v: [Double]) -> Double {

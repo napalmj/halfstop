@@ -148,6 +148,23 @@ final class LibraryStore {
         didSet { UserDefaults.standard.set(autoAdvance, forKey: "autoAdvance") }
     }
     var thumbnailSize: Double = 200
+
+    // Learn from my edits
+    /// ✦ Auto adapts to the user's own edits (Settings). On by default.
+    var learnFromEdits = UserDefaults.standard.object(forKey: LibraryStore.learnFromEditsKey) as? Bool ?? true {
+        didSet {
+            guard learnFromEdits != oldValue else { return }
+            UserDefaults.standard.set(learnFromEdits, forKey: Self.learnFromEditsKey)
+            rebuildStyleModel()
+        }
+    }
+    nonisolated static let learnFromEditsKey = "learnFromEdits"
+    /// Edited photos ✦ Auto learns from, updated one photo at a time (never a catalog rescan per click).
+    @ObservationIgnored var styleModel = StyleModel()
+    /// Whether the model has enough edited photos to act (observed, unlike the model itself).
+    private(set) var styleActive = false
+    @ObservationIgnored private var pendingStyleSamples: [URL: DispatchWorkItem] = [:]
+    @ObservationIgnored private var pendingCatalogSave: DispatchWorkItem?
     var panelTab: PanelTab = .quick { didSet { if panelTab == .quick { activeMaskID = nil } } }
     /// Mask currently being edited; nil = whole photo.
     var activeMaskID: UUID? {
@@ -430,6 +447,7 @@ final class LibraryStore {
                 self.isLoading = false
                 self.keepCurrentVisible()
                 self.backfillFingerprints()
+                self.rebuildStyleModel()
                 completion?()
             }
         }
@@ -510,6 +528,7 @@ final class LibraryStore {
             catalog.collections[i].members.removeAll { $0.folder == id }
         }
         catalog.fingerprints = catalog.fingerprints.filter { !$0.key.hasPrefix(id.uuidString + "/") }
+        catalog.styleSamples = catalog.styleSamples.filter { !$0.key.hasPrefix(id.uuidString + "/") }
         if catalog.lastImport?.folder == id { catalog.lastImport = nil }
         if source == .folder(id) || (source == .lastImport && catalog.lastImport == nil) { source = .all }
         saveCatalog()
@@ -676,6 +695,12 @@ final class LibraryStore {
             recordSave(url, sidecar: sidecar, failure: failure)
         }
         unsavedCount = 0
+        if let pending = pendingCatalogSave {
+            // Learned samples waiting to be written.
+            pending.cancel()
+            pendingCatalogSave = nil
+            saveCatalog()
+        }
         updateRetryTimer()
     }
 
@@ -885,6 +910,8 @@ final class LibraryStore {
 
         catalog.forget(Set(moved.map(\.ref)))
         saveCatalog()
+        for p in moved { styleModel.remove(p.ref.key) }
+        updateStyleActive()
         let gone = Set(moved.map(\.url))
         photos.removeAll { gone.contains($0.url) }
         selection.subtract(gone)
@@ -984,6 +1011,7 @@ final class LibraryStore {
         photo.history = history
         photo.historyIndex = history.count - 1
         scheduleSave(photo, history: true)
+        noteEdited(photo)
     }
 
     /// Sets a photo's edits as one labelled step (paste, presets, snapshots, reset).
@@ -1028,13 +1056,14 @@ final class LibraryStore {
     @discardableResult
     func finishAuto(_ request: AutoRequest, start: Adjustments, result: AutoResult?) -> AutoOutcome {
         guard let photo = current, photo.url == request.url, photo.adjustments == start else { return .stale }
-        guard let result else { return .unreadable }
+        guard var result else { return .unreadable }
         if request.kind == .straighten {
             guard result.angle != nil else {
                 showHint("No horizon found")
                 return .noHorizon
             }
         }
+        if request.kind == .auto { result.learned = learnedOffset(for: photo, result: result) }
         let next = result.applied(to: start)
         guard next != start else {
             if request.kind == .straighten { showHint("Horizon already level") }
@@ -1071,6 +1100,7 @@ final class LibraryStore {
         photo.historyIndex = index
         photo.adjustments = photo.history[index].adjustments
         scheduleSave(photo, history: true)
+        noteEdited(photo)
     }
 
     /// Drops the steps after the current one right away.
@@ -1366,3 +1396,98 @@ struct TrashRequest: Identifiable {
     /// Came from "Delete Rejected…" (changes the wording).
     let rejectedOnly: Bool
 }
+
+// MARK: - Learn from my edits
+
+extension LibraryStore {
+    /// ✦ Auto's tooltip says it adapts once this is true.
+    var autoIsAdapted: Bool { learnFromEdits && styleActive }
+
+    /// What learning adds to ✦ Auto's result for `photo` (nil when off, with too few edited
+    /// photos, or nothing to add). Microseconds: a search over the in-memory index.
+    func learnedOffset(for photo: Photo, result: AutoResult) -> StyleOffset? {
+        guard learnFromEdits, styleModel.isActive, let f = StyleFeatures.make(result, isRAW: photo.isRAW) else { return nil }
+        return styleModel.predict(f, excluding: photo.ref.key)
+    }
+
+    /// Rebuilds the index from the catalog's samples and the photos' current edits (after the
+    /// library loads, or when learning is switched on). O(library), never per click.
+    func rebuildStyleModel() {
+        styleModel.removeAll()
+        if learnFromEdits {
+            for p in photos {
+                if let sample = catalog.styleSamples[p.ref.key] { styleModel.update(p.ref.key, sample: sample, adjustments: p.adjustments) }
+            }
+        }
+        updateStyleActive()
+    }
+
+    func updateStyleActive() {
+        let active = styleModel.isActive
+        if styleActive != active { styleActive = active }
+    }
+
+    /// After a history step (or undo/redo): updates the photo's entry, and if it's edited by hand
+    /// but has no current sample, measures one in the background shortly after.
+    func noteEdited(_ photo: Photo) {
+        guard learnFromEdits else { return }
+        let sample = catalog.styleSamples[photo.ref.key]
+        styleModel.update(photo.ref.key, sample: sample, adjustments: photo.adjustments)
+        updateStyleActive()
+        if StyleSliders.isEdited(photo.adjustments), sample?.isUsable(crop: photo.adjustments.crop) != true {
+            scheduleStyleSample(photo)
+        }
+    }
+
+    /// How long after an edit its sample is measured (edits come in bursts).
+    static let styleSampleDelay: TimeInterval = 1.5
+
+    private func scheduleStyleSample(_ photo: Photo) {
+        let url = photo.url
+        pendingStyleSamples[url]?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated { _ = self?.measureStyleSample(url) }
+        }
+        pendingStyleSamples[url] = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.styleSampleDelay, execute: work)
+    }
+
+    /// Measures ✦ Auto for the photo (off the main thread, on the shared engine, so a later ✦ Auto
+    /// click on it is a cache hit) and stores the sample in the catalog.
+    @discardableResult
+    func measureStyleSample(_ url: URL) -> Task<Void, Never>? {
+        pendingStyleSamples[url] = nil
+        guard learnFromEdits, let photo = photo(for: url), StyleSliders.isEdited(photo.adjustments) else { return nil }
+        let crop = photo.adjustments.crop, ref = photo.ref, isRAW = photo.isRAW
+        let request = AutoRequest(url: url, kind: .auto, adjustments: photo.adjustments)
+        return Task { [weak self] in
+            guard let result = await AutoEngine.shared.result(for: request),
+                  let features = StyleFeatures.make(result, isRAW: isRAW), let self else { return }
+            // The photo may have gone or been re-cropped meanwhile.
+            guard let photo = self.photo(for: url), photo.ref == ref, photo.adjustments.crop == crop else { return }
+            let sample = StyleSample(features: features, auto: StyleSliders.values(result.applied(to: Adjustments())), crop: crop)
+            self.catalog.styleSamples[ref.key] = sample
+            self.scheduleCatalogSave()
+            if self.learnFromEdits {
+                self.styleModel.update(ref.key, sample: sample, adjustments: photo.adjustments)
+                self.updateStyleActive()
+            }
+        }
+    }
+
+    func photo(for url: URL) -> Photo? { photoByURL[url] }
+
+    /// Saves the catalog a moment after the last of a burst of changes.
+    private func scheduleCatalogSave() {
+        pendingCatalogSave?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated {
+                self?.pendingCatalogSave = nil
+                self?.saveCatalog()
+            }
+        }
+        pendingCatalogSave = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2, execute: work)
+    }
+}
+
