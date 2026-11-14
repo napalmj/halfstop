@@ -13,7 +13,7 @@ enum EditLimits {
     static let grow = -100.0...100.0
     static let softness = 0.0...100.0
     static let straighten = -45.0...45.0
-    /// The global sliders, as the panel shows them (values from outside, like local AI control, are clamped to these).
+    /// The global sliders, as the panel shows them (values from outside, like the `halfstop` command, are clamped to these).
     static let slider = -100.0...100.0
     static let exposure = -5.0...5.0
     static let detail = 0.0...100.0

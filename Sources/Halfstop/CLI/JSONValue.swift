@@ -1,7 +1,7 @@
 import Foundation
 
-/// A JSON value with exact types (an integer stays an integer, `true` is never the number 1), so
-/// requests can be validated strictly and replies are built without `Any`.
+/// A JSON value with exact types (an integer stays an integer, `true` is never the number 1), so the
+/// command-line tool's `--json` output is built without `Any` and always prints the same way.
 enum JSONValue: Equatable, Sendable {
     case null
     case bool(Bool)
@@ -11,13 +11,13 @@ enum JSONValue: Equatable, Sendable {
     case array([JSONValue])
     case object([String: JSONValue])
 
-    /// Deepest nesting a request may have: MCP messages need a handful of levels.
+    /// Deepest nesting `parse` accepts (the tool's own output needs a handful of levels).
     static let maxDepth = 32
 
     enum ParseError: Error, Equatable { case invalid, tooDeep }
 
-    /// Parses a complete JSON text (UTF-8). Nesting is checked first, on the raw bytes, so a
-    /// hostile `[[[[…` can't exhaust the parser's stack.
+    /// Parses a complete JSON text (UTF-8), for the self-test reading the tool's output. Nesting is
+    /// checked first, on the raw bytes, so a hostile `[[[[…` can't exhaust the parser's stack.
     static func parse(_ data: Data) -> Result<JSONValue, ParseError> {
         guard depth(of: data) <= maxDepth else { return .failure(.tooDeep) }
         guard let any = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]),
@@ -157,7 +157,7 @@ enum JSONValue: Equatable, Sendable {
         }
     }
 
-    /// A number rounded to `places` decimals, for compact replies.
+    /// A number rounded to `places` decimals, for compact output.
     static func number(_ d: Double, places: Int = 4) -> JSONValue {
         guard d.isFinite else { return .null }
         let f = pow(10, Double(places))

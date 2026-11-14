@@ -16,22 +16,6 @@ enum SelfTest {
             makeSamples(in: URL(fileURLWithPath: args[i + 1]))
             exit(0)
         }
-        if let i = args.firstIndex(of: "--serve-control"), i + 1 < args.count {
-            let dir = URL(fileURLWithPath: args[i + 1])
-            guard TestOutput.claim(dir) else {
-                print("--serve-control: \(dir.path) isn't empty and wasn't made by a test run. Choose a new or empty folder.")
-                exit(2)
-            }
-            ThumbnailDiskCache.directory = dir.appendingPathComponent("thumbcache", isDirectory: true)
-            func option(_ name: String) -> Int? { args.firstIndex(of: name).flatMap { $0 + 1 < args.count ? Int(args[$0 + 1]) : nil } }
-            var done = false
-            Task { @MainActor in
-                await ControlDemo.run(dir: dir, port: option("--port") ?? LocalControl.defaultPort, seconds: option("--seconds") ?? 120)
-                done = true
-            }
-            while !done { RunLoop.main.run(until: Date().addingTimeInterval(0.05)) }
-            exit(0)
-        }
         if let i = args.firstIndex(of: "--selftest"), i + 1 < args.count {
             let dir = URL(fileURLWithPath: args[i + 1])
             // The test deletes and recreates folders inside `dir`: never let it loose on one it didn't make.
@@ -1194,28 +1178,15 @@ enum Snapshot {
             let settings = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: 560), styleMask: [.titled],
                                     backing: .buffered, defer: false)
             settings.appearance = NSAppearance(named: .darkAqua)
-            // A throwaway control (in-memory token, nothing remembered), shown off, then on.
-            let control = LocalControl(runner: StoreToolRunner(store: store), tokenStore: MemoryTokenStore(), defaults: nil)
-            settings.contentView = NSHostingView(rootView: SettingsView().environment(store).environment(control)
-                .preferredColorScheme(.dark))
+            settings.contentView = NSHostingView(rootView: SettingsView().environment(store).preferredColorScheme(.dark))
             settings.orderFront(nil)
-            @MainActor func shotSettings(_ name: String) {
-                if let view = settings.contentView, let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
-                    view.cacheDisplay(in: view.bounds, to: rep)
-                    try? rep.representation(using: .png, properties: [:])?.write(to: dir.appendingPathComponent(name + ".png"))
-                    print("snapshot \(name)")
-                }
-            }
             await wait(1)
-            shotSettings("12-settings")
-            if let port = LibraryTest.freeLoopbackPort() {
-                control.port = port
-                control.enabled = true
-                await wait(1.5)
-                settings.setContentSize(settings.contentView?.fittingSize ?? settings.frame.size)
-                await wait(0.5)
-                shotSettings("12b-settings-ai-control-on")
-                control.enabled = false
+            settings.setContentSize(settings.contentView?.fittingSize ?? settings.frame.size)
+            await wait(0.5)
+            if let view = settings.contentView, let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
+                view.cacheDisplay(in: view.bounds, to: rep)
+                try? rep.representation(using: .png, properties: [:])?.write(to: dir.appendingPathComponent("12-settings.png"))
+                print("snapshot 12-settings")
             }
             settings.close()
             store.flushSaves()
@@ -1570,7 +1541,8 @@ enum LibraryTest {
         check("sort by rating puts the best first", store.visiblePhotos.first?.rating == 5, "")
         store.sortOrder = savedSort; store.sortDescending = savedDesc
 
-        await controlChecks(store: store, check: check)
+        await commandLineChecks(dir: dir.appendingPathComponent("cli"), check: check)
+        await syncChecks(dir: dir.appendingPathComponent("sync"), check: check)
         await sidecarChecks(dir: dir.appendingPathComponent("sidecars"), check: check)
         await scaleChecks(dir: dir.appendingPathComponent("scale"), check: check)
         toleranceChecks(dir: dir.appendingPathComponent("tolerance"), check: check)
@@ -1609,7 +1581,7 @@ extension LibraryTest {
         sidecar.history = history
         sidecar.historyIndex = history.count - 1
 
-        try? SidecarFiles.write(sidecar, for: photo, history: true)
+        _ = try? SidecarFiles.write(sidecar, for: photo, history: true)
         let back = SidecarFiles.read(for: photo)
         check("history round-trips", back?.history == history && back?.historyIndex == history.count - 1 && back?.rating == 3, "")
         let mainSize = (try? fm.attributesOfItem(atPath: SidecarFiles.mainURL(for: photo).path)[.size] as? Int) ?? 0
@@ -1623,7 +1595,7 @@ extension LibraryTest {
         var rated = sidecar
         rated.rating = 5
         rated.history = Array(history.prefix(2))
-        try? SidecarFiles.write(rated, for: photo, history: false)
+        _ = try? SidecarFiles.write(rated, for: photo, history: false)
         let afterRating = SidecarFiles.read(for: photo)
         check("rating save leaves history alone", afterRating?.rating == 5 && afterRating?.history.count == history.count, "")
 
@@ -1636,7 +1608,7 @@ extension LibraryTest {
         check("older inline-history sidecar loads", legacyBack?.history == history, "")
         if var lb = legacyBack {
             lb.rating = 1
-            try? SidecarFiles.write(lb, for: legacy, history: false)
+            _ = try? SidecarFiles.write(lb, for: legacy, history: false)
             let migrated = SidecarFiles.read(for: legacy)
             check("older history moves to its own file", fm.fileExists(atPath: SidecarFiles.historyURL(for: legacy).path)
                   && migrated?.history == history && migrated?.rating == 1, "")
@@ -1651,7 +1623,7 @@ extension LibraryTest {
               && SidecarFiles.read(for: renamed)?.history.count == history.count, "")
 
         // Nothing left to keep: both files go.
-        try? SidecarFiles.write(Sidecar(), for: renamed, history: true)
+        _ = try? SidecarFiles.write(Sidecar(), for: renamed, history: true)
         check("empty sidecar removes both files", !fm.fileExists(atPath: SidecarFiles.mainURL(for: renamed).path)
               && !fm.fileExists(atPath: SidecarFiles.historyURL(for: renamed).path), "")
 
@@ -1998,7 +1970,7 @@ extension LibraryTest {
         try? fm.copyItem(at: photo, to: clean)
         var good = Sidecar(); good.rating = 2; good.adjustments = a
         good.history = history; good.historyIndex = 1
-        try? SidecarFiles.write(good, for: clean, history: true)
+        _ = try? SidecarFiles.write(good, for: clean, history: true)
         let cleanBack = SidecarFiles.read(for: clean)
         check("a clean sidecar round-trips without a backup", cleanBack?.adjustments == a && cleanBack?.history == history
               && backups().count == 2, "")

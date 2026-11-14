@@ -68,15 +68,44 @@ enum SidecarFiles {
     /// dropped (or a file can't be read at all), the file is copied aside first, since the next
     /// save rewrites it without the missing parts.
     static func read(for photo: URL) -> Sidecar? {
+        decode(snapshot(for: photo), for: photo)
+    }
+
+    /// The sidecar and the revision it was read at.
+    static func load(for photo: URL) -> (sidecar: Sidecar?, revision: SidecarRevision) {
+        let disk = snapshot(for: photo)
+        return (decode(disk, for: photo), disk.revision)
+    }
+
+    /// The raw bytes of both files (nil for a missing, unsafe or unreadable one) and their revision.
+    /// Files whose stamp matches `known` aren't read again; their bytes are then nil and
+    /// `reused` says so.
+    static func snapshot(for photo: URL, known: SidecarRevision? = nil) -> SidecarSnapshot {
         let main = mainURL(for: photo), hist = historyURL(for: photo)
-        guard isSafe(main, for: photo), let data = try? Data(contentsOf: main) else { return nil }
+        func one(_ url: URL, _ known: SidecarFileState?) -> (Data?, SidecarFileState?, Bool) {
+            guard isSafe(url, for: photo), let stamp = SidecarFileState.Stamp(url) else { return (nil, nil, false) }
+            if let known, known.stamp == stamp { return (nil, known, true) }
+            guard let data = try? Data(contentsOf: url) else { return (nil, nil, false) }
+            // Stamped before reading: a write in between changes the stamp, so it is never taken for this content.
+            return (data, SidecarFileState(stamp: stamp, hash: SidecarFileState.hash(data)), false)
+        }
+        let (m, ms, mr) = one(main, known?.main)
+        let (h, hs, hr) = one(hist, known?.history)
+        return SidecarSnapshot(main: m, history: h, revision: SidecarRevision(main: ms, history: hs), reusedMain: mr, reusedHistory: hr)
+    }
+
+    /// Decodes a snapshot read with `snapshot(for:)` (without `known`), keeping copies of files
+    /// that couldn't be read in full.
+    static func decode(_ disk: SidecarSnapshot, for photo: URL) -> Sidecar? {
+        let main = mainURL(for: photo), hist = historyURL(for: photo)
+        guard let data = disk.main else { return nil }
         let report = DecodeReport()
         guard var sidecar = try? JSONDecoder.reporting(into: report).decode(Sidecar.self, from: data) else {
             FileBackup.keepPartiallyLoaded(main, data: data)
             return nil
         }
         if report.dropped > 0 { FileBackup.keepPartiallyLoaded(main, data: data) }
-        if isSafe(hist, for: photo), let data = try? Data(contentsOf: hist) {
+        if let data = disk.history {
             let report = DecodeReport()
             if let file = try? JSONDecoder.reporting(into: report).decode(HistoryFile.self, from: data) {
                 sidecar.history = file.historySteps()
@@ -89,26 +118,58 @@ enum SidecarFiles {
         return sidecar
     }
 
-    /// - Parameter history: also write the history file. Ignored (written anyway) when the history
-    ///   only exists inline in an older sidecar, so it isn't lost when the main file is rewritten.
+    /// - Parameters:
+    ///   - history: also write the history file. Ignored (written anyway) when the history only
+    ///     exists inline in an older sidecar, so it isn't lost when the main file is rewritten.
+    ///   - keepingUnknownFrom: the files as they were read: fields this version doesn't know (written
+    ///     by a newer Halfstop) are carried over instead of dropped. The `halfstop` command uses it.
+    /// - Returns: the revision written.
     /// Throws when the sidecar folder is unsafe (see `checkSafe`) or a file can't be written.
-    static func write(_ sidecar: Sidecar, for photo: URL, history: Bool) throws {
+    @discardableResult
+    static func write(_ sidecar: Sidecar, for photo: URL, history: Bool, keepingUnknownFrom previous: SidecarSnapshot? = nil) throws -> SidecarRevision {
         let main = mainURL(for: photo), hist = historyURL(for: photo)
         try checkSafe(main, for: photo)
         try checkSafe(hist, for: photo)
         let fm = FileManager.default
         if sidecar.isEmpty {
             for url in [main, hist] where LibraryFiles.kind(url) != nil { try fm.removeItem(at: url) }
-            return
+            return SidecarRevision(main: nil, history: nil)
         }
         try fm.createDirectory(at: main.deletingLastPathComponent(), withIntermediateDirectories: true)
         try checkSafe(main, for: photo)   // nothing swapped in while creating it
-        let encoder = JSONEncoder()
         let writeHistory = history || (!fm.fileExists(atPath: hist.path) && sidecar.history.count > 1)
+        var historyState: SidecarFileState?
         if writeHistory {
-            try encoder.encode(HistoryFile(sidecar.history, index: sidecar.historyIndex)).write(to: hist, options: .atomic)
+            var data = try encodeHistory(sidecar)
+            if let old = previous?.history { data = UnknownFields.carry(from: old, roundTrip: roundTripHistory, into: data, kind: .history) }
+            try data.write(to: hist, options: .atomic)
+            historyState = SidecarFileState(url: hist, data: data)
+        } else if let stamp = SidecarFileState.Stamp(hist) {
+            // Unchanged: reuse what's known about it, else read it to know its content.
+            if let known = previous?.revision.history, known.stamp == stamp {
+                historyState = known
+            } else if let data = try? Data(contentsOf: hist) {
+                historyState = SidecarFileState(stamp: stamp, hash: SidecarFileState.hash(data))
+            }
         }
-        try encoder.encode(MainFile(sidecar)).write(to: main, options: .atomic)
+        var data = try encodeMain(sidecar)
+        if let old = previous?.main { data = UnknownFields.carry(from: old, roundTrip: roundTripMain, into: data, kind: .main) }
+        try data.write(to: main, options: .atomic)
+        return SidecarRevision(main: SidecarFileState(url: main, data: data), history: historyState)
+    }
+
+    static func encodeMain(_ s: Sidecar) throws -> Data { try JSONEncoder().encode(MainFile(s)) }
+    static func encodeHistory(_ s: Sidecar) throws -> Data { try JSONEncoder().encode(HistoryFile(s.history, index: s.historyIndex)) }
+
+    /// What this version writes back for a main file it read unchanged (nil if it can't read it).
+    static func roundTripMain(_ data: Data) -> Data? {
+        guard let s = try? JSONDecoder().decode(Sidecar.self, from: data) else { return nil }
+        return try? encodeMain(s)
+    }
+
+    static func roundTripHistory(_ data: Data) -> Data? {
+        guard let file = try? JSONDecoder().decode(HistoryFile.self, from: data) else { return nil }
+        return try? JSONEncoder().encode(HistoryFile(file.historySteps(), index: file.index))
     }
 }
 
@@ -141,9 +202,12 @@ struct HistoryFile: Codable {
         var adjustments: Adjustments
         /// Mask id → its strokes, in order, as keys into `strokes`.
         var strokeRefs: [String: [String]]?
+        /// `HistoryStep.commandLine`; left out when false.
+        var commandLine: Bool?
 
-        init(id: UUID, label: String, date: Date, adjustments: Adjustments, strokeRefs: [String: [String]]?) {
+        init(id: UUID, label: String, date: Date, adjustments: Adjustments, strokeRefs: [String: [String]]?, commandLine: Bool? = nil) {
             self.id = id; self.label = label; self.date = date; self.adjustments = adjustments; self.strokeRefs = strokeRefs
+            self.commandLine = commandLine
         }
 
         init(from decoder: Decoder) throws {
@@ -153,6 +217,7 @@ struct HistoryFile: Codable {
             date = t.value(.date, Date())
             adjustments = try t.required(.adjustments)
             strokeRefs = t.dictionary(.strokeRefs)
+            commandLine = t.optional(.commandLine)
         }
     }
 
@@ -175,7 +240,8 @@ struct HistoryFile: Codable {
                 refs[a.masks[i].id.uuidString] = a.masks[i].strokes.map { HistoryFile.intern($0, into: &pool) }
                 a.masks[i].strokes = []
             }
-            return Step(id: step.id, label: step.label, date: step.date, adjustments: a, strokeRefs: refs.isEmpty ? nil : refs)
+            return Step(id: step.id, label: step.label, date: step.date, adjustments: a, strokeRefs: refs.isEmpty ? nil : refs,
+                        commandLine: step.commandLine ? true : nil)
         }
         strokes = pool
     }
@@ -188,7 +254,7 @@ struct HistoryFile: Codable {
                     if let keys = refs[a.masks[i].id.uuidString] { a.masks[i].strokes = keys.compactMap { strokes[$0] } }
                 }
             }
-            return HistoryStep(id: step.id, label: step.label, date: step.date, adjustments: a)
+            return HistoryStep(id: step.id, label: step.label, date: step.date, adjustments: a, commandLine: step.commandLine ?? false)
         }
     }
 

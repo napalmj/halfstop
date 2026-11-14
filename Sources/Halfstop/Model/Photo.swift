@@ -11,9 +11,12 @@ struct HistoryStep: Codable, Identifiable, Hashable {
     var label: String
     var date = Date()
     var adjustments: Adjustments
+    /// Made by the `halfstop` command rather than in the app. Such a step doesn't count as an edit
+    /// by hand for "Learn from my edits" while it's the photo's current step.
+    var commandLine = false
 
-    init(id: UUID = UUID(), label: String, date: Date = Date(), adjustments: Adjustments) {
-        self.id = id; self.label = label; self.date = date; self.adjustments = adjustments
+    init(id: UUID = UUID(), label: String, date: Date = Date(), adjustments: Adjustments, commandLine: Bool = false) {
+        self.id = id; self.label = label; self.date = date; self.adjustments = adjustments; self.commandLine = commandLine
     }
 
     init(from decoder: Decoder) throws {
@@ -22,6 +25,7 @@ struct HistoryStep: Codable, Identifiable, Hashable {
         label = t.value(.label, "Edit")
         date = t.value(.date, Date())
         adjustments = try t.required(.adjustments)
+        commandLine = t.value(.commandLine, false)
     }
 }
 
@@ -73,6 +77,20 @@ struct Sidecar: Codable {
     var isEmpty: Bool {
         rating == 0 && flag == .none && adjustments.isDefault && history.count <= 1 && snapshots.isEmpty
     }
+
+    /// With a history to undo into: one that has none starts from what's on disk now, and the
+    /// current step is kept inside it. Photos in the app and the `halfstop` command start the same way.
+    mutating func ensureHistory() {
+        if history.isEmpty {
+            history = [HistoryStep(label: adjustments.isDefault ? "Original" : "Opened", adjustments: adjustments)]
+            historyIndex = 0
+        } else {
+            historyIndex = min(max(historyIndex, 0), history.count - 1)
+        }
+    }
+
+    /// The step the photo is at.
+    var currentStep: HistoryStep? { history.indices.contains(historyIndex) ? history[historyIndex] : nil }
 }
 
 @Observable
@@ -102,14 +120,28 @@ final class Photo: Identifiable, Hashable {
         self.flag = sidecar.flag
         self.adjustments = sidecar.adjustments
         self.snapshots = sidecar.snapshots
-        if sidecar.history.isEmpty {
-            // Start every photo's history from what's on disk now.
-            self.history = [HistoryStep(label: sidecar.adjustments.isDefault ? "Original" : "Opened", adjustments: sidecar.adjustments)]
-            self.historyIndex = 0
-        } else {
-            self.history = sidecar.history
-            self.historyIndex = min(max(sidecar.historyIndex, 0), sidecar.history.count - 1)
-        }
+        // Start every photo's history from what's on disk now.
+        var s = sidecar
+        s.ensureHistory()
+        self.history = s.history
+        self.historyIndex = s.historyIndex
+    }
+
+    /// Takes on a sidecar's contents (edits reloaded from disk).
+    func adopt(_ sidecar: Sidecar) {
+        var s = sidecar
+        s.ensureHistory()
+        if rating != s.rating { rating = s.rating }
+        if flag != s.flag { flag = s.flag }
+        if snapshots != s.snapshots { snapshots = s.snapshots }
+        if history != s.history { history = s.history }
+        if historyIndex != s.historyIndex { historyIndex = s.historyIndex }
+        if adjustments != s.adjustments { adjustments = s.adjustments }
+    }
+
+    /// Whether its current step was made by the `halfstop` command.
+    var atCommandLineStep: Bool {
+        history.indices.contains(historyIndex) && history[historyIndex].commandLine
     }
 
     var sidecar: Sidecar {

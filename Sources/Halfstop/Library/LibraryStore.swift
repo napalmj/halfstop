@@ -116,6 +116,9 @@ final class LibraryStore {
     var importPrefill: URL?
     @ObservationIgnored let catalogURL: URL
     @ObservationIgnored private var watcher: FolderWatcher?
+    /// What each photo's sidecar files held when the app last read or wrote them, so a change made
+    /// outside the app (the `halfstop` command) is noticed, shown and never overwritten.
+    nonisolated let sync = SidecarSync()
     @ObservationIgnored private var reloadPending = false
 
     // Navigation
@@ -234,9 +237,11 @@ final class LibraryStore {
             saveCatalog()
         }
         if watch {
-            watcher = FolderWatcher { [weak self] paths in
+            watcher = FolderWatcher(onChange: { [weak self] paths in
                 MainActor.assumeIsolated { self?.scheduleReload(changed: paths) }
-            }
+            }, onSidecarChange: { [weak self] paths in
+                MainActor.assumeIsolated { self?.sidecarsChanged(paths) }
+            })
         }
         reload()
     }
@@ -428,8 +433,13 @@ final class LibraryStore {
             await MainActor.run {
                 var scanned: [UUID: [Photo]] = [:]
                 for item in found {
-                    let p = existing[item.url].flatMap { $0.ref == item.ref ? $0 : nil }
-                        ?? Photo(url: item.url, ref: item.ref, sidecar: item.sidecar ?? Sidecar())
+                    let p: Photo
+                    if let kept = existing[item.url].flatMap({ $0.ref == item.ref ? $0 : nil }) {
+                        p = kept
+                    } else {
+                        p = Photo(url: item.url, ref: item.ref, sidecar: item.sidecar ?? Sidecar())
+                        self.sync.record(item.url, revision: item.revision, base: p.sidecar)
+                    }
                     scanned[item.ref.folder, default: []].append(p)
                 }
                 // Folders in catalog order; untouched ones keep the photos (and order) they had.
@@ -444,6 +454,7 @@ final class LibraryStore {
                 }
                 self.scanOrder = Dictionary(list.enumerated().map { ($1.url, $0) }, uniquingKeysWith: { a, _ in a })
                 self.photos = self.sorted(list)
+                self.sync.keep(only: Set(list.map(\.url)))
                 self.isLoading = false
                 self.keepCurrentVisible()
                 self.backfillFingerprints()
@@ -457,6 +468,7 @@ final class LibraryStore {
         let url: URL
         let ref: PhotoRef
         let sidecar: Sidecar?
+        let revision: SidecarRevision
     }
 
     nonisolated static func scanCatalog(_ catalog: Catalog, known: Set<URL>, only: Set<UUID>? = nil) -> [ScannedPhoto] {
@@ -475,17 +487,24 @@ final class LibraryStore {
         let box = SidecarBox(count: entries.count)
         DispatchQueue.concurrentPerform(iterations: need.count) { k in
             let i = need[k]
-            box.set(i, SidecarFiles.read(for: entries[i].url))
+            let url = entries[i].url
+            // Under the folder's lock, so a write by the `halfstop` command is never half read.
+            let loaded = (try? SidecarLock.with(url, exclusive: false, create: false) { SidecarFiles.load(for: url) })
+                ?? SidecarFiles.load(for: url)
+            box.set(i, loaded)
         }
-        return entries.indices.map { ScannedPhoto(url: entries[$0].url, ref: entries[$0].ref, sidecar: box.get($0)) }
+        return entries.indices.map {
+            let loaded = box.get($0)
+            return ScannedPhoto(url: entries[$0].url, ref: entries[$0].ref, sidecar: loaded.sidecar, revision: loaded.revision)
+        }
     }
 
     private final class SidecarBox: @unchecked Sendable {
-        private var items: [Sidecar?]
+        private var items: [(sidecar: Sidecar?, revision: SidecarRevision)]
         private let lock = NSLock()
-        init(count: Int) { items = Array(repeating: nil, count: count) }
-        func set(_ i: Int, _ s: Sidecar?) { lock.lock(); items[i] = s; lock.unlock() }
-        func get(_ i: Int) -> Sidecar? { lock.lock(); defer { lock.unlock() }; return items[i] }
+        init(count: Int) { items = Array(repeating: (nil, .none), count: count) }
+        func set(_ i: Int, _ s: (sidecar: Sidecar?, revision: SidecarRevision)) { lock.lock(); items[i] = s; lock.unlock() }
+        func get(_ i: Int) -> (sidecar: Sidecar?, revision: SidecarRevision) { lock.lock(); defer { lock.unlock() }; return items[i] }
     }
 
     nonisolated static func sidecarURL(for photo: URL) -> URL { SidecarFiles.mainURL(for: photo) }
@@ -638,10 +657,11 @@ final class LibraryStore {
         pendingSaves[url]?.cancel()
         let withHistory = historyDirty.contains(url)
         let token = UUID()
+        let sync = self.sync, epoch = sync.epoch(url)
         let work = DispatchWorkItem { [weak self] in
-            let failure = LibraryStore.writeSidecar(sidecar, for: url, history: withHistory)
+            let outcome = sync.save(sidecar, for: url, history: withHistory, epoch: epoch)
             DispatchQueue.main.async {
-                MainActor.assumeIsolated { self?.didWrite(url, token: token, sidecar: sidecar, failure: failure) }
+                MainActor.assumeIsolated { self?.didWrite(url, token: token, sidecar: sidecar, outcome: outcome) }
             }
         }
         pendingSaves[url] = work
@@ -650,11 +670,25 @@ final class LibraryStore {
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay, execute: work)
     }
 
-    private func didWrite(_ url: URL, token: UUID, sidecar: Sidecar, failure: String?) {
+    private func didWrite(_ url: URL, token: UUID, sidecar: Sidecar, outcome: SidecarSync.SaveOutcome) {
+        if case .changedOnDisk(let change) = outcome {
+            if pendingTokens[url] == token {
+                pendingTokens[url] = nil
+                pendingSaves[url] = nil
+                unsavedCount = pendingSaves.count
+            }
+            // Saved again, merged, if the app had changes of its own.
+            takeExternalChange(change)
+            return
+        }
         guard pendingTokens[url] == token else { return }
         pendingTokens[url] = nil
         pendingSaves[url] = nil
-        recordSave(url, sidecar: sidecar, failure: failure)
+        switch outcome {
+        case .saved: recordSave(url, sidecar: sidecar, failure: nil)
+        case .failed(let error): recordSave(url, sidecar: sidecar, failure: Self.describeSaveError(error))
+        case .superseded, .changedOnDisk: break
+        }
         unsavedCount = pendingSaves.count
     }
 
@@ -689,11 +723,28 @@ final class LibraryStore {
         pendingSaves = [:]
         pendingTokens = [:]
         for url in urls {
-            guard let sidecar = photoByURL[url]?.sidecar ?? failedSnapshots[url]?.sidecar else { continue }
-            if failedSnapshots[url]?.history == true { historyDirty.insert(url) }
-            let failure = LibraryStore.writeSidecar(sidecar, for: url, history: historyDirty.contains(url))
-            recordSave(url, sidecar: sidecar, failure: failure)
+            // A change on disk found while saving is merged in, then saved (a few rounds at most).
+            attempts: for _ in 0..<3 {
+                guard let sidecar = photoByURL[url]?.sidecar ?? failedSnapshots[url]?.sidecar else { break }
+                if failedSnapshots[url]?.history == true { historyDirty.insert(url) }
+                switch sync.save(sidecar, for: url, history: historyDirty.contains(url), epoch: sync.epoch(url)) {
+                case .saved:
+                    recordSave(url, sidecar: sidecar, failure: nil)
+                    break attempts
+                case .failed(let error):
+                    recordSave(url, sidecar: sidecar, failure: Self.describeSaveError(error))
+                    break attempts
+                case .changedOnDisk(let change):
+                    guard takeExternalChange(change, scheduleSave: false) else { break attempts }
+                    historyDirty.insert(url)
+                case .superseded:
+                    continue
+                }
+            }
         }
+        for (_, work) in pendingSaves { work.cancel() }
+        pendingSaves = [:]
+        pendingTokens = [:]
         unsavedCount = 0
         if let pending = pendingCatalogSave {
             // Learned samples waiting to be written.
@@ -764,10 +815,14 @@ final class LibraryStore {
         }
     }
 
-    /// Writes the sidecar; returns why it couldn't be, or nil when it was saved.
+    /// Writes the sidecar of a photo that isn't loaded yet (presets at import), holding the folder's
+    /// sidecar lock; returns why it couldn't be, or nil when it was saved.
+    @discardableResult
     nonisolated static func writeSidecar(_ sidecar: Sidecar, for url: URL, history: Bool) -> String? {
         do {
-            try SidecarFiles.write(sidecar, for: url, history: history)
+            try SidecarLock.with(url, exclusive: true, create: !sidecar.isEmpty) {
+                _ = try SidecarFiles.write(sidecar, for: url, history: history)
+            }
             return nil
         } catch {
             return describeSaveError(error)
@@ -777,6 +832,7 @@ final class LibraryStore {
     /// A short, plain reason for a failed save.
     nonisolated static func describeSaveError(_ error: Error) -> String {
         if error is SidecarFiles.Failure { return "The edits folder is a link, so it isn’t used" }
+        if error is SidecarLock.Failure { return "Another program kept the edits locked; trying again" }
         let ns = error as NSError
         var posix: Int32?
         if ns.domain == NSPOSIXErrorDomain { posix = Int32(ns.code) }
@@ -893,6 +949,7 @@ final class LibraryStore {
             // Don't let a pending save or history step recreate the sidecar afterwards.
             pendingSaves[p.url]?.cancel(); pendingSaves[p.url] = nil; pendingTokens[p.url] = nil; historyDirty.remove(p.url)
             pendingCommits[p.url]?.cancel(); pendingCommits[p.url] = nil
+            sync.forget(p.url)
             do {
                 try Self.trashFile(p.url)
                 for sidecar in SidecarFiles.all(for: p.url) where fm.fileExists(atPath: sidecar.path) && SidecarFiles.isSafe(sidecar, for: p.url) {
@@ -945,7 +1002,7 @@ final class LibraryStore {
 
     // MARK: - Editing & history
 
-    static let historyLimit = 100
+    nonisolated static let historyLimit = 100
     /// Pause after the last change before it becomes a history step (one slider drag = one step).
     static let historySettle: TimeInterval = 0.6
 
@@ -1083,17 +1140,6 @@ final class LibraryStore {
         let work = DispatchWorkItem { [weak self] in self?.hint = nil }
         hintTimer = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.5, execute: work)
-    }
-
-    /// Sets the open photo's edits as one labelled history step (local AI control).
-    /// Returns false, adding no step, when there's no photo or nothing would change.
-    @discardableResult
-    func applyToCurrent(_ adjustments: Adjustments, label: String) -> Bool {
-        guard let photo = current else { return false }
-        commitPending(photo)
-        guard adjustments != photo.adjustments else { return false }
-        applyStep(photo, adjustments, label: label)
-        return true
     }
 
     private func applyStep(_ photo: Photo, _ adjustments: Adjustments, label: String) {
@@ -1408,6 +1454,86 @@ struct TrashRequest: Identifiable {
     let rejectedOnly: Bool
 }
 
+// MARK: - Changes made outside the app
+
+extension LibraryStore {
+    /// The photo a sidecar file belongs to: `<folder>/.halfstop/<name>.json` or `.history.json`.
+    nonisolated static func photoURL(forSidecarPath path: String) -> URL? {
+        let url = URL(fileURLWithPath: path)
+        let dir = url.deletingLastPathComponent()
+        guard dir.lastPathComponent == SidecarFiles.folderName else { return nil }
+        let file = url.lastPathComponent
+        let name: String
+        if file.hasSuffix(".history.json") {
+            name = String(file.dropLast(".history.json".count))
+        } else if file.hasSuffix(".json") {
+            name = String(file.dropLast(".json".count))
+        } else {
+            return nil
+        }
+        guard !name.isEmpty, !name.hasPrefix(".") else { return nil }
+        return dir.deletingLastPathComponent().appendingPathComponent(name)
+    }
+
+    /// FSEvents saw sidecar files change: look for changes made outside the app, in the background.
+    func sidecarsChanged(_ paths: [String]) {
+        let urls = Set(paths.compactMap(Self.photoURL(forSidecarPath:)).filter { photoByURL[$0] != nil })
+        guard !urls.isEmpty else { return }
+        Task { await checkSidecars(urls) }
+    }
+
+    /// Reads these photos' sidecars off the main thread and takes in any change made outside the app.
+    /// The app's own saves are recognized (same content as it last wrote) and ignored.
+    func checkSidecars(_ urls: Set<URL>) async {
+        let sync = self.sync
+        let changes = await Task.detached(priority: .utility) { urls.sorted { $0.path < $1.path }.compactMap { sync.check($0) } }.value
+        for change in changes { takeExternalChange(change) }
+    }
+
+    /// Takes in a photo's sidecar as changed on disk by another program. The rule (`SidecarMerge`):
+    /// with no unsaved changes in the app, the disk's version replaces the photo's edits, history
+    /// included; otherwise the app's changes are applied on top as a new step and saved. Either way
+    /// it can be undone in the app. Returns whether the result still has to be saved.
+    @discardableResult
+    func takeExternalChange(_ change: ExternalSidecarChange, scheduleSave save: Bool = true) -> Bool {
+        let url = change.url
+        // An older find (a newer one is on its way), or a photo that's gone.
+        guard change.epoch == sync.epoch(url), let photo = photoByURL[url], let known = sync.state(url) else { return false }
+        commitPending(photo)
+        var theirs = change.sidecar
+        theirs.ensureHistory()
+        let result = SidecarMerge.merge(base: known.base, ours: photo.sidecar, theirs: theirs, historyLimit: Self.historyLimit)
+        sync.record(url, revision: change.revision, base: theirs)
+        // Saves of the app's older version are void now.
+        pendingSaves[url]?.cancel()
+        pendingSaves[url] = nil
+        pendingTokens[url] = nil
+        historyDirty.remove(url)
+        photo.adopt(result.sidecar)
+        if let id = activeMaskID, photo === current, !photo.adjustments.masks.contains(where: { $0.id == id }) { activeMaskID = nil }
+        if result.keptLocalChanges {
+            historyDirty.insert(url)
+            if save { scheduleWrite(url, sidecar: photo.sidecar, delay: 0) }
+        } else {
+            failedSaves[url] = nil
+            failedSnapshots[url] = nil
+        }
+        unsavedCount = pendingSaves.count
+        updateRetryTimer()
+        refreshStyleEntry(photo)
+        if photo === current {
+            if result.keptLocalChanges {
+                showHint("Merged with changes made outside Halfstop")
+            } else if theirs.currentStep?.commandLine == true {
+                showHint("Updated from the command line: \(theirs.currentStep?.label ?? "")")
+            } else {
+                showHint("Updated with changes made outside Halfstop")
+            }
+        }
+        return result.keptLocalChanges
+    }
+}
+
 // MARK: - Learn from my edits
 
 extension LibraryStore {
@@ -1429,9 +1555,21 @@ extension LibraryStore {
     func rebuildStyleModel() {
         styleModel.removeAll()
         if learnFromEdits {
-            for p in photos {
+            // A photo whose current step came from the `halfstop` command isn't an edit by hand.
+            for p in photos where !p.atCommandLineStep {
                 if let sample = catalog.styleSamples[p.ref.key] { styleModel.update(p.ref.key, sample: sample, adjustments: p.adjustments) }
             }
+        }
+        updateStyleActive()
+    }
+
+    /// After the photo's edits were reloaded from disk: its entry follows them, without measuring.
+    func refreshStyleEntry(_ photo: Photo) {
+        guard learnFromEdits else { return }
+        if photo.atCommandLineStep {
+            styleModel.remove(photo.ref.key)
+        } else {
+            styleModel.update(photo.ref.key, sample: catalog.styleSamples[photo.ref.key], adjustments: photo.adjustments)
         }
         updateStyleActive()
     }
@@ -1445,6 +1583,11 @@ extension LibraryStore {
     /// but has no current sample, measures one in the background shortly after.
     func noteEdited(_ photo: Photo) {
         guard learnFromEdits else { return }
+        // Undo or redo onto a step made by the `halfstop` command: not an edit by hand.
+        guard !photo.atCommandLineStep else {
+            refreshStyleEntry(photo)
+            return
+        }
         let sample = catalog.styleSamples[photo.ref.key]
         styleModel.update(photo.ref.key, sample: sample, adjustments: photo.adjustments)
         updateStyleActive()
@@ -1484,7 +1627,7 @@ extension LibraryStore {
             let sample = StyleSample(features: features, auto: StyleSliders.values(result.applied(to: Adjustments())), crop: crop)
             self.catalog.styleSamples[ref.key] = sample
             self.scheduleCatalogSave()
-            if self.learnFromEdits {
+            if self.learnFromEdits, !photo.atCommandLineStep {
                 self.styleModel.update(ref.key, sample: sample, adjustments: photo.adjustments)
                 self.updateStyleActive()
             }

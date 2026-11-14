@@ -2,12 +2,32 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 
+/// The executable's entry point. `halfstop <command> …` (see `CommandLineTool`) runs without any
+/// window or Dock icon and exits; everything else starts the app.
 @main
+enum HalfstopMain {
+    static func main() {
+        let args = Array(CommandLine.arguments.dropFirst())
+        if CommandLineTool.handles(args) {
+            exit(CommandLineTool.main(args))
+        }
+        if CommandLineTool.startedThroughLink {
+            // `halfstop` on its own: the app runs only from its bundle, so explain instead.
+            if args.isEmpty {
+                print(CommandLineHelp.overview)
+                exit(0)
+            }
+            FileHandle.standardError.write(Data("halfstop: unknown command “\(args[0])”. Run halfstop --help. (To use the app, open Halfstop.app.)\n".utf8))
+            exit(2)
+        }
+        HalfstopApp.main()
+    }
+}
+
 struct HalfstopApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     @State private var store: LibraryStore
     @State private var renderer = PreviewRenderer()
-    @State private var localControl: LocalControl
 
     init() {
         SelfTest.runIfRequested()
@@ -17,9 +37,6 @@ struct HalfstopApp: App {
         let store = LibraryStore(catalogURL: Snapshot.catalogOverride ?? Catalog.defaultURL)
         LibraryStore.appStore = store
         _store = State(initialValue: store)
-        // Off unless the user switched it on in Settings. Snapshots never start it.
-        _localControl = State(initialValue: LocalControl(runner: StoreToolRunner(store: store),
-                                                         defaults: Snapshot.outputDir == nil ? .standard : nil))
     }
 
     var body: some Scene {
@@ -37,7 +54,6 @@ struct HalfstopApp: App {
         Settings {
             SettingsView()
                 .environment(store)
-                .environment(localControl)
                 .preferredColorScheme(.dark)
         }
 
