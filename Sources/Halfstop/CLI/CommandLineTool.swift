@@ -408,17 +408,25 @@ extension CommandLineTool {
 
         // MARK: Writing
 
+        /// The edits in `disk`, to be changed and written back; nil when there are none yet. Throws
+        /// when any part can't be read (damaged, or written by a newer Halfstop in a way this version
+        /// can't decode), since rewriting the files would drop that part.
+        func decodeForRewrite(_ disk: SidecarSnapshot, _ url: URL) throws -> Sidecar? {
+            var incomplete = false
+            let decoded = SidecarFiles.decode(disk, for: url, incomplete: &incomplete)
+            if incomplete {
+                throw CommandError("Part of its Halfstop edits can't be read by this version (damaged, or saved by a newer Halfstop), so it isn't changed (a copy was kept next to it).")
+            }
+            return decoded
+        }
+
         /// Reads the photo's sidecar holding the lock, lets `change` turn its edits into new ones
         /// (nil: nothing to do), and if they differ, adds one history step and writes it back
         /// atomically, keeping fields this version doesn't know.
         func edit(_ url: URL, label: String, _ change: (Adjustments) throws -> Adjustments?) throws -> (before: Sidecar, after: Sidecar)? {
             try SidecarLock.with(url, exclusive: true, create: true) {
                 let disk = SidecarFiles.snapshot(for: url)
-                let decoded = SidecarFiles.decode(disk, for: url)
-                if disk.main != nil, decoded == nil {
-                    throw CommandError("Its Halfstop edits file can't be read, so it isn't changed (a copy was kept next to it).")
-                }
-                var s = decoded ?? Sidecar()
+                var s = try decodeForRewrite(disk, url) ?? Sidecar()
                 s.ensureHistory()
                 let before = s
                 guard let next = try change(s.adjustments), next != s.adjustments else { return nil }
@@ -513,8 +521,7 @@ extension CommandLineTool {
         func step(_ url: URL, by delta: Int) throws -> Report {
             try SidecarLock.with(url, exclusive: true, create: false) {
                 let disk = SidecarFiles.snapshot(for: url)
-                guard var s = SidecarFiles.decode(disk, for: url) else {
-                    if disk.main != nil { throw CommandError("Its Halfstop edits file can't be read, so it isn't changed (a copy was kept next to it).") }
+                guard var s = try decodeForRewrite(disk, url) else {
                     return Report(json: ["changed": false, "reason": "no_history"], lines: [delta < 0 ? "nothing to undo" : "nothing to redo"])
                 }
                 s.ensureHistory()
@@ -635,8 +642,8 @@ struct LearnedStyle {
 
 enum RenderTarget {
     /// Why `dest` can't be written, or nil. Never the photo itself, never anything in an edits
-    /// folder or a photo with Halfstop edits, never a link or folder, and an existing file only with
-    /// `force`.
+    /// folder, a photo with Halfstop edits or a file with camera data, never a link or folder, and
+    /// an existing file only with `force`.
     static func problem(_ dest: URL, source: URL, force: Bool) -> String? {
         let ext = dest.pathExtension.lowercased()
         guard ext == "jpg" || ext == "jpeg" else { return "The output must be a .jpg file." }
@@ -667,8 +674,20 @@ enum RenderTarget {
             if LibraryFiles.kind(SidecarFiles.mainURL(for: dest)) != nil {
                 return "\(dest.lastPathComponent) is a photo with Halfstop edits; it's never replaced."
             }
+            if hasPhotoMetadata(dest) {
+                return "\(dest.lastPathComponent) is a photo (it has camera data); it's never replaced. Choose another name."
+            }
             return nil
         }
+    }
+
+    /// Whether the image at `url` carries photo metadata (Exif, TIFF, GPS or IPTC). Previews written
+    /// by `render` have none, so `--force` can replace them, but never a photo from a camera or phone.
+    static func hasPhotoMetadata(_ url: URL) -> Bool {
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary),
+              let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any] else { return false }
+        return [kCGImagePropertyExifDictionary, kCGImagePropertyTIFFDictionary, kCGImagePropertyGPSDictionary, kCGImagePropertyIPTCDictionary]
+            .contains { props[$0] != nil }
     }
 
     static func sameFile(_ a: URL, _ b: URL) -> Bool {

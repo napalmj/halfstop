@@ -724,23 +724,31 @@ final class LibraryStore {
         pendingTokens = [:]
         for url in urls {
             // A change on disk found while saving is merged in, then saved (a few rounds at most).
+            var unsaved: Sidecar?
             attempts: for _ in 0..<3 {
-                guard let sidecar = photoByURL[url]?.sidecar ?? failedSnapshots[url]?.sidecar else { break }
+                guard let sidecar = photoByURL[url]?.sidecar ?? failedSnapshots[url]?.sidecar else { unsaved = nil; break }
+                unsaved = sidecar
                 if failedSnapshots[url]?.history == true { historyDirty.insert(url) }
                 switch sync.save(sidecar, for: url, history: historyDirty.contains(url), epoch: sync.epoch(url)) {
                 case .saved:
                     recordSave(url, sidecar: sidecar, failure: nil)
+                    unsaved = nil
                     break attempts
                 case .failed(let error):
                     recordSave(url, sidecar: sidecar, failure: Self.describeSaveError(error))
+                    unsaved = nil
                     break attempts
                 case .changedOnDisk(let change):
-                    guard takeExternalChange(change, scheduleSave: false) else { break attempts }
+                    guard takeExternalChange(change, scheduleSave: false) else { unsaved = nil; break attempts }
                     historyDirty.insert(url)
+                    unsaved = photoByURL[url]?.sidecar
                 case .superseded:
                     continue
                 }
             }
+            // Still changing on disk after every round: keep the merged edits as a failed save, so
+            // they're retried (and shown) instead of silently dropped.
+            if let unsaved { recordSave(url, sidecar: unsaved, failure: "The edits kept changing on disk while saving; trying again") }
         }
         for (_, work) in pendingSaves { work.cancel() }
         pendingSaves = [:]
@@ -815,12 +823,15 @@ final class LibraryStore {
         }
     }
 
-    /// Writes the sidecar of a photo that isn't loaded yet (presets at import), holding the folder's
-    /// sidecar lock; returns why it couldn't be, or nil when it was saved.
+    /// Reads, changes and writes back the sidecar of a photo that isn't loaded yet (presets at
+    /// import), all holding the folder's sidecar lock, so an edit made meanwhile by the `halfstop`
+    /// command isn't lost; returns why it couldn't be saved, or nil when it was.
     @discardableResult
-    nonisolated static func writeSidecar(_ sidecar: Sidecar, for url: URL, history: Bool) -> String? {
+    nonisolated static func updateSidecar(for url: URL, history: Bool, _ change: (inout Sidecar) -> Void) -> String? {
         do {
-            try SidecarLock.with(url, exclusive: true, create: !sidecar.isEmpty) {
+            try SidecarLock.with(url, exclusive: true, create: true) {
+                var sidecar = SidecarFiles.read(for: url) ?? Sidecar()
+                change(&sidecar)
                 _ = try SidecarFiles.write(sidecar, for: url, history: history)
             }
             return nil
@@ -894,11 +905,15 @@ final class LibraryStore {
     func stepRow(_ delta: Int, columns: Int) { step(delta * max(columns, 1)) }
 
     private func setCurrent(_ url: URL?) {
-        if currentID != url {
+        let changed = currentID != url
+        if changed {
             if let previous = current { commitPending(previous) }
             isCropping = false; showBefore = false; activeMaskID = nil
         }
         currentID = url
+        // Opening a photo also looks for edits saved outside the app that file events missed
+        // (made while the library was still being scanned, say). Cheap when nothing changed.
+        if changed, let url, photoByURL[url] != nil { Task { await checkSidecars([url]) } }
     }
 
     private func keepCurrentVisible() {

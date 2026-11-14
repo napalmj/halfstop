@@ -375,7 +375,9 @@ final class SidecarSync: @unchecked Sendable {
             return try SidecarLock.with(url, exclusive: true, create: !sidecar.isEmpty) {
                 guard self.epoch(url) == epoch else { return .superseded }
                 if let known = state(url), let change = changeOnDisk(url, known: known) { return .changedOnDisk(change) }
-                let revision = try SidecarFiles.write(sidecar, for: url, history: history)
+                // The files are as last known (just checked): a history file left as is needn't be read again.
+                let known = state(url).map { SidecarSnapshot(main: nil, history: nil, revision: $0.revision) }
+                let revision = try SidecarFiles.write(sidecar, for: url, history: history, keepingUnknownFrom: known)
                 record(url, revision: revision, base: sidecar)
                 return .saved
             }

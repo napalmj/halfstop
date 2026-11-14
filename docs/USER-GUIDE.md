@@ -188,7 +188,8 @@ Other agents that can run shell commands work the same way: point them at `halfs
 - The tool only reads and writes local files: your photos are only read, and edits go to Halfstop's
   own files in the photo's `.halfstop` folder, the same ones the app uses. It never changes, renames
   or moves a photo file, and it never connects to a network. `render` writes only the JPEG you ask
-  for, never over a photo or Halfstop's files, and replaces an existing file only with `--force`.
+  for, never over a photo (one with Halfstop edits or camera data) or Halfstop's files, and replaces
+  another existing file, such as an earlier preview, only with `--force`.
 - Every change is one step in the photo's history, so you can always undo it, here or in the app.
   Steps made from the command line don't count as your own edits for Learn from my edits.
 - An AI agent sees what the tool prints and any preview it renders, and sends that to its AI

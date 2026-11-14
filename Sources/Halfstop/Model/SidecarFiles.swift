@@ -97,22 +97,38 @@ enum SidecarFiles {
     /// Decodes a snapshot read with `snapshot(for:)` (without `known`), keeping copies of files
     /// that couldn't be read in full.
     static func decode(_ disk: SidecarSnapshot, for photo: URL) -> Sidecar? {
+        var incomplete = false
+        return decode(disk, for: photo, incomplete: &incomplete)
+    }
+
+    /// - Parameter incomplete: set when part of the files couldn't be read (values this version
+    ///   can't decode, such as a mask of a kind from a newer Halfstop, or an unreadable history
+    ///   file); rewriting them would drop that part.
+    static func decode(_ disk: SidecarSnapshot, for photo: URL, incomplete: inout Bool) -> Sidecar? {
         let main = mainURL(for: photo), hist = historyURL(for: photo)
         guard let data = disk.main else { return nil }
         let report = DecodeReport()
         guard var sidecar = try? JSONDecoder.reporting(into: report).decode(Sidecar.self, from: data) else {
             FileBackup.keepPartiallyLoaded(main, data: data)
+            incomplete = true
             return nil
         }
-        if report.dropped > 0 { FileBackup.keepPartiallyLoaded(main, data: data) }
+        if report.dropped > 0 {
+            FileBackup.keepPartiallyLoaded(main, data: data)
+            incomplete = true
+        }
         if let data = disk.history {
             let report = DecodeReport()
             if let file = try? JSONDecoder.reporting(into: report).decode(HistoryFile.self, from: data) {
                 sidecar.history = file.historySteps()
                 sidecar.historyIndex = file.index
-                if report.dropped > 0 { FileBackup.keepPartiallyLoaded(hist, data: data) }
+                if report.dropped > 0 {
+                    FileBackup.keepPartiallyLoaded(hist, data: data)
+                    incomplete = true
+                }
             } else {
                 FileBackup.keepPartiallyLoaded(hist, data: data)
+                incomplete = true
             }
         }
         return sidecar

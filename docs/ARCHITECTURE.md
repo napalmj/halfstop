@@ -83,8 +83,8 @@ with no command, it prints help rather than starting the app outside its bundle.
   per photo per command (`commandLine: true`), trimmed and capped like the app's history. Only the
   13 sliders in `EditFields.fields` can be set; values are checked strictly (plain decimals, finite,
   each slider once), clamped to `EditLimits` and rounded. Photo files are only read; `render` refuses
-  the photo itself, anything in an edits folder, links, folders, photos with edits, and existing
-  files without `--force`, and writes atomically.
+  the photo itself, anything in an edits folder, links, folders, photos with edits or camera
+  metadata, and other existing files without `--force`, and writes atomically.
 - **Auto** uses the same `AutoEngine` (one 1024 px decode per photo serves ✦ Auto and the horizon),
   measured outside the lock and re-checked under it. "Learn from my edits" is applied when it's on
   in the app's settings: `LearnedStyle` rebuilds the model read-only from the catalog's samples and

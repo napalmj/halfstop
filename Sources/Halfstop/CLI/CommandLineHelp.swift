@@ -142,9 +142,9 @@ enum CommandLineHelp {
             Writes a JPEG of the photo with its current edits and crop, at most N pixels on the long
             edge (default \(CommandLineTool.defaultRenderSize), \(CommandLineTool.renderSizes.lowerBound) to \(CommandLineTool.renderSizes.upperBound)), sRGB, with no metadata (no camera
             data, no location). Use it to look at the result of an edit. It never writes over the
-            photo itself, Halfstop's edit files, a link or folder, or a photo that has Halfstop
-            edits; an existing file is replaced only with --force. Nothing is saved to the photo's
-            edits.
+            photo itself, Halfstop's edit files, a link or folder, a photo that has Halfstop edits,
+            or a file with camera data; another existing file is replaced only with --force. Nothing
+            is saved to the photo's edits.
 
             Example:
               halfstop render IMG_0042.jpg -o /tmp/IMG_0042-preview.jpg --size 1024

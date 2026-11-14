@@ -231,6 +231,23 @@ extension LibraryTest {
         let refuse = run(["set", "unreadable.jpg", "exposure=1"])
         check("cli: an unreadable sidecar is left alone", refuse.code == 1
               && (try? Data(contentsOf: SidecarFiles.mainURL(for: unreadable))) == Data("{not json".utf8), refuse.err)
+        // A mask of a kind this version doesn't know (a newer Halfstop): rewriting would drop it.
+        let newerKind = dir.appendingPathComponent("newerkind.jpg")
+        try? fm.copyItem(at: b, to: newerKind)
+        var masked = Sidecar()
+        masked.adjustments.masks = [Mask(name: "Radial", kind: .radial)]
+        _ = try? SidecarFiles.write(masked, for: newerKind, history: true)
+        patch(SidecarFiles.mainURL(for: newerKind)) { o in
+            var adj = o["adjustments"] as? [String: Any] ?? [:]
+            var masks = adj["masks"] as? [[String: Any]] ?? []
+            if !masks.isEmpty { masks[0]["kind"] = "someFutureKind" }
+            adj["masks"] = masks
+            o["adjustments"] = adj
+        }
+        let newerBytes = try? Data(contentsOf: SidecarFiles.mainURL(for: newerKind))
+        let refuseNewer = run(["set", "newerkind.jpg", "exposure=1"])
+        check("cli: a sidecar with parts it can't read is left alone", refuseNewer.code == 1 && newerBytes != nil
+              && (try? Data(contentsOf: SidecarFiles.mainURL(for: newerKind))) == newerBytes, refuseNewer.err)
 
         // render
         let out = dir.appendingPathComponent("previews", isDirectory: true)
@@ -244,7 +261,16 @@ extension LibraryTest {
               && props[kCGImagePropertyTIFFDictionary] == nil && props[kCGImagePropertyIPTCDictionary] == nil, "\(props.keys)")
         try? fm.createSymbolicLink(at: out.appendingPathComponent("link.jpg"), withDestinationURL: dir.appendingPathComponent("victim.jpg"))
         try? Data("keep".utf8).write(to: out.appendingPathComponent("existing.jpg"))
+        // A camera JPEG (Exif) without Halfstop edits: --force must not replace it either.
+        let camera = out.appendingPathComponent("camera.jpg")
+        if let src = CGImageSourceCreateWithURL(b as CFURL, nil), let img = CGImageSourceCreateImageAtIndex(src, 0, nil),
+           let dest = CGImageDestinationCreateWithURL(camera as CFURL, "public.jpeg" as CFString, 1, nil) {
+            CGImageDestinationAddImage(dest, img, [kCGImagePropertyExifDictionary: [kCGImagePropertyExifDateTimeOriginal: "2026:01:02 03:04:05"]] as CFDictionary)
+            CGImageDestinationFinalize(dest)
+        }
+        let cameraBytes = try? Data(contentsOf: camera)
         let refusals: [[String]] = [
+            ["render", "b.jpg", "-o", "previews/camera.jpg", "--force"],
             ["render", "b.jpg", "-o", "b.jpg"], ["render", "b.jpg", "-o", "./B.JPG", "--force"], ["render", "b.jpg", "-o", "previews/b.jpg"],
             ["render", "b.jpg", "-o", ".halfstop/x.jpg"], ["render", "b.jpg", "-o", "previews/link.jpg", "--force"],
             ["render", "b.jpg", "-o", "previews/x.png"], ["render", "b.jpg", "-o", "nowhere/x.jpg"], ["render", "b.jpg", "-o", "a.jpg", "--force"],
@@ -252,7 +278,8 @@ extension LibraryTest {
         ]
         let refusedCodes = refusals.map { run($0).code }
         check("cli: render refuses the photo, edit files, links, existing files and photos with edits", refusedCodes.allSatisfy { $0 == 1 }
-              && !fm.fileExists(atPath: dir.appendingPathComponent("victim.jpg").path) && !fm.fileExists(atPath: dir.appendingPathComponent(".halfstop/x.jpg").path),
+              && !fm.fileExists(atPath: dir.appendingPathComponent("victim.jpg").path) && !fm.fileExists(atPath: dir.appendingPathComponent(".halfstop/x.jpg").path)
+              && cameraBytes != nil && (try? Data(contentsOf: camera)) == cameraBytes,
               "\(zip(refusals.map { $0[3] }, refusedCodes).filter { $0.1 != 1 })")
         let forced = run(["render", "b.jpg", "-o", "previews/existing.jpg", "--force"])
         check("cli: --force replaces a plain file", forced.code == 0 && (try? Data(contentsOf: out.appendingPathComponent("existing.jpg")))?.prefix(2) == Data([0xFF, 0xD8]), forced.err)
