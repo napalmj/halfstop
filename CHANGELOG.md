@@ -30,16 +30,17 @@ All notable changes to Halfstop are listed here. The format follows
   (each is measured in the background after you edit it), ✦ Auto adds what you usually change on
   similar photos, from your own edits only and entirely on this Mac. Its tooltip then reads "Auto
   (adapted to your edits)".
-- Local AI control (Settings ▸ Local AI control (MCP), off by default): a local MCP server that lets
-  an AI app on this Mac, such as Claude Code, read and edit the photo open in the editor. It can read
-  the photo's name, size, slider values and auto analysis, look at a small preview without metadata,
-  set the global sliders (clamped to their ranges), run ✦ Auto and Auto straighten, and undo. Each
-  change is one undoable history step. It listens on 127.0.0.1 only, needs a random token kept in
-  the login keychain (Copy and Regenerate in Settings), refuses web pages and other hosts, and stops
-  as soon as it's turned off. Settings offer a ready-made `claude mcp add` command and JSON config.
-  Halfstop still makes no network requests to outside services and stores no API keys.
-- `--serve-control` command line mode: the local AI control server on throwaway sample photos, for
-  trying an MCP client against it.
+- The `halfstop` command-line tool (the app's own executable, linked onto your `PATH`; Settings ▸
+  Command-line tool shows how): `info`, `get`, `set` (absolute and relative slider values, clamped
+  to their ranges), `auto`, `straighten`, `undo`, `redo` and `render` (a small JPEG of the current
+  edit, without metadata), for many photos at once, with `--json` output. An AI agent with a shell,
+  such as Claude Code, can use it to edit photos with you. Edits go only to Halfstop's sidecar files,
+  one undoable history step per photo per command; photo files are never changed. It reads and
+  writes only local files.
+- The open app picks up edits made outside it (the `halfstop` command) within a second: editor,
+  thumbnail and histogram update, and the change is an undoable step. If the app had unsaved changes
+  to the same photo, both are kept: the outside version, then the app's changes on top as one step.
+  Saves never overwrite a newer version on disk.
 - A Settings window (⌘,).
 - README with install and usage instructions, a user guide and an architecture overview.
 - MIT license, contributing guide, code of conduct, security policy and GitHub issue and pull

@@ -65,7 +65,7 @@ struct HelpView: View {
             Item(keys: ["⌘Z", "⇧⌘Z"], what: "Undo / redo, one history step at a time"),
             Item(keys: ["Click a step"], what: "Go back to it. Your next edit removes the struck-out steps after it"),
             Item(keys: ["Snapshots ▸ Save"], what: "Keep a named version. Snapshots survive trimming and clearing"),
-            Item(keys: ["“AI edit” steps"], what: "A change made by an AI app through Local AI control. It's a step like any other: ⌘Z undoes it"),
+            Item(keys: ["Command-line steps"], what: "Changes made with the halfstop command (by you or an AI agent) show up as steps right away: ⌘Z undoes them"),
         ]),
         Section(title: "Masks", icon: "circle.lefthalf.filled", items: [
             Item(keys: ["O"], what: "Show or hide the red mask overlay"),
@@ -80,7 +80,7 @@ struct HelpView: View {
             Item(keys: ["Drop a folder"], what: "Import it"),
             Item(keys: ["⌘S"], what: "Save now (edits also save on their own after a moment)"),
             Item(keys: ["⇧⌘E"], what: "Export"),
-            Item(keys: ["⌘,"], what: "Settings (Learn from my edits, Local AI control)"),
+            Item(keys: ["⌘,"], what: "Settings (Learn from my edits, command-line tool)"),
         ]),
     ]
 
@@ -88,7 +88,7 @@ struct HelpView: View {
         ("Your files are never changed", "Edits, ratings and history live in a small .halfstop folder next to your photos. Export to get edited copies."),
         ("Deleting goes to the Trash", "Halfstop never erases files. Trashed photos come back with Finder's Put Back until you empty the Trash."),
         ("✦ Auto learns from your edits", "Once you have edited 20 photos, ✦ Auto adds what you usually change on similar ones. It learns on this Mac only; turn it off in Settings (⌘,)."),
-        ("AI apps can edit with you (optional)", "Settings (⌘,) ▸ Local AI control lets an AI app on this Mac, such as Claude Code, look at and edit the photo open in the editor over MCP. Off by default; it listens on this Mac only (127.0.0.1), needs a token, and every change is an undoable step. Halfstop itself sends nothing anywhere."),
+        ("Edit from the command line or with an AI agent", "The halfstop command reads and edits photos from Terminal, so an AI agent with a shell, such as Claude Code, can edit with you (run halfstop --help). Settings (⌘,) shows how to install it. It only changes Halfstop's own edit files, never your photos, and every change is an undoable step."),
         ("Each photo keeps its own crop", "Paste settings copies everything except the crop. Presets carry only the global look, never crop or masks."),
     ]
 

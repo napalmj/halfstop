@@ -102,7 +102,7 @@ Masks apply adjustments to part of the photo, each with its own sliders.
 ### History and snapshots
 
 The panel on the left of the editor lists every edit as a named step (auto actions and changes made
-through Local AI control included). Click a step to go back to it.
+with the `halfstop` command included). Click a step to go back to it.
 Your next edit removes the struck-out steps after it. **⌘Z** and **⇧⌘Z** undo and redo one step at a
 time. **Snapshots ▸ Save** keeps a named version that survives trimming and clearing.
 
@@ -117,52 +117,91 @@ time. **Snapshots ▸ Save** keeps a named version that survives trimming and cl
 Edits save automatically a moment after each change (the top bar shows Saving… and Saved). **⌘S**
 saves immediately.
 
-## Local AI control (MCP)
+## Editing from the command line / with an AI agent
 
-Halfstop can let an AI app on the same Mac, such as Claude Code, look at and edit the photo open in
-the editor, so you can ask for things like "make this warmer and lift the shadows a little". It does
-this by running a small [MCP](https://modelcontextprotocol.io) server that the AI app connects to.
-**It is off by default.**
+Halfstop is also a command-line tool, `halfstop`. You can use it yourself in Terminal, or let an AI
+agent that can run commands, such as Claude Code, edit photos with you: "make these warmer and lift
+the shadows a little".
+
+### Installing it
+
+The tool is the app itself, so there's nothing extra to download. Put it on your `PATH` with a link
+(no administrator rights needed). **Settings ▸ Command-line tool** shows the exact line for where
+your copy of Halfstop is, with a **Copy** button; for an app in Applications it is:
+
+```bash
+mkdir -p ~/.local/bin && ln -sf /Applications/Halfstop.app/Contents/MacOS/Halfstop ~/.local/bin/halfstop
+```
+
+Then run `halfstop --help`. If Terminal says "command not found", add
+`export PATH="$HOME/.local/bin:$PATH"` to `~/.zshrc` and open a new Terminal window. If you move
+Halfstop.app, run the line again. To remove the tool, delete `~/.local/bin/halfstop`.
+
+### Commands
+
+| Command | What it does |
+| --- | --- |
+| `halfstop info <photo>…` | Size, RAW or not, rating, slider values, history, and an analysis: brightness percentiles, mean color, scene type, faces, horizon, and the angle Auto straighten would set |
+| `halfstop get <photo>…` | The current slider values and where the photo is in its history |
+| `halfstop set <photo>… name=value…` | Changes sliders: `exposure=0.5` sets a value, `exposure+=0.3` and `contrast-=10` change it. Optional `--label "Warmer"` names the step |
+| `halfstop auto <photo>…` | ✦ Auto, exactly as in the app (including Learn from my edits, if it's on) |
+| `halfstop straighten <photo>…` | Auto straighten. Prints "No horizon found" and changes nothing if there's no clear horizon |
+| `halfstop undo <photo>…`, `halfstop redo <photo>…` | One step back or forward in the photo's history |
+| `halfstop render <photo> -o <file.jpg>` | Writes a JPEG of the current edit (1024 pixels on the long edge, `--size` up to 4096), with no camera or location data, so you or an agent can look at the result |
+| `halfstop help <command>` | Details and examples |
+
+The sliders are `temperature`, `tint`, `exposure` (in EV, -5 to 5), `contrast`, `highlights`,
+`shadows`, `whites`, `blacks`, `vibrance`, `saturation`, `vignette` (each -100 to 100),
+`sharpening` and `noise_reduction` (0 to 100). Values outside the range are clamped, and the tool
+says so. Masks, crop, the tone curve, HSL and color grading can't be changed from the command line.
+
+Several photos at once work, shell patterns too (`halfstop auto trip/*.jpg`). If one photo can't be
+done (not found, not a photo), the tool says why and carries on with the rest. Add `--json` for
+output a program can read. The exit status is 0 when everything worked, 1 when a photo failed, and 2
+for a mistake in the command (then nothing is changed).
+
+Examples:
+
+```bash
+halfstop info IMG_0042.jpg
+halfstop set IMG_0042.jpg exposure+=0.3 shadows=25 --label "Brighter"
+halfstop auto *.jpg
+halfstop render IMG_0042.jpg -o ~/Desktop/preview.jpg
+halfstop undo IMG_0042.jpg
+```
+
+### Using it with Claude Code
+
+1. Install the tool as above, and check `halfstop --help` works in Terminal.
+2. Start Claude Code in (or give it) the folder with your photos, and tell it something like:
+   "Run `halfstop --help` first, then use the halfstop command to make IMG_0042.jpg warmer and lift
+   the shadows. Render a preview to /tmp and look at it before you finish."
+3. The agent runs `halfstop info`, `set` or `auto`, then `halfstop render … -o /tmp/preview.jpg` and
+   opens the JPEG to check its work.
+4. Look at the result in Halfstop. If Halfstop is open, the changes show up within a second, as steps
+   in the history panel. **⌘Z** undoes them.
+
+Other agents that can run shell commands work the same way: point them at `halfstop --help`.
 
 ### Privacy and safety
 
-- **Halfstop makes no network requests to outside services and stores no API keys.** The AI app you
-  use is the one that talks to its AI service, under its own settings and terms.
-- The server listens on **127.0.0.1 only**, so other computers on your network can't reach it, and
-  it refuses requests from web pages. Every request must carry a **token** that Halfstop makes when
-  you turn the feature on and keeps in your login keychain.
-- It runs only while the setting is on, and stops the moment you turn it off.
-- An AI app can only work on **the photo open in the editor**. It can read its file name (not the
-  folder), size, rating, flag, slider values and a few measured numbers (brightness percentiles,
-  color, faces, horizon), and ask for a small preview image (at most 512 pixels, with no camera or
-  location data). Anything it reads goes to that AI app and the service behind it.
-- It can change the global sliders (white balance, exposure, contrast, highlights, shadows, whites,
-  blacks, vibrance, saturation, vignette, sharpening, noise reduction), run ✦ Auto and Auto
-  straighten, and undo. It can't open other photos, crop (beyond Auto straighten's angle), edit
-  masks, the tone curve, HSL or color grading, change ratings, export, delete, or touch any file.
-  Every change is one step in the photo's history, named after what the AI app asked for (or "AI
-  edit"), and the editor briefly shows "AI control: …". **⌘Z** undoes it.
+- The tool only reads and writes local files: your photos are only read, and edits go to Halfstop's
+  own files in the photo's `.halfstop` folder, the same ones the app uses. It never changes, renames
+  or moves a photo file, and it never connects to a network. `render` writes only the JPEG you ask
+  for, never over a photo or Halfstop's files, and replaces an existing file only with `--force`.
+- Every change is one step in the photo's history, so you can always undo it, here or in the app.
+  Steps made from the command line don't count as your own edits for Learn from my edits.
+- An AI agent sees what the tool prints and any preview it renders, and sends that to its AI
+  service under its own settings and terms. Halfstop itself sends nothing anywhere.
 
-### Setting it up
+### When Halfstop is open
 
-1. Open **Halfstop ▸ Settings** (**⌘,**) and turn on **Let AI apps on this Mac edit the open photo**
-   under **Local AI control (MCP)**. The status should read "Running on 127.0.0.1:47615".
-2. Add Halfstop to your AI app:
-   - **Claude Code:** click **Copy command** and run it in Terminal. It looks like
-     `claude mcp add --transport http halfstop http://127.0.0.1:47615/mcp --header "Authorization: Bearer <token>"`.
-   - **Other MCP apps** that connect to HTTP servers: click **Copy JSON config** and paste the
-     `mcpServers` entry into the app's MCP settings (for Claude Code, a project's `.mcp.json` takes
-     the same entry). Apps that can only start local command-line servers need an HTTP bridge; see
-     their documentation.
-3. Open a photo in Halfstop's editor and ask your AI app to work on it.
-
-The copied command and JSON contain the token: keep them private. **Regenerate** makes a new token
-(apps set up with the old one stop working until you give them the new one). To use another port,
-type it in **Port**; the server restarts there and you need to update the AI app's settings.
-
-If you build Halfstop from source, macOS may ask once after a rebuild whether Halfstop may use its
-token in your keychain. Choose **Always Allow**. If you denied it, click **Regenerate** to make a new
-token (and give it to your AI app).
+Halfstop notices edits made from the command line straight away: the editor, thumbnail and
+histogram update, and the editor briefly shows "Updated from the command line". If you were changing
+the same photo in the app at that moment, nothing is lost: Halfstop keeps the command line's version
+and puts your changes on top of it as one more step (where both changed the same slider, yours
+wins), and shows "Merged with changes made outside Halfstop". One **⌘Z** brings back exactly the
+command line's version.
 
 ## Exporting
 
@@ -181,7 +220,6 @@ the `.halfstop` folder too if you want to keep its edits.
 - Edits, ratings and flags: `<photo folder>/.halfstop/<filename>.json`; edit history: `<filename>.history.json` next to it
 - Library index (folders, collections, what ✦ Auto learned from your edits): `~/Library/Application Support/Halfstop/catalog.json`
 - Presets: `~/Library/Application Support/Halfstop/presets.json`
-- Local AI control token: your login keychain, as "Halfstop local AI control token"
 
 To back up your work, include the hidden `.halfstop` folders with your photos, and the `Halfstop` folder in
 Application Support. To move your library to another Mac, copy the photo folders (with `.halfstop`) and
@@ -204,12 +242,12 @@ can't be read, it keeps the rest and copies the original to `catalog.partial-<co
 and `presets.json` get the same treatment). Your photos and
 their `.halfstop` sidecars are untouched, so you can re-import the folders, or attach that file to a bug report.
 
-**Local AI control says the port is in use.** Another app is using that port. Type a different port
-in **Settings ▸ Local AI control** and update your AI app's settings with the new address.
+**`halfstop: command not found`.** The link isn't on your `PATH`: see [Installing it](#installing-it).
+If you moved Halfstop.app, make the link again.
 
-**My AI app can't connect to Halfstop.** Check that the setting is on and the status says Running,
-that a photo is open in the editor, and that the app has the current token (copy the command or
-JSON again after **Regenerate**).
+**A command-line edit doesn't show in the app.** Check that the photo is in one of the app's
+imported folders (the tool also works on photos that aren't, but the app only shows its own
+library). Changes appear within a second; reopening the photo always shows what's saved.
 
 **Reporting a problem.** Please open an issue with your macOS version, Mac model, the photo's file
 type, and the steps to reproduce. See [CONTRIBUTING.md](../CONTRIBUTING.md).
