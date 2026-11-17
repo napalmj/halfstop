@@ -20,6 +20,15 @@ touches a photo file's name is the optional rename on import, which is off by de
   star ratings, pick/reject flags, filters, multi-select and drag to collections.
 - **Quick and Detailed editing.** Quick has the everyday sliders. Detailed adds full light and color,
   color grading wheels, tone curve, HSL and detail.
+- **One-click auto.** ✦ Auto sets white balance, tone, whites and blacks, and vibrance in one undoable
+  step. It reads the scene (well-exposed, low-key, high-key, night) and finds faces on your Mac to
+  protect skin tones. Tone and WB do just those, and Auto straighten levels a tilted horizon.
+- **Learns your style.** With Learn from my edits (on by default), ✦ Auto adapts to how you finish
+  similar photos once you have edited 20, from your own edits only and entirely on your Mac.
+- **Command-line tool.** `halfstop info`, `set`, `auto`, `straighten`, `undo` and `render` read
+  and edit photos from Terminal, so an AI agent with a shell, such as Claude Code, can edit with you.
+  Every change is an undoable step, and the open app shows it right away. See
+  [Editing from the command line](docs/USER-GUIDE.md#editing-from-the-command-line--with-an-ai-agent).
 - **Masks.** Brush, linear, radial, subject (Apple Vision) and sky masks, each with its own sliders.
   Combine several gradients (add, subtract, intersect), pick individual subjects, grow, shrink and
   soften automatic masks, and refine any mask with brush strokes.
@@ -60,6 +69,22 @@ The app is ad-hoc signed, not notarized. An app you build yourself opens normall
 
 A debug build (faster to compile, much slower to run) is available with `./scripts/bundle.sh debug`.
 
+### The `halfstop` command (optional)
+
+The same app is also a command-line tool. To use it from Terminal, link it into a folder on your
+`PATH` (no administrator rights needed; Settings ▸ Command-line tool shows this line with the app's
+actual location and a Copy button):
+
+```bash
+mkdir -p ~/.local/bin && ln -sf /Applications/Halfstop.app/Contents/MacOS/Halfstop ~/.local/bin/halfstop
+halfstop --help
+```
+
+If `halfstop` isn't found, add `export PATH="$HOME/.local/bin:$PATH"` to `~/.zshrc` and open a new
+Terminal window. Edits go to Halfstop's sidecar files, never to the photos, and can be undone in the
+app. See the [user guide](docs/USER-GUIDE.md#editing-from-the-command-line--with-an-ai-agent) for
+using it with an AI agent such as Claude Code.
+
 ## Quick start
 
 1. Open Halfstop and press **⌘I** (or drop a folder onto the window) to import a folder of photos.
@@ -99,6 +124,7 @@ Press **⌘?** (Help ▸ Halfstop Help) for a searchable list of every shortcut.
 | ⌘⌫ | Move selected photos to Trash (asks first) |
 | ⇧⌘S | Show / hide the sidebar (library) or history (editor) |
 | ⌘S | Save now |
+| ⌘, | Settings (Learn from my edits, command-line tool) |
 
 ## Where your data lives
 
@@ -106,12 +132,16 @@ Press **⌘?** (Help ▸ Halfstop Help) for a searchable list of every shortcut.
 | --- | --- |
 | Your photos | Wherever they already are. Halfstop never copies them or changes their contents (export writes new files). |
 | Edits, ratings, flags, history | `<photo folder>/.halfstop/<filename>.json` plus `<filename>.history.json`, small JSON sidecars per photo |
-| Library index (folders, collections) | `~/Library/Application Support/Halfstop/catalog.json` |
+| Library index (folders, collections, what ✦ Auto learned from your edits) | `~/Library/Application Support/Halfstop/catalog.json` |
 | Presets | `~/Library/Application Support/Halfstop/presets.json` |
 | Thumbnail cache | `~/Library/Caches/Halfstop/Thumbnails` (safe to delete; kept under 1 GB) |
 
 To back up your work, back up your photo folders (hidden `.halfstop` folders included) and the
-`Halfstop` folder in Application Support. Nothing is uploaded anywhere; Halfstop makes no network requests.
+`Halfstop` folder in Application Support.
+
+**Privacy.** Nothing is uploaded anywhere: Halfstop makes no network requests to outside services.
+Face detection and "Learn from my edits" run on your Mac. The `halfstop` command-line tool only
+reads and writes local files: your photos (read only) and Halfstop's own edit files.
 
 ## Development
 

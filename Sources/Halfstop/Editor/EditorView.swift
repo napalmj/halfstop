@@ -47,7 +47,10 @@ struct PreviewArea: View {
                 }
             }
         }
-        .onAppear(perform: prepare)
+        .onAppear {
+            prepare()
+            AutoVision.shared.warmUp()
+        }
         .onChange(of: store.currentID) { prepare() }
     }
 
@@ -92,9 +95,7 @@ struct PreviewArea: View {
             let contentSize = PreviewLayout.contentSize(source.size, a, mode)
             let rect = PreviewLayout.fit(contentSize, in: size)
             if store.pickingWhite && !store.isCropping && store.activeMaskID == nil {
-                WhitePicker(imageRect: rect) { p in
-                    if let s = renderer.source(for: url) { store.pickWhiteBalance(at: p, using: s) }
-                }
+                WhitePicker(imageRect: rect) { p in store.pickWhiteBalance(at: p) }
             } else if store.isCropping {
                 CropOverlay(
                     imageRect: rect,
@@ -110,7 +111,8 @@ struct PreviewArea: View {
 
         VStack {
             HStack {
-                if store.pickingWhite { badge("Click something that should be neutral gray · Esc cancels") }
+                if let hint = store.hint { badge(hint) }
+                else if store.pickingWhite { badge("Click something that should be neutral gray · Esc cancels") }
                 else if store.showBefore { badge("Before") }
                 else if clipping { badge("Clipping: red = blown, blue = crushed (J)") }
                 else if let mask = store.activeMask { badge("Editing \(mask.name)") }

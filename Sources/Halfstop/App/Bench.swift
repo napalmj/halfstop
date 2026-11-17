@@ -85,7 +85,49 @@ enum Bench {
             var a = Adjustments(); a.masks = [m]; return a
         }
 
+        benchAuto(url: url, preview: src)
         benchStore()
+    }
+
+    /// One-click auto adjustments, measured on the already-decoded preview source (as the buttons do).
+    static func benchAuto(url: URL, preview src: ImageSource) {
+        func time(_ name: String, runs: Int = 5, _ body: () -> Void) {
+            body()   // warm up
+            var t: [Double] = []
+            for _ in 0..<runs { let t0 = CACurrentMediaTime(); body(); t.append((CACurrentMediaTime() - t0) * 1000) }
+            print("  " + name.padding(toLength: 38, withPad: " ", startingAt: 0) + String(format: "%7.2f ms", median(t)))
+        }
+        let engine = AutoEngine.shared
+        func request(_ kind: AutoKind) -> AutoRequest { AutoRequest(url: url, kind: kind, adjustments: Adjustments()) }
+        // First use of a photo: decodes the small measurement copy.
+        engine.clear(sources: true)
+        let t0 = CACurrentMediaTime()
+        _ = engine.resultNow(for: request(.tone))
+        print("  " + "auto tone, first (incl. decode)".padding(toLength: 34, withPad: " ", startingAt: 0)
+              + String(format: "%7.2f ms", (CACurrentMediaTime() - t0) * 1000))
+        // The first face request of a session loads Vision's model (the editor warms it up on open).
+        engine.clear()
+        let tv = CACurrentMediaTime()
+        _ = engine.resultNow(for: request(.auto))
+        print("  " + "auto ✦ Auto, first Vision use".padding(toLength: 34, withPad: " ", startingAt: 0)
+              + String(format: "%7.2f ms", (CACurrentMediaTime() - tv) * 1000))
+        // Decoded, nothing cached: what a click costs on the photo being edited.
+        for (kind, name) in [(AutoKind.whiteBalance, "WB"), (.tone, "tone"), (.auto, "✦ Auto"), (.straighten, "straighten")] {
+            time("auto \(name) (background, uncached)") { engine.clear(); _ = engine.resultNow(for: request(kind)) }
+        }
+        time("auto ✦ Auto (cached)") { _ = engine.resultNow(for: request(.auto)) }
+        // What it decided, to sanity-check real photos passed with --file.
+        if let r = engine.resultNow(for: request(.auto)) {
+            let a = r.applied(to: Adjustments())
+            print("  ✦ Auto on this photo: " + (r.scene?.rawValue ?? "?") + String(format:
+                ", temp %.0f tint %.0f, exposure %.2f, contrast %.0f, highlights %.0f, shadows %.0f, whites %.0f, blacks %.0f, vibrance %.0f, saturation %.0f",
+                a.temperature, a.tint, a.exposure, a.contrast, a.highlights, a.shadows, a.whites, a.blacks, a.vibrance, a.saturation))
+            print("    faces \(r.hints.faces.count), second opinion \(r.opinion.map { String(describing: $0) } ?? "none")")
+        }
+        if let s = engine.resultNow(for: request(.straighten)) {
+            print("  Auto straighten on this photo: " + (s.horizon.map { String(format: "horizon %.2f° (confidence %.2f)", $0.angle, $0.confidence) } ?? "no horizon")
+                  + (s.angle.map { String(format: ", sets %.1f°", $0) } ?? ", leaves the angle"))
+        }
     }
 
     /// One preview frame through the same code path the editor uses.
@@ -131,6 +173,19 @@ enum Bench {
         print("  " + "10k photos: 40 slider reads".padding(toLength: 34, withPad: " ", startingAt: 0) + String(format: "%7.2f ms per tick", currentMs))
         print("  " + "10k photos: visiblePhotos".padding(toLength: 34, withPad: " ", startingAt: 0) + String(format: "%7.2f ms per access", visibleMs))
         try? FileManager.default.removeItem(at: tmp)
+
+        // Learn from my edits: one ✦ Auto prediction over 5,000 edited photos.
+        var model = StyleModel()
+        var seed: UInt64 = 7
+        func rnd() -> Double { seed = seed &* 6364136223846793005 &+ 1442695040888963407; return Double(seed >> 11) / Double(1 << 53) }
+        for i in 0..<5000 {
+            model.set("p\(i)", features: (0..<StyleFeatures.count).map { _ in rnd() }, delta: (0..<StyleSliders.count).map { _ in rnd() - 0.5 })
+        }
+        let query = (0..<StyleFeatures.count).map { _ in rnd() }
+        t = CACurrentMediaTime()
+        for _ in 0..<frames { _ = model.predict(query) }
+        let knnMs = (CACurrentMediaTime() - t) * 1000 / Double(frames)
+        print("  " + "learn: k-NN over 5k edited photos".padding(toLength: 34, withPad: " ", startingAt: 0) + String(format: "%7.2f ms per ✦ Auto", knnMs))
     }
 
     static func median(_ v: [Double]) -> Double {

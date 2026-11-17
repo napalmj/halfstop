@@ -2,7 +2,28 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 
+/// The executable's entry point. `halfstop <command> …` (see `CommandLineTool`) runs without any
+/// window or Dock icon and exits; everything else starts the app.
 @main
+enum HalfstopMain {
+    static func main() {
+        let args = Array(CommandLine.arguments.dropFirst())
+        if CommandLineTool.handles(args) {
+            exit(CommandLineTool.main(args))
+        }
+        if CommandLineTool.startedThroughLink {
+            // `halfstop` on its own: the app runs only from its bundle, so explain instead.
+            if args.isEmpty {
+                print(CommandLineHelp.overview)
+                exit(0)
+            }
+            FileHandle.standardError.write(Data("halfstop: unknown command “\(args[0])”. Run halfstop --help. (To use the app, open Halfstop.app.)\n".utf8))
+            exit(2)
+        }
+        HalfstopApp.main()
+    }
+}
+
 struct HalfstopApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     @State private var store: LibraryStore
@@ -29,6 +50,12 @@ struct HalfstopApp: App {
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1440, height: 900)
         .commands { HalfstopCommands(store: store) }
+
+        Settings {
+            SettingsView()
+                .environment(store)
+                .preferredColorScheme(.dark)
+        }
 
         Window("Halfstop Help", id: "help") {
             HelpView()

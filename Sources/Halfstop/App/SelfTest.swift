@@ -26,6 +26,8 @@ enum SelfTest {
             // Keep test thumbnails out of the real cache.
             ThumbnailDiskCache.directory = dir.appendingPathComponent("thumbcache", isDirectory: true)
             try? FileManager.default.removeItem(at: ThumbnailDiskCache.directory)
+            // Vision's output isn't part of the test: faces and horizons come from the test hook.
+            AutoVision.shared.visionEnabled = false
             let pipelineOK = run(dir: dir)
             var libraryOK = false
             var done = false
@@ -114,6 +116,20 @@ enum SelfTest {
         Render.background.render(avg, toBitmap: &p, rowBytes: 16, bounds: CGRect(x: 0, y: 0, width: 1, height: 1),
                                  format: .RGBAf, colorSpace: Render.sRGB)
         return RGB(r: Double(p[0]), g: Double(p[1]), b: Double(p[2]))
+    }
+
+    /// Sorted sRGB-encoded luminance of every pixel: the reference the histogram is checked against.
+    static func sortedLuminances(_ image: CIImage) -> [Double] {
+        let e = image.extent.integral
+        let w = Int(e.width), h = Int(e.height)
+        var px = [UInt8](repeating: 0, count: w * h * 4)
+        Render.background.render(image, toBitmap: &px, rowBytes: w * 4, bounds: e, format: .RGBA8, colorSpace: Render.sRGB)
+        var out = [Double]()
+        out.reserveCapacity(w * h)
+        for i in stride(from: 0, to: px.count, by: 4) {
+            out.append((0.2126 * Double(px[i]) + 0.7152 * Double(px[i + 1]) + 0.0722 * Double(px[i + 2])) / 255)
+        }
+        return out.sorted()
     }
 
     static func run(dir: URL) -> Bool {
@@ -444,9 +460,413 @@ enum SelfTest {
         if let dim = variant("dim.jpg", { $0.applyingFilter("CIExposureAdjust", parameters: [kCIInputEVKey: -1.8]) }) {
             let t = AutoAdjust.tone(source: dim, adjustments: Adjustments())
             var a = Adjustments(); a.exposure = t.exposure
-            let lum = AutoAdjust.luminances(dim.developed(a, renderScale: 0.25))
-            let m = lum[lum.count / 2]
+            let m = AutoAdjust.measure(dim.developed(a, renderScale: 0.25))?.percentile(0.5) ?? 0
             check("auto tone lifts a dark photo", t.exposure > 0.3 && abs(m - 0.42) < 0.08, String(format: "ev %.2f, median %.2f", t.exposure, m))
+
+            // The histogram's percentiles are the ones sorting every pixel gave.
+            var worst = 0.0
+            for image in [dim.developed(Adjustments(), renderScale: 0.3), base.cropped(to: CGRect(x: 0, y: 0, width: 700, height: 500))] {
+                guard let stats = AutoAdjust.measure(image) else { worst = 1; continue }
+                let sorted = sortedLuminances(image)
+                for p in [0.0, 0.005, 0.05, 0.25, 0.5, 0.75, 0.95, 0.995, 1] {
+                    worst = max(worst, abs(stats.percentile(p) - sorted[min(sorted.count - 1, Int(Double(sorted.count - 1) * p))]))
+                }
+            }
+            check("histogram percentiles match sorting within 1/255", worst <= 1.0 / 255, String(format: "worst %.4f", worst))
+        }
+
+        // White balance solver: few renders, and the end of the range when there's no root inside.
+        do {
+            var renders = 0
+            let root = AutoAdjust.solveNeutral { x in
+                renders += 1
+                return SIMD2(0.004 * (x.x - 37) + 0.0006 * (x.y + 12), 0.003 * (x.y + 12) - 0.0005 * (x.x - 37) + 0.00001 * (x.y + 12) * (x.y + 12))
+            }
+            check("white balance solve converges in few renders", abs(root.x - 37) < 1 && abs(root.y + 12) < 1 && renders <= 6,
+                  String(format: "(%.2f, %.2f) after %d renders", root.x, root.y, renders))
+            renders = 0
+            let pinned = AutoAdjust.solveNeutral { x in renders += 1; return SIMD2(0.004 * (x.x - 160), 0.003 * x.y) }
+            check("white balance solve stops at the end of the range", pinned.x > 99 && abs(pinned.y) < 1 && renders <= 12,
+                  String(format: "(%.2f, %.2f) after %d renders", pinned.x, pinned.y, renders))
+        }
+
+        // The engine measures off its own decode and caches by the inputs that matter.
+        do {
+            let engine = AutoEngine()
+            var a = Adjustments(); a.temperature = 10
+            let first = engine.resultNow(for: AutoRequest(url: url, kind: .tone, adjustments: a))
+            a.vignette = -30; a.saturation = 20
+            let again = engine.resultNow(for: AutoRequest(url: url, kind: .tone, adjustments: a))
+            check("auto results are cached across unrelated edits", first != nil && first == again && engine.measurementCount == 1,
+                  "\(engine.measurementCount) measurements")
+            a.temperature = -20
+            _ = engine.resultNow(for: AutoRequest(url: url, kind: .tone, adjustments: a))
+            a.crop.rect = NormRect(x: 0.1, y: 0.1, width: 0.5, height: 0.5)
+            _ = engine.resultNow(for: AutoRequest(url: url, kind: .tone, adjustments: a))
+            check("auto measures again when its inputs change", engine.measurementCount == 3, "\(engine.measurementCount) measurements")
+            let wbA = engine.resultNow(for: AutoRequest(url: url, kind: .whiteBalance, adjustments: Adjustments()))?.whiteBalance
+            let wbB = AutoAdjust.whiteBalance(source: src, adjustments: Adjustments(), region: nil)
+            check("measurement decode gives the same white balance as full size", wbA.map { abs($0.temperature - wbB.temperature) <= 2 && abs($0.tint - wbB.tint) <= 2 } == true,
+                  "\(String(describing: wbA)) vs \(wbB)")
+        }
+
+        // Auto: scene-aware choices on synthetic photos with known exposure.
+        do {
+            func synthetic(_ name: String, _ draw: (CGContext, CGFloat, CGFloat) -> Void) -> ImageSource? {
+                let cs = CGColorSpace(name: CGColorSpace.sRGB)!
+                guard let ctx = CGContext(data: nil, width: 900, height: 600, bitsPerComponent: 8, bytesPerRow: 0, space: cs,
+                                          bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+                draw(ctx, 900, 600)
+                guard let cg = ctx.makeImage() else { return nil }
+                let u = dir.appendingPathComponent(name)
+                write(cg, to: u)
+                return ImageSource(url: u, maxPixelSize: nil)
+            }
+            func gray(_ v: Double) -> CGColor { CGColor(colorSpace: Render.sRGB, components: [v, v, v, 1])! }
+            func color(_ h: Double, _ sat: Double, _ b: Double) -> CGColor {
+                let c = NSColorShim.hsb(h, sat, b)
+                return CGColor(colorSpace: Render.sRGB, components: [c.0, c.1, c.2, 1])!
+            }
+            func ramp(_ ctx: CGContext, _ H: CGFloat, _ from: Double, _ to: Double) {
+                let g = CGGradient(colorsSpace: Render.sRGB, colors: [gray(from), gray(to)] as CFArray, locations: [0, 1])!
+                ctx.drawLinearGradient(g, start: .zero, end: CGPoint(x: 0, y: H), options: [.drawsBeforeStartLocation, .drawsAfterEndLocation])
+            }
+            func describe(_ r: AutoResult) -> String {
+                let t = r.tone, l = r.levels, c = r.color, wb = r.whiteBalance
+                return String(format: "%@ ev %.2f c %.0f h %.0f s %.0f w %.0f b %.0f vib %.0f sat %.0f wb %.0f/%.0f",
+                              r.scene?.rawValue ?? "-", t?.exposure ?? .nan, t?.contrast ?? .nan, t?.highlights ?? .nan, t?.shadows ?? .nan,
+                              l?.whites ?? .nan, l?.blacks ?? .nan, c?.vibrance ?? .nan, c?.saturation ?? .nan,
+                              wb?.temperature ?? .nan, wb?.tint ?? .nan)
+            }
+
+            // Weights line up with the render: the top half of a red-over-blue frame reads red.
+            if let split = synthetic("split.jpg", { ctx, W, H in
+                ctx.setFillColor(color(0.66, 0.9, 0.8)); ctx.fill(CGRect(x: 0, y: 0, width: W, height: H / 2))
+                ctx.setFillColor(color(0, 0.9, 0.8)); ctx.fill(CGRect(x: 0, y: H / 2, width: W, height: H / 2))
+            }), let bm = AutoAdjust.readback(AutoAdjust.measurementImage(split, Adjustments())) {
+                var mask = [UInt8](repeating: 0, count: bm.width * bm.height)
+                for i in 0..<(bm.width * bm.height / 2) { mask[i] = 255 }
+                let image = AutoAdjust.measurementImage(split, Adjustments())
+                let weighted = image.applyingFilter("CIMultiplyCompositing",
+                                                    parameters: [kCIInputBackgroundImageKey: AutoAdjust.weightImage(mask, like: bm)]).cropped(to: image.extent)
+                let (r, _, b) = AutoAdjust.average(weighted, region: nil)
+                check("white balance weights line up with the photo", r > b * 4, String(format: "r %.3f b %.3f", r, b))
+            }
+
+                if let fine = synthetic("well-exposed.jpg", { ctx, W, H in
+                ramp(ctx, H, 0.03, 0.96)
+                for i in 0..<6 {
+                    ctx.setFillColor(color(Double(i) / 6, 0.45, 0.7))
+                    ctx.fillEllipse(in: CGRect(x: 40 + CGFloat(i) * 140, y: H * 0.4, width: 90, height: 90))
+                }
+            }) {
+                let r = AutoAdjust.auto(source: fine, inputs: Adjustments())
+                let t = r.tone!, l = r.levels!, wb = r.whiteBalance!
+                let small = [t.contrast, t.highlights, t.shadows, l.whites, l.blacks].allSatisfy { abs($0) <= 10 }
+                check("auto leaves a well-exposed photo nearly alone", abs(t.exposure) <= 0.15 && small
+                      && abs(wb.temperature) <= 5 && abs(wb.tint) <= 5, describe(r))
+            }
+
+            if let lowKey = synthetic("low-key.jpg", { ctx, W, H in
+                ramp(ctx, H, 0.02, 0.25)
+                ctx.setFillColor(gray(0.9)); ctx.fill(CGRect(x: W * 0.6, y: H * 0.5, width: W * 0.25, height: H * 0.25))
+            }) {
+                let r = AutoAdjust.auto(source: lowKey, inputs: Adjustments())
+                check("auto keeps a low-key photo dark", r.scene == .lowKey && r.tone!.exposure <= 0.6, describe(r))
+            }
+
+            if let night = synthetic("night.jpg", { ctx, W, H in
+                ramp(ctx, H, 0.02, 0.12)
+                ctx.setFillColor(gray(1))
+                for i in 0..<24 { ctx.fillEllipse(in: CGRect(x: 30 + CGFloat(i % 12) * 72, y: H * (i < 12 ? 0.3 : 0.6), width: 16, height: 16)) }
+            }) {
+                let r = AutoAdjust.auto(source: night, inputs: Adjustments())
+                let t = r.tone!
+                check("auto treats a night scene gently", r.scene == .night && t.highlights == 0 && t.shadows <= 20 && t.exposure <= 0.3
+                      && r.levels!.whites == 0, describe(r))
+            }
+
+            if let highKey = synthetic("high-key.jpg", { ctx, W, H in
+                ramp(ctx, H, 0.72, 0.95)
+                ctx.setFillColor(gray(0.1)); ctx.fill(CGRect(x: W * 0.4, y: H * 0.3, width: W * 0.2, height: H * 0.4))
+            }) {
+                let r = AutoAdjust.auto(source: highKey, inputs: Adjustments())
+                check("auto keeps a high-key photo bright", r.scene == .highKey && r.tone!.exposure >= -0.4, describe(r))
+            }
+
+            if let flat = synthetic("flat.jpg", { ctx, W, H in
+                ramp(ctx, H, 0.3, 0.6)
+                for i in 0..<6 {
+                    ctx.setFillColor(color(Double(i) / 6, 0.22, 0.55))
+                    ctx.fill(CGRect(x: CGFloat(i) * 150, y: H * 0.35, width: 150, height: H * 0.3))
+                }
+            }) {
+                let r = AutoAdjust.auto(source: flat, inputs: Adjustments())
+                check("auto stretches a flat, muted photo", r.levels!.whites > 0 && r.levels!.blacks < 0 && r.tone!.contrast > 0
+                      && r.color!.vibrance > 5, describe(r))
+            }
+
+            // Frames with no detail at all (a lens-cap black, a fully blown white) and tiny ones:
+            // auto stays finite and leaves exposure and the tone sliders alone.
+            for (name, v) in [("all-black.jpg", 0.0), ("all-white.jpg", 1.0)] {
+                if let blank = synthetic(name, { ctx, W, H in ctx.setFillColor(gray(v)); ctx.fill(CGRect(x: 0, y: 0, width: W, height: H)) }) {
+                    let r = AutoAdjust.auto(source: blank, inputs: Adjustments())
+                    let out = StyleSliders.values(r.applied(to: Adjustments()))
+                    check("auto leaves a blank \(v == 0 ? "black" : "white") frame alone", out.allSatisfy { $0 == 0 }, describe(r))
+                }
+            }
+            do {
+                let cs = CGColorSpace(name: CGColorSpace.sRGB)!
+                if let ctx = CGContext(data: nil, width: 3, height: 2, bitsPerComponent: 8, bytesPerRow: 0, space: cs,
+                                       bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) {
+                    ctx.setFillColor(gray(0.2)); ctx.fill(CGRect(x: 0, y: 0, width: 3, height: 2))
+                    let u = dir.appendingPathComponent("tiny.jpg")
+                    if let cg = ctx.makeImage() { write(cg, to: u) }
+                    let r = ImageSource(url: u, maxPixelSize: nil).map { AutoAdjust.auto(source: $0, inputs: Adjustments()) }
+                    let out = r.map { StyleSliders.values($0.applied(to: Adjustments())) } ?? [.nan]
+                    check("auto on a 3×2 pixel photo is finite and leaves tone alone", out.allSatisfy(\.isFinite) && r?.tone?.exposure == 0,
+                          r.map(describe) ?? "unreadable")
+                }
+            }
+
+            // The sky-heavy test scene has a neutral gray ramp: auto balances on it rather than the
+            // whole-frame average (which warms it a lot).
+            let gw = AutoAdjust.whiteBalance(source: src, adjustments: Adjustments(), region: nil)
+            let sceneAuto = AutoAdjust.auto(source: src, inputs: Adjustments())
+            check("auto white balance trusts the grays over a blue sky", abs(sceneAuto.whiteBalance!.temperature) < abs(gw.temperature) / 2,
+                  "auto \(describe(sceneAuto)), whole frame \(gw.temperature)")
+
+            // Vibrance: toward typical colorfulness, careful with skin and faces, never on black and white.
+            if let base = sceneAuto.stats {
+                var muted = base; muted.meanChroma = 0.02; muted.skinFraction = 0
+                var skin = muted; skin.skinFraction = 0.35
+                var mono = muted; mono.meanChroma = 0.003; mono.chroma = [mono.pixelCount] + Array(repeating: 0, count: ImageStats.chromaBins - 1)
+                let m = AutoAdjust.color(muted), sk = AutoAdjust.color(skin)
+                let face = AutoAdjust.color(muted, hints: AutoHints(faces: [CGRect(x: 0.4, y: 0.3, width: 0.2, height: 0.3)]))
+                check("vibrance lifts muted color", m.vibrance >= 12 && m.saturation > 0 && m.saturation <= 5, "\(m)")
+                check("vibrance holds back on skin", sk.vibrance < m.vibrance && sk.saturation == 0, "\(sk)")
+                check("vibrance holds back on faces, saturation never rises", face.vibrance <= min(15, m.vibrance / 2 + 0.5)
+                      && face.saturation == 0, "\(face)")
+                check("no vibrance on black and white", AutoAdjust.color(mono) == AutoAdjust.ColorBoost(vibrance: 0, saturation: 0), "")
+            }
+
+            // Auto starts from defaults, so pressing it again on its own result is a cache hit and no change.
+            let engine = AutoEngine()
+            let first = engine.resultNow(for: AutoRequest(url: url, kind: .auto, adjustments: Adjustments()))
+            let applied = first?.applied(to: Adjustments()) ?? Adjustments()
+            let second = engine.resultNow(for: AutoRequest(url: url, kind: .auto, adjustments: applied))
+            check("auto twice changes nothing more", first != nil && second?.applied(to: applied) == applied && engine.measurementCount == 1,
+                  "\(engine.measurementCount) measurements")
+
+            // Faces (installed through the Vision test hook): exposure leans toward them, skin
+            // stays out of green and magenta, and vibrance holds back.
+            let faceBox = CGRect(x: 0.4, y: 0.25, width: 0.2, height: 0.3)   // top-left origin
+            func portrait(_ name: String, skin: (Double, Double, Double)) -> ImageSource? {
+                synthetic(name) { ctx, W, H in
+                    ramp(ctx, H, 0.15, 0.95)
+                    ctx.setFillColor(CGColor(colorSpace: Render.sRGB, components: [skin.0, skin.1, skin.2, 1])!)
+                    // CG's origin is bottom-left.
+                    ctx.fill(CGRect(x: faceBox.minX * W, y: (1 - faceBox.maxY) * H, width: faceBox.width * W, height: faceBox.height * H))
+                }
+            }
+            if let dark = portrait("face-dark.jpg", skin: (0.30, 0.20, 0.15)) {
+                AutoVision.shared.install(faces: [], for: dark.url)
+                let plain = AutoAdjust.auto(source: dark, inputs: Adjustments())
+                AutoVision.shared.install(faces: [faceBox], for: dark.url)
+                let withFace = AutoAdjust.auto(source: dark, inputs: Adjustments())
+                check("a dark face pulls exposure up", withFace.tone!.exposure > plain.tone!.exposure
+                      && withFace.tone!.exposure - plain.tone!.exposure <= 0.5 + 1e-9 && withFace.hints.faces == [faceBox],
+                      "\(describe(plain)) -> \(describe(withFace))")
+                check("faces never raise saturation", withFace.color!.saturation == 0, describe(withFace))
+            }
+            if let green = portrait("face-green.jpg", skin: (0.62, 0.62, 0.42)), let normal = portrait("face-normal.jpg", skin: (0.88, 0.67, 0.55)) {
+                AutoVision.shared.install(faces: [faceBox], for: green.url)
+                AutoVision.shared.install(faces: [faceBox], for: normal.url)
+                let g = AutoAdjust.auto(source: green, inputs: Adjustments())
+                let n = AutoAdjust.auto(source: normal, inputs: Adjustments())
+                func faceHue(_ source: ImageSource, _ r: AutoResult) -> Double {
+                    let a = r.applied(to: Adjustments())
+                    let (cr, cg, cb) = AutoAdjust.average(AutoAdjust.measurementImage(source, a), region: AutoAdjust.faceCore(faceBox))
+                    let lab = Oklab(cr, cg, cb)
+                    return atan2(lab.b, lab.a) * 180 / .pi
+                }
+                let noFace = AutoAdjust.auto(source: green, inputs: Adjustments(), hints: AutoHints())
+                check("a greenish face moves the tint toward magenta, within limits", g.whiteBalance!.tint > noFace.whiteBalance!.tint
+                      && g.whiteBalance!.tint - noFace.whiteBalance!.tint <= AutoAdjust.maxSkinTintShift
+                      && faceHue(green, g) < faceHue(green, noFace),
+                      String(format: "tint %.0f -> %.0f, face hue %.1f -> %.1f", noFace.whiteBalance!.tint, g.whiteBalance!.tint,
+                             faceHue(green, noFace), faceHue(green, g)))
+                let nPlain = AutoAdjust.auto(source: normal, inputs: Adjustments(), hints: AutoHints())
+                check("a natural skin tone leaves the tint alone", n.whiteBalance == nPlain.whiteBalance, "\(describe(nPlain)) vs \(describe(n))")
+            }
+            if let fine = ImageSource(url: dir.appendingPathComponent("well-exposed.jpg"), maxPixelSize: nil), let st = AutoAdjust.auto(source: fine, inputs: Adjustments()).stats {
+                let ev = AutoAdjust.faceExposure(0, faceLuminance: 0.5, faceArea: 0.1, stats: st, scene: .normal)
+                let dim = AutoAdjust.faceExposure(0, faceLuminance: 0.15, faceArea: 0.3, stats: st, scene: .normal)
+                let night = AutoAdjust.faceExposure(0, faceLuminance: 0.15, faceArea: 0.3, stats: st, scene: .night)
+                let lowKey = AutoAdjust.faceExposure(0, faceLuminance: 0.15, faceArea: 0.3, stats: st, scene: .lowKey)
+                check("face exposure: alone in the band, capped outside it, off at night", ev == 0 && dim > 0 && dim <= 0.5
+                      && night == 0 && lowKey <= 0.3, "\(ev) \(dim) \(night) \(lowKey)")
+            }
+
+            // Second opinion: a nudge, never a replacement.
+            do {
+                let t = AutoAdjust.Tone(exposure: 0.2, contrast: 10, highlights: -10, shadows: 10)
+                let c = AutoAdjust.ColorBoost(vibrance: 10, saturation: 2)
+                let o = AutoAdjust.SecondOpinion(exposure: 1.5, vibrance: 60, shadows: 60, highlights: -60)
+                let (nt, nc) = AutoAdjust.nudged(t, c, by: o, scene: .normal, faces: false)
+                check("second opinion nudges by small capped steps", abs(nt.exposure - 0.35) < 1e-9 && nt.shadows == 18 && nt.highlights == -18
+                      && nc.vibrance == 15 && nt.contrast == 10 && nc.saturation == 2, "\(nt) \(nc)")
+                let (wt, wc) = AutoAdjust.nudged(t, c, by: o, scene: .wellExposed, faces: false)
+                let (ft, fc) = AutoAdjust.nudged(t, c, by: o, scene: .night, faces: true)
+                check("second opinion leaves well-exposed photos, night tone and faces' vibrance alone", wt == t && wc == c
+                      && ft.exposure == t.exposure && ft.shadows == t.shadows && ft.highlights == t.highlights && fc.vibrance <= c.vibrance, "\(ft) \(fc)")
+                check("tone curve midpoint reads as EV", abs((AutoAdjust.curveValue([CGPoint(x: 0, y: 0), CGPoint(x: 0.4, y: 0.5), CGPoint(x: 1, y: 1)], at: 0.5) ?? 0) - 7.0 / 12) < 1e-9, "")
+                let opinion = sceneAuto.opinion
+                check("second opinion is read from Core Image", opinion != nil, "\(String(describing: opinion))")
+            }
+
+            // Auto straighten: only a confident, modest tilt; sets only the angle; ignores the crop.
+            check("straighten trusts confident, modest horizons only",
+                  AutoAdjust.straightenAngle(.init(angle: 4.87, confidence: 0.9)) == 4.9
+                  && AutoAdjust.straightenAngle(.init(angle: -10, confidence: 0.6)) == -10
+                  && AutoAdjust.straightenAngle(.init(angle: 12, confidence: 1)) == nil
+                  && AutoAdjust.straightenAngle(.init(angle: 3, confidence: 0.3)) == nil
+                  && AutoAdjust.straightenAngle(nil) == nil, "")
+            do {
+                let engine = AutoEngine()
+                AutoVision.shared.install(horizon: .init(angle: -3.24, confidence: 0.95), for: url)
+                var cropped = Adjustments(); cropped.crop.rect = NormRect(x: 0.1, y: 0.1, width: 0.5, height: 0.5); cropped.exposure = 1
+                let level = engine.resultNow(for: AutoRequest(url: url, kind: .straighten, adjustments: cropped))
+                let again = engine.resultNow(for: AutoRequest(url: url, kind: .straighten, adjustments: Adjustments()))
+                var expect = cropped; expect.crop.angle = -3.2
+                check("auto straighten sets only the angle", level?.angle == -3.2 && level?.applied(to: cropped) == expect
+                      && again == level && engine.measurementCount == 1, "\(String(describing: level))")
+                let auto = engine.resultNow(for: AutoRequest(url: url, kind: .auto, adjustments: cropped))
+                check("✦ Auto never straightens", auto?.angle == nil && auto?.applied(to: cropped).crop == cropped.crop, "")
+                AutoVision.shared.install(horizon: nil, for: url)
+                engine.clear()
+                check("no horizon, no angle", engine.resultNow(for: AutoRequest(url: url, kind: .straighten, adjustments: Adjustments()))?.angle == nil, "")
+                AutoVision.shared.removeOverrides(for: url)
+            }
+
+            // The real horizon detector, when it finds the synthetic horizon: the sign must level it.
+            // (Skipped, not failed, when Vision finds nothing: the test mustn't depend on the model.)
+            if let tilted = synthetic("tilted.jpg", { ctx, W, H in
+                ctx.setFillColor(color(0.58, 0.45, 0.95)); ctx.fill(CGRect(x: 0, y: 0, width: W, height: H))
+                ctx.setFillColor(color(0.3, 0.5, 0.35))
+                ctx.beginPath(); ctx.move(to: .zero); ctx.addLine(to: CGPoint(x: 0, y: H * 0.4))
+                ctx.addLine(to: CGPoint(x: W, y: H * 0.4 + tan(5 * .pi / 180) * W)); ctx.addLine(to: CGPoint(x: W, y: 0)); ctx.fillPath()
+            }) {
+                AutoVision.shared.visionEnabled = true
+                let found = AutoAdjust.straighten(source: tilted)
+                if let angle = found.angle {
+                    // Where the ground starts (first green-over-blue row from the top) near each side.
+                    func edgeRows(_ a: Adjustments) -> (Int, Int)? {
+                        guard let bm = AutoAdjust.readback(tilted.developed(a, geometry: .full, renderScale: 1)) else { return nil }
+                        func row(_ x: Int) -> Int {
+                            for y in 0..<bm.height { let i = (y * bm.width + x) * 4; if bm.pixels[i + 1] > bm.pixels[i + 2] { return y } }
+                            return bm.height
+                        }
+                        return (row(bm.width / 5), row(bm.width * 4 / 5))
+                    }
+                    var a = Adjustments(); a.crop.angle = angle
+                    let before = edgeRows(Adjustments()), after = edgeRows(a)
+                    check("auto straighten levels a horizon rising to the right", angle > 3 && angle < 7
+                          && before.map { $0.0 - $0.1 > 30 } == true && after.map { abs($0.0 - $0.1) <= 4 } == true,
+                          String(format: "angle %.1f, ", angle) + "edge rows \(String(describing: before)) -> \(String(describing: after))")
+                } else {
+                    print("SKIP  auto straighten sign check (Vision found no horizon: \(String(describing: found.horizon)))")
+                }
+                AutoVision.shared.visionEnabled = false
+            }
+        }
+
+        // Learn from my edits: a nearest-neighbour average of what the user changed over ✦ Auto.
+        do {
+            var seed: UInt64 = 42
+            func rnd() -> Double { seed = seed &* 6364136223846793005 &+ 1442695040888963407; return Double(seed >> 11) / Double(1 << 53) }
+            func features() -> [Double] { (0..<StyleFeatures.count).map { _ in rnd() } }
+            // A fake catalog where every edit is "+0.5 EV and +10 vibrance over auto", with a little noise.
+            var model = StyleModel()
+            for i in 0..<60 {
+                var d = [Double](repeating: 0, count: StyleSliders.count)
+                d[2] = 0.5 + (rnd() - 0.5) * 0.1; d[8] = 10 + (rnd() - 0.5) * 4; d[0] = (rnd() - 0.5) * 2
+                model.set("p\(i)", features: features(), delta: d)
+            }
+            var worst = (ev: 0.0, vib: 0.0, other: 0.0)
+            for _ in 0..<20 {
+                guard let o = model.predict(features())?.values else { worst = (9, 99, 99); break }
+                worst.ev = max(worst.ev, abs(o[2] - 0.5)); worst.vib = max(worst.vib, abs(o[8] - 10))
+                worst.other = max(worst.other, (0..<o.count).filter { $0 != 2 && $0 != 8 }.map { abs(o[$0]) }.max() ?? 0)
+            }
+            check("learned style converges to +0.5 EV and +10 vibrance", worst.ev <= 0.1 && worst.vib <= 2 && worst.other <= 1,
+                  String(format: "worst off by %.2f EV, %.1f vibrance, %.1f elsewhere", worst.ev, worst.vib, worst.other))
+
+            var few = StyleModel()
+            for i in 0..<(StyleModel.minimumSamples - 1) { few.set("p\(i)", features: features(), delta: [0, 0, 0.5, 0, 0, 0, 0, 0, 10, 0]) }
+            let tooFew = few.predict(features())
+            few.set("last", features: features(), delta: [0, 0, 0.5, 0, 0, 0, 0, 0, 10, 0])
+            check("no learning below \(StyleModel.minimumSamples) edited photos", tooFew == nil && few.isActive && few.predict(features()) != nil
+                  && few.predict(features(), excluding: "last") == nil, "")
+
+            // The open photo's own entry never counts toward its own prediction, so "adapted" is
+            // judged without it: exactly the minimum, one of them the photo itself, isn't enough.
+            check("adapted only with enough other edited photos", few.isActive(for: "new") && !few.isActive(for: "last")
+                  && few.predict(features(), excluding: "last") == nil && !few.isActive(for: "last") == (few.predict(features(), excluding: "last") == nil), "")
+
+            var wild = StyleModel()
+            for i in 0..<30 { wild.set("p\(i)", features: features(), delta: [80, -80, 3, 0, 0, 0, 0, 0, 90, 0]) }
+            let clamped = wild.predict(features())?.values ?? []
+            check("learned changes are clamped", clamped == [25, -20, 1.0, 0, 0, 0, 0, 0, 30, 0], "\(clamped)")
+
+            // Nearest neighbours win: two clusters with opposite habits.
+            var two = StyleModel()
+            for i in 0..<30 {
+                var f = features(); f[2] = 0.2 + rnd() * 0.05
+                two.set("dark\(i)", features: f, delta: [0, 0, 0.6, 0, 0, 0, 0, 0, 0, 0])
+                var g = features(); g[2] = 0.8 + rnd() * 0.05
+                two.set("light\(i)", features: g, delta: [0, 0, -0.4, 0, 0, 0, 0, 0, 0, 0])
+            }
+            var q = [Double](repeating: 0.5, count: StyleFeatures.count); q[2] = 0.21
+            check("similar photos decide", (two.predict(q)?.values[2] ?? 0) > 0.2, "\(String(describing: two.predict(q)))")
+
+            // Index entries: only hand-edited photos with a current sample for the same crop.
+            let sample = StyleSample(features: features(), auto: [5, 0, 0.3, 10, -5, 5, 10, -10, 12, 0], crop: CropSettings())
+            var edited = Adjustments(); edited.exposure = 0.8; edited.vibrance = 22; edited.temperature = 5
+            var idx = StyleModel()
+            idx.update("a", sample: sample, adjustments: edited)
+            let delta = idx.entries["a"]?.delta ?? []
+            idx.update("b", sample: sample, adjustments: Adjustments())
+            var recropped = edited; recropped.crop.rect = NormRect(x: 0, y: 0, width: 0.5, height: 0.5)
+            idx.update("c", sample: sample, adjustments: recropped)
+            var old = sample; old.version = 0
+            idx.update("d", sample: old, adjustments: edited)
+            check("only hand-edited photos with a current sample are learned from", idx.count == 1
+                  && abs(delta[2] - 0.5) < 1e-9 && delta[8] == 10 && delta[3] == -10, "\(delta)")
+
+            do {
+                let f = StyleFeatures.make(AutoAdjust.auto(source: src, inputs: Adjustments()), isRAW: false) ?? []
+                check("style features are a dozen finite numbers", f.count == StyleFeatures.count && f.allSatisfy { $0.isFinite && abs($0) <= 1.0001 }, "\(f)")
+            }
+            var adapted = AutoResult(); adapted.learned = StyleOffset(values: [0, 0, 0.5, 0, 0, 0, 0, 0, 10, 0])
+            var start = Adjustments(); start.exposure = 4.8; start.vibrance = 95
+            let applied = adapted.applied(to: start)
+            check("a learned offset stays within slider ranges", applied.exposure == 5 && applied.vibrance == 100, "")
+
+            // Catalogs from before learning still load; a bad sample is dropped on its own.
+            let oldCatalog = #"{"version":1,"folders":[{"id":"6F9619FF-8B86-D011-B42D-00CF4FC964FF","path":"/tmp/x"}],"fingerprints":{"a":"b"}}"#
+            let newCatalog = #"{"version":1,"folders":[],"styleSamples":{"good":{"version":1,"features":[0,0,0,0,0,0,0,0,0,0,0,0],"auto":[0,0,0,0,0,0,0,0,0,0]},"bad":{"version":1,"auto":[1]}}}"#
+            let report = DecodeReport()
+            let o = try? JSONDecoder.reporting(into: DecodeReport()).decode(Catalog.self, from: Data(oldCatalog.utf8))
+            let n = try? JSONDecoder.reporting(into: report).decode(Catalog.self, from: Data(newCatalog.utf8))
+            check("catalogs without style samples still load", o?.folders.count == 1 && o?.styleSamples.isEmpty == true && o?.fingerprints["a"] == "b", "")
+            check("a malformed style sample is dropped on its own", n?.styleSamples.count == 1 && n?.styleSamples["good"]?.crop == CropSettings()
+                  && n?.styleSamples["good"]?.isUsable(crop: CropSettings()) == true && report.dropped == 1, "dropped \(report.dropped)")
+            var cat = Catalog(); cat.styleSamples["k"] = sample
+            let enc = JSONEncoder(); enc.dateEncodingStrategy = .iso8601
+            let dec = JSONDecoder(); dec.dateDecodingStrategy = .iso8601
+            let back = (try? enc.encode(cat)).flatMap { try? dec.decode(Catalog.self, from: $0) }
+            check("style samples round-trip", back?.styleSamples["k"]?.features == sample.features && back?.styleSamples["k"]?.auto == sample.auto, "")
         }
 
         // Export keeps metadata (optionally without location), and parallel exports never share a name.
@@ -657,6 +1077,24 @@ enum Snapshot {
             store.source = .all
             store.mode = .edit
             await wait(2)
+            // The Basic panel with its auto row, then after ✦ Auto.
+            let tab = store.panelTab
+            store.panelTab = .quick
+            await wait(0.5)
+            shot("3b-basic-panel")
+            _ = await store.runAuto(.auto)?.value
+            await wait(0.8)
+            shot("3c-after-auto")
+            store.undo()
+            // The crop panel with Auto straighten (the samples have no horizon: its hint shows).
+            store.isCropping = true
+            await wait(0.8)
+            _ = await store.runAuto(.straighten)?.value
+            await wait(0.3)
+            shot("3d-crop-auto-straighten")
+            store.isCropping = false
+            store.panelTab = tab
+            await wait(0.5)
             store.addMask(.brush)
             var s1 = BrushStroke(radius: 0.05, feather: 0.4)
             s1.points = [NormPoint(x: 0.15, y: 0.25), NormPoint(x: 0.3, y: 0.3), NormPoint(x: 0.4, y: 0.25)]
@@ -737,6 +1175,20 @@ enum Snapshot {
                 print("snapshot 11-help")
             }
             help.close()
+            let settings = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: 560), styleMask: [.titled],
+                                    backing: .buffered, defer: false)
+            settings.appearance = NSAppearance(named: .darkAqua)
+            settings.contentView = NSHostingView(rootView: SettingsView().environment(store).preferredColorScheme(.dark))
+            settings.orderFront(nil)
+            await wait(1)
+            settings.setContentSize(settings.contentView?.fittingSize ?? settings.frame.size)
+            await wait(0.5)
+            if let view = settings.contentView, let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
+                view.cacheDisplay(in: view.bounds, to: rep)
+                try? rep.representation(using: .png, properties: [:])?.write(to: dir.appendingPathComponent("12-settings.png"))
+                print("snapshot 12-settings")
+            }
+            settings.close()
             store.flushSaves()
             print("snapshot done")
             NSApp.terminate(nil)
@@ -897,6 +1349,112 @@ enum LibraryTest {
             store.mode = .library
         }
 
+        // Auto actions: measured off the main thread, applied as one step, dropped when stale.
+        if store.photos.count >= 2 {
+            let photo = store.photos[0], other = store.photos[1]
+            store.mode = .edit
+            store.select(photo)
+            store.resetAdjustments()
+            store.commitPending(photo)
+            let steps = photo.history.count, before = photo.adjustments
+            let task = store.runAuto(.tone)
+            check("auto runs in the background", task != nil && photo.adjustments == before && store.isAutoRunning)
+            check("auto ignores a second tap while running", store.runAuto(.whiteBalance) == nil)
+            let applied = await task?.value ?? false
+            check("auto tone is one labelled step", applied && !store.isAutoRunning && photo.history.count == steps + 1
+                  && photo.history.last?.label == "Auto tone" && photo.adjustments != before,
+                  photo.history.suffix(2).map(\.label).joined(separator: " | "))
+            store.undo()
+            check("auto tone undoes in one step", photo.adjustments == before)
+
+            let all = await store.runAuto(.auto)?.value ?? false
+            check("✦ Auto is one step labelled Auto", all && photo.history.count == steps + 1 && photo.history.last?.label == "Auto",
+                  photo.history.suffix(2).map(\.label).joined(separator: " | "))
+            store.undo()
+            check("✦ Auto undoes in one step", photo.adjustments == before)
+
+            let stale = store.runAuto(.whiteBalance)
+            store.edit { $0.vignette = -20 }
+            let staleApplied = await stale?.value ?? true
+            check("auto result is dropped when the edits changed", !staleApplied && photo.adjustments.vignette == -20
+                  && photo.adjustments.temperature == before.temperature)
+
+            store.commitPending(photo)
+            let otherSteps = other.history.count, otherBefore = other.adjustments
+            let moved = store.runAuto(.tone)
+            store.select(other)
+            check("another photo's row isn't blocked", !store.isAutoRunning)
+            let movedApplied = await moved?.value ?? true
+            check("auto result is dropped after switching photos", !movedApplied && other.history.count == otherSteps
+                  && other.adjustments == otherBefore && photo.adjustments.exposure == before.exposure)
+            store.select(photo)
+
+            // Auto straighten: one step that sets only the angle; without a horizon, a hint and no step.
+            store.resetAdjustments()
+            store.commitPending(photo)
+            AutoEngine.shared.clear()
+            AutoVision.shared.install(horizon: .init(angle: 2.54, confidence: 0.9), for: photo.url)
+            let flat = photo.adjustments, flatSteps = photo.history.count
+            let leveled = await store.performAuto(.straighten)?.value
+            var expect = flat; expect.crop.angle = 2.5
+            check("auto straighten is one step that sets only the angle", leveled == .applied && photo.adjustments == expect
+                  && photo.history.count == flatSteps + 1 && photo.history.last?.label == "Auto straighten",
+                  "\(String(describing: leveled)) angle \(photo.adjustments.crop.angle)")
+            store.undo()
+            AutoEngine.shared.clear()
+            AutoVision.shared.install(horizon: nil, for: photo.url)
+            let none = await store.performAuto(.straighten)?.value
+            check("no horizon: a hint and no step", none == .noHorizon && store.hint == "No horizon found"
+                  && photo.adjustments == flat && photo.history.count == flatSteps + 1, "\(String(describing: none))")
+            AutoVision.shared.removeOverrides(for: photo.url)
+            AutoEngine.shared.clear()
+
+            // Learn from my edits, through the store: a background sample after an edit, then ✦ Auto
+            // adapted by a fake catalog of "+0.5 EV and +10 vibrance" edits, and plain when off.
+            // (The setting lives in the user's defaults: put it back exactly as it was.)
+            let userSetting = UserDefaults.standard.object(forKey: LibraryStore.learnFromEditsKey)
+            store.learnFromEdits = true
+            store.resetAdjustments()
+            store.edit { $0.exposure = 0.3; $0.vibrance = 7 }
+            store.commitPending(photo)
+            await store.measureStyleSample(photo.url)?.value
+            let sample = store.catalog.styleSamples[photo.ref.key]
+            let entry = store.styleModel.entries[photo.ref.key]
+            check("an edited photo's style sample is measured and indexed", sample?.isUsable(crop: photo.adjustments.crop) == true
+                  && entry.map { abs($0.delta[2] - (0.3 - sample!.auto[2])) < 1e-9 && $0.delta[8] == 7 - sample!.auto[8] } == true,
+                  "\(String(describing: sample))")
+            store.flushSaves()
+            let saved = Catalog.load(from: catalogURL).styleSamples[photo.ref.key]
+            check("style samples are saved in the catalog", sample != nil && saved?.features == sample?.features && saved?.auto == sample?.auto
+                  && saved?.crop == sample?.crop)
+
+            store.resetAdjustments()
+            store.commitPending(photo)
+            check("a reset photo leaves the index", store.styleModel.entries[photo.ref.key] == nil && !store.autoIsAdapted)
+            let plainResult = AutoEngine.shared.resultNow(for: AutoRequest(url: photo.url, kind: .auto, adjustments: photo.adjustments))
+            let plain = plainResult?.applied(to: photo.adjustments) ?? Adjustments()
+            if let pf = plainResult.flatMap({ StyleFeatures.make($0, isRAW: false) }) {
+                for i in 0..<25 {
+                    store.styleModel.set("fake\(i)", features: pf.map { $0 + Double(i % 5) * 0.01 },
+                                         delta: [0, 0, 0.5, 0, 0, 0, 0, 0, 10, 0])
+                }
+            }
+            store.updateStyleActive()
+            let adapted = await store.runAuto(.auto)?.value ?? false
+            check("✦ Auto adds what the user usually does", adapted && store.autoIsAdapted
+                  && abs(photo.adjustments.exposure - min(plain.exposure + 0.5, 5)) < 1e-9 && photo.adjustments.vibrance == min(plain.vibrance + 10, 100)
+                  && photo.adjustments.temperature == plain.temperature && photo.history.last?.label == "Auto",
+                  String(format: "exposure %.2f -> %.2f, vibrance %.0f -> %.0f", plain.exposure, photo.adjustments.exposure, plain.vibrance, photo.adjustments.vibrance))
+            store.undo()
+            store.learnFromEdits = false
+            let off = await store.runAuto(.auto)?.value ?? false
+            check("with learning off, ✦ Auto is plain", off && !store.autoIsAdapted && photo.adjustments == plain)
+            store.undo()
+            UserDefaults.standard.set(userSetting, forKey: LibraryStore.learnFromEditsKey)
+            store.resetAdjustments()
+            store.mode = .library
+        }
+
         // Move to Trash: files and sidecars go to the (fake) trash, references are dropped, the next photo is current.
         do {
             let fakeTrash = dir.appendingPathComponent("FakeTrash")
@@ -983,6 +1541,8 @@ enum LibraryTest {
         check("sort by rating puts the best first", store.visiblePhotos.first?.rating == 5, "")
         store.sortOrder = savedSort; store.sortDescending = savedDesc
 
+        await commandLineChecks(dir: dir.appendingPathComponent("cli"), check: check)
+        await syncChecks(dir: dir.appendingPathComponent("sync"), check: check)
         await sidecarChecks(dir: dir.appendingPathComponent("sidecars"), check: check)
         await scaleChecks(dir: dir.appendingPathComponent("scale"), check: check)
         toleranceChecks(dir: dir.appendingPathComponent("tolerance"), check: check)
@@ -1021,7 +1581,7 @@ extension LibraryTest {
         sidecar.history = history
         sidecar.historyIndex = history.count - 1
 
-        try? SidecarFiles.write(sidecar, for: photo, history: true)
+        _ = try? SidecarFiles.write(sidecar, for: photo, history: true)
         let back = SidecarFiles.read(for: photo)
         check("history round-trips", back?.history == history && back?.historyIndex == history.count - 1 && back?.rating == 3, "")
         let mainSize = (try? fm.attributesOfItem(atPath: SidecarFiles.mainURL(for: photo).path)[.size] as? Int) ?? 0
@@ -1035,7 +1595,7 @@ extension LibraryTest {
         var rated = sidecar
         rated.rating = 5
         rated.history = Array(history.prefix(2))
-        try? SidecarFiles.write(rated, for: photo, history: false)
+        _ = try? SidecarFiles.write(rated, for: photo, history: false)
         let afterRating = SidecarFiles.read(for: photo)
         check("rating save leaves history alone", afterRating?.rating == 5 && afterRating?.history.count == history.count, "")
 
@@ -1048,7 +1608,7 @@ extension LibraryTest {
         check("older inline-history sidecar loads", legacyBack?.history == history, "")
         if var lb = legacyBack {
             lb.rating = 1
-            try? SidecarFiles.write(lb, for: legacy, history: false)
+            _ = try? SidecarFiles.write(lb, for: legacy, history: false)
             let migrated = SidecarFiles.read(for: legacy)
             check("older history moves to its own file", fm.fileExists(atPath: SidecarFiles.historyURL(for: legacy).path)
                   && migrated?.history == history && migrated?.rating == 1, "")
@@ -1063,7 +1623,7 @@ extension LibraryTest {
               && SidecarFiles.read(for: renamed)?.history.count == history.count, "")
 
         // Nothing left to keep: both files go.
-        try? SidecarFiles.write(Sidecar(), for: renamed, history: true)
+        _ = try? SidecarFiles.write(Sidecar(), for: renamed, history: true)
         check("empty sidecar removes both files", !fm.fileExists(atPath: SidecarFiles.mainURL(for: renamed).path)
               && !fm.fileExists(atPath: SidecarFiles.historyURL(for: renamed).path), "")
 
@@ -1410,7 +1970,7 @@ extension LibraryTest {
         try? fm.copyItem(at: photo, to: clean)
         var good = Sidecar(); good.rating = 2; good.adjustments = a
         good.history = history; good.historyIndex = 1
-        try? SidecarFiles.write(good, for: clean, history: true)
+        _ = try? SidecarFiles.write(good, for: clean, history: true)
         let cleanBack = SidecarFiles.read(for: clean)
         check("a clean sidecar round-trips without a backup", cleanBack?.adjustments == a && cleanBack?.history == history
               && backups().count == 2, "")
