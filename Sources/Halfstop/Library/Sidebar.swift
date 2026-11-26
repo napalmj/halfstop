@@ -23,7 +23,7 @@ struct LibrarySidebar: View {
                 }
 
                 header("Folders") { store.showImportSheet() }
-                    .help("Import a folder (⌘I)")
+                    .shortcutTip("Import a folder", key: "⌘I")
                 ForEach(store.catalog.folders) { folder in
                     folderRow(folder)
                 }

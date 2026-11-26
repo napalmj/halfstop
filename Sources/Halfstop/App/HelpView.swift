@@ -48,13 +48,17 @@ struct HelpView: View {
             Item(keys: ["\\"], what: "Before / after"),
             Item(keys: ["J"], what: "Show clipping: red = blown highlights, blue = crushed shadows"),
             Item(keys: ["W"], what: "Pick white balance: click something that should be gray"),
-            Item(keys: ["Auto tone", "Auto WB"], what: "One-click starting points (top of the panel)"),
+            Item(keys: ["Q"], what: "Remove spots: click a spot. ⌥-click or Delete removes one, [ ] change the size"),
+            Item(keys: ["T"], what: "Target adjust: drag up or down on a color to bend the current hue curve"),
+            Item(keys: ["✦ Auto"], what: "White balance, tone, whites and blacks, and vibrance in one undoable step (top of the panel). Takes care with faces and skin tones"),
+            Item(keys: ["Tone", "WB"], what: "Auto tone or auto white balance on its own"),
             Item(keys: ["Hover a slider + ↑ ↓"], what: "Nudge it (⇧ for bigger steps)"),
             Item(keys: ["Click a slider's value"], what: "Type an exact number"),
             Item(keys: ["D"], what: "Switch between Quick and Detailed panels"),
             Item(keys: ["C", "R"], what: "Crop & straighten"),
+            Item(keys: ["Auto straighten"], what: "In Crop & straighten: level a tilted horizon (up to 10°). Says “No horizon found” when it can’t find one"),
             Item(keys: ["Double-click a slider"], what: "Reset it"),
-            Item(keys: ["Esc"], what: "Back out: crop → refine → mask → before/after → library"),
+            Item(keys: ["Esc"], what: "Back out: tool (spots, target adjust, crop) → refine → mask → before/after → library"),
             Item(keys: ["⇧⌘C", "⇧⌘V"], what: "Copy / paste settings (to the whole selection)"),
             Item(keys: ["⌥⇧⌘V"], what: "Paste only some settings (light, color, masks, crop…)"),
             Item(keys: ["⇧⌘R"], what: "Reset all adjustments"),
@@ -63,6 +67,7 @@ struct HelpView: View {
             Item(keys: ["⌘Z", "⇧⌘Z"], what: "Undo / redo, one history step at a time"),
             Item(keys: ["Click a step"], what: "Go back to it. Your next edit removes the struck-out steps after it"),
             Item(keys: ["Snapshots ▸ Save"], what: "Keep a named version. Snapshots survive trimming and clearing"),
+            Item(keys: ["Command-line steps"], what: "Changes made with the halfstop command (by you or an AI agent) show up as steps right away: ⌘Z undoes them"),
         ]),
         Section(title: "Masks", icon: "circle.lefthalf.filled", items: [
             Item(keys: ["O"], what: "Show or hide the red mask overlay"),
@@ -71,18 +76,22 @@ struct HelpView: View {
             Item(keys: ["⇧ drag"], what: "Add another linear or radial shape to the same mask"),
             Item(keys: ["Click a subject"], what: "Include or leave out that subject (subject masks)"),
             Item(keys: ["Drag a handle"], what: "Move, resize or feather the active shape"),
+            Item(keys: ["Limit to"], what: "Keep only a brightness range or a picked color of the mask"),
         ]),
         Section(title: "Files", icon: "folder", items: [
             Item(keys: ["⌘I"], what: "Import a folder (photos stay where they are)"),
             Item(keys: ["Drop a folder"], what: "Import it"),
             Item(keys: ["⌘S"], what: "Save now (edits also save on their own after a moment)"),
             Item(keys: ["⇧⌘E"], what: "Export"),
+            Item(keys: ["⌘,"], what: "Settings (Learn from my edits, command-line tool)"),
         ]),
     ]
 
     private static let notes: [(String, String)] = [
         ("Your files are never changed", "Edits, ratings and history live in a small .halfstop folder next to your photos. Export to get edited copies."),
         ("Deleting goes to the Trash", "Halfstop never erases files. Trashed photos come back with Finder's Put Back until you empty the Trash."),
+        ("✦ Auto learns from your edits", "Once you have edited 20 photos, ✦ Auto adds what you usually change on similar ones. It learns on this Mac only; turn it off in Settings (⌘,)."),
+        ("Edit from the command line or with an AI agent", "The halfstop command reads and edits photos from Terminal, so an AI agent with a shell, such as Claude Code, can edit with you (run halfstop --help). Settings (⌘,) shows how to install it. It only changes Halfstop's own edit files, never your photos, and every change is an undoable step."),
         ("Each photo keeps its own crop", "Paste settings copies everything except the crop. Presets carry only the global look, never crop or masks."),
     ]
 

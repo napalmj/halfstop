@@ -47,13 +47,16 @@ struct PreviewArea: View {
                 }
             }
         }
-        .onAppear(perform: prepare)
+        .onAppear {
+            prepare()
+            AutoVision.shared.warmUp()
+        }
         .onChange(of: store.currentID) { prepare() }
     }
 
     private var geometryMode: GeometryMode {
         if store.isCropping { return .straightenOnly }
-        if store.activeMaskID != nil { return .none }
+        if store.activeMaskID != nil || store.removingSpots { return .none }
         return .full
     }
 
@@ -92,8 +95,24 @@ struct PreviewArea: View {
             let contentSize = PreviewLayout.contentSize(source.size, a, mode)
             let rect = PreviewLayout.fit(contentSize, in: size)
             if store.pickingWhite && !store.isCropping && store.activeMaskID == nil {
+                WhitePicker(imageRect: rect) { p in store.pickWhiteBalance(at: p) }
+            } else if store.pickingRangeColor, store.activeMask != nil, !store.showBefore {
+                // Sampled before any mask, which is close to what the range sees.
                 WhitePicker(imageRect: rect) { p in
-                    if let s = renderer.source(for: url) { store.pickWhiteBalance(at: p, using: s) }
+                    var base = a
+                    base.masks = []
+                    if let c = PixelSampler.color(source, base, geometry: .none, at: p) { store.pickRangeColor(c) }
+                }
+            } else if store.removingSpots && !store.showBefore {
+                SpotOverlay(spots: a.spots, imageRect: rect) { center, radius in
+                    PixelSampler.spotSource(source, a, center: center, radius: radius)
+                }
+            } else if store.targetAdjusting && !store.showBefore {
+                TargetAdjustOverlay(imageRect: rect) { p in
+                    // The color as it is before the hue curves, so the point stays put while dragging.
+                    var base = a
+                    base.hueCurves = HueCurves()
+                    return PixelSampler.color(source, base, geometry: .full, at: p)
                 }
             } else if store.isCropping {
                 CropOverlay(
@@ -110,7 +129,11 @@ struct PreviewArea: View {
 
         VStack {
             HStack {
-                if store.pickingWhite { badge("Click something that should be neutral gray · Esc cancels") }
+                if let hint = store.hint { badge(hint) }
+                else if store.pickingWhite { badge("Click something that should be neutral gray · Esc cancels") }
+                else if store.pickingRangeColor { badge("Click the color the mask should keep · Esc cancels") }
+                else if store.removingSpots { badge("Remove spots: click a spot · ⌥-click deletes · Esc when done") }
+                else if store.targetAdjusting { badge("\(store.hueCurveChannel.label) curve: drag up or down on a color · Esc when done") }
                 else if store.showBefore { badge("Before") }
                 else if clipping { badge("Clipping: red = blown, blue = crushed (J)") }
                 else if let mask = store.activeMask { badge("Editing \(mask.name)") }
@@ -452,5 +475,174 @@ private struct WhitePicker: View {
                 onPick(NormPoint(x: Double((loc.x - imageRect.minX) / imageRect.width),
                                  y: Double((loc.y - imageRect.minY) / imageRect.height)))
             }
+    }
+}
+
+// MARK: - Spot removal
+
+/// Spot removal: click to remove a spot (the source is picked automatically), drag a spot or its
+/// source to move it, ⌥-click a spot to delete it. In uncropped image space, like masks.
+private struct SpotOverlay: View {
+    @Environment(LibraryStore.self) private var store
+    let spots: [Spot]
+    let imageRect: CGRect
+    /// Picks a source for a new spot (center, radius) → source.
+    let findSource: (NormPoint, Double) -> NormPoint
+
+    private enum Drag: Equatable { case center(UUID), source(UUID), new }
+    @State private var drag: Drag?
+    @State private var dragStart: CGPoint?
+    @State private var grabOffset: CGSize = .zero
+    @State private var hover: CGPoint?
+
+    private var longEdge: CGFloat { max(imageRect.width, imageRect.height) }
+
+    private func view(_ p: NormPoint) -> CGPoint {
+        CGPoint(x: imageRect.minX + p.x * imageRect.width, y: imageRect.minY + p.y * imageRect.height)
+    }
+
+    private func norm(_ p: CGPoint) -> NormPoint {
+        NormPoint(x: Double((p.x - imageRect.minX) / imageRect.width), y: Double((p.y - imageRect.minY) / imageRect.height))
+    }
+
+    var body: some View {
+        ZStack {
+            Canvas { ctx, _ in
+                for spot in spots {
+                    let active = spot.id == store.activeSpotID
+                    let r = spot.radius * longEdge
+                    let c = view(spot.center), s = view(spot.source)
+                    let white = Color.white.opacity(active ? 0.95 : 0.55)
+                    ctx.stroke(Path(ellipseIn: CGRect(x: c.x - r, y: c.y - r, width: r * 2, height: r * 2)),
+                               with: .color(active ? Theme.accent : white), lineWidth: active ? 1.6 : 1.1)
+                    if active {
+                        ctx.stroke(Path(ellipseIn: CGRect(x: s.x - r, y: s.y - r, width: r * 2, height: r * 2)),
+                                   with: .color(white), style: StrokeStyle(lineWidth: 1, dash: [4, 3]))
+                        let d = hypot(c.x - s.x, c.y - s.y)
+                        if d > r * 2 {
+                            var line = Path()
+                            line.move(to: CGPoint(x: s.x + (c.x - s.x) / d * r, y: s.y + (c.y - s.y) / d * r))
+                            line.addLine(to: CGPoint(x: c.x - (c.x - s.x) / d * r, y: c.y - (c.y - s.y) / d * r))
+                            ctx.stroke(line, with: .color(white.opacity(0.6)), style: StrokeStyle(lineWidth: 1, dash: [2, 3]))
+                        }
+                    }
+                }
+                if drag == nil, let hover {
+                    let r = store.spotSize * longEdge
+                    ctx.stroke(Path(ellipseIn: CGRect(x: hover.x - r, y: hover.y - r, width: r * 2, height: r * 2)),
+                               with: .color(.white.opacity(0.7)), lineWidth: 1)
+                }
+            }
+            .allowsHitTesting(false)
+            Color.clear
+                .contentShape(Rectangle())
+                .gesture(DragGesture(minimumDistance: 0)
+                    .onChanged(changed)
+                    .onEnded(ended))
+                .onContinuousHover { phase in
+                    if case .active(let p) = phase { hover = p } else { hover = nil }
+                }
+        }
+    }
+
+    /// The spot (or its source, for the selected spot) under a point.
+    private func hit(_ loc: CGPoint) -> Drag? {
+        if let active = store.activeSpot {
+            let r = active.radius * longEdge
+            if hypot(view(active.center).x - loc.x, view(active.center).y - loc.y) <= max(r, 6) { return .center(active.id) }
+            if hypot(view(active.source).x - loc.x, view(active.source).y - loc.y) <= max(r, 6) { return .source(active.id) }
+        }
+        for spot in spots.reversed() {
+            let c = view(spot.center)
+            if hypot(c.x - loc.x, c.y - loc.y) <= max(spot.radius * longEdge, 6) { return .center(spot.id) }
+        }
+        return nil
+    }
+
+    private func changed(_ g: DragGesture.Value) {
+        hover = g.location
+        if drag == nil || dragStart != g.startLocation {
+            dragStart = g.startLocation
+            let picked = hit(g.startLocation)
+            if case .center(let id) = picked, NSEvent.modifierFlags.contains(.option) {
+                store.deleteSpot(id)
+                drag = .new  // swallow the rest of this click
+                return
+            }
+            switch picked {
+            case .center(let id), .source(let id):
+                store.activeSpotID = id
+                store.checkpoint()
+                let spot = spots.first { $0.id == id }
+                let anchor = picked == .center(id) ? spot?.center : spot?.source
+                if let anchor {
+                    let v = view(anchor)
+                    grabOffset = CGSize(width: v.x - g.startLocation.x, height: v.y - g.startLocation.y)
+                }
+            default:
+                break
+            }
+            drag = picked ?? .new
+        }
+        let p = norm(CGPoint(x: g.location.x + grabOffset.width, y: g.location.y + grabOffset.height))
+        switch drag {
+        case .center(let id): store.editSpot(id) { $0.center = p }
+        case .source(let id): store.editSpot(id) { $0.source = p }
+        case .new, nil: break
+        }
+    }
+
+    private func ended(_ g: DragGesture.Value) {
+        defer { drag = nil; dragStart = nil; grabOffset = .zero }
+        // A click on empty photo adds a spot (not when it deleted one, or was a drag).
+        guard drag == .new, !NSEvent.modifierFlags.contains(.option),
+              hypot(g.translation.width, g.translation.height) < 5, imageRect.contains(g.startLocation) else {
+            if drag == .new, !NSEvent.modifierFlags.contains(.option), !imageRect.contains(g.startLocation) { store.activeSpotID = nil }
+            return
+        }
+        let center = norm(g.startLocation)
+        store.addSpot(center: center, source: findSource(center, store.spotSize))
+    }
+}
+
+// MARK: - Target adjust
+
+/// Drag up or down on the photo to bend the current hue curve at the color under the pointer.
+private struct TargetAdjustOverlay: View {
+    @Environment(LibraryStore.self) private var store
+    let imageRect: CGRect
+    /// The color (display RGB) at a point, before hue curves.
+    let sample: (NormPoint) -> SIMD3<Float>?
+
+    @State private var target: (hue: Double, startY: Double)?
+    @State private var dragStart: CGPoint?
+
+    var body: some View {
+        Color.clear
+            .contentShape(Rectangle())
+            .onContinuousHover { phase in
+                if case .active = phase { NSCursor.resizeUpDown.set() } else { NSCursor.arrow.set() }
+            }
+            .gesture(DragGesture(minimumDistance: 0)
+                .onChanged { g in
+                    if dragStart != g.startLocation {
+                        dragStart = g.startLocation
+                        target = nil
+                        guard imageRect.contains(g.startLocation) else { return }
+                        let p = NormPoint(x: Double((g.startLocation.x - imageRect.minX) / imageRect.width),
+                                          y: Double((g.startLocation.y - imageRect.minY) / imageRect.height))
+                        guard let c = sample(p) else { return }
+                        let (h, s, _) = ColorLUT.rgbToHSL(c.x, c.y, c.z)
+                        // Gray has no hue to adjust.
+                        guard s > 0.04 else { store.showHint("That spot is too gray to adjust by color"); return }
+                        let points = store.current?.adjustments.hueCurves[keyPath: store.hueCurveChannel.keyPath] ?? []
+                        target = (Double(h), PeriodicCurve(points: points).evaluate(Double(h) / 360))
+                        store.checkpoint()
+                    }
+                    guard let t = target else { return }
+                    let y = t.startY - Double(g.translation.height) / 250
+                    store.setHueCurve(at: t.hue, to: y)
+                }
+                .onEnded { _ in target = nil; dragStart = nil })
     }
 }

@@ -132,9 +132,9 @@ extension LibraryStore {
             let urls = newFiles.map { URL(fileURLWithPath: root).appendingPathComponent($0) }
             await Task.detached(priority: .userInitiated) {
                 for url in urls {
-                    var sidecar = SidecarFiles.read(for: url) ?? Sidecar()
-                    sidecar.adjustments = preset.adjustments.asPreset(onto: sidecar.adjustments)
-                    LibraryStore.writeSidecar(sidecar, for: url, history: false)
+                    LibraryStore.updateSidecar(for: url, history: false) { sidecar in
+                        sidecar.adjustments = preset.adjustments.asPreset(onto: sidecar.adjustments)
+                    }
                 }
             }.value
         }

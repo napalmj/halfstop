@@ -101,6 +101,8 @@ struct Catalog: Codable {
     var captureDates: [String: Date] = [:]
     var lastImport: ImportRecord?
     var targetCollection: UUID?
+    /// PhotoRef.key → what "Learn from my edits" measured for an edited photo.
+    var styleSamples: [String: StyleSample] = [:]
 
     init() {}
 
@@ -115,6 +117,7 @@ struct Catalog: Codable {
         captureDates = t.dictionary(.captureDates) ?? [:]
         lastImport = t.optional(.lastImport)
         targetCollection = t.optional(.targetCollection)
+        styleSamples = t.dictionary(.styleSamples) ?? [:]
     }
 
     static var defaultURL: URL {
@@ -151,7 +154,7 @@ struct Catalog: Codable {
     /// Drops every reference to photos that are gone (moved to the Trash).
     mutating func forget(_ refs: Set<PhotoRef>) {
         for i in collections.indices { collections[i].members.removeAll { refs.contains($0) } }
-        for r in refs { fingerprints[r.key] = nil; captureDates[r.key] = nil }
+        for r in refs { fingerprints[r.key] = nil; captureDates[r.key] = nil; styleSamples[r.key] = nil }
         if var record = lastImport {
             record.refs.removeAll { refs.contains($0) }
             lastImport = record
@@ -164,6 +167,7 @@ struct Catalog: Codable {
             collections[i].members = collections[i].members.map { $0 == from ? to : $0 }
         }
         if let fp = fingerprints.removeValue(forKey: from.key) { fingerprints[to.key] = fp }
+        if let sample = styleSamples.removeValue(forKey: from.key) { styleSamples[to.key] = sample }
         if var record = lastImport {
             record.refs = record.refs.map { $0 == from ? to : $0 }
             lastImport = record
@@ -383,23 +387,52 @@ enum RenamePattern: String, CaseIterable, Identifiable, Codable {
 /// Ignores changes inside `.halfstop/` so saving edits doesn't trigger rescans.
 final class FolderWatcher {
     private var stream: FSEventStreamRef?
+    /// File-level events in the folders' `.halfstop` sidecar folders (edits saved by another program).
+    private var sidecarStream: FSEventStreamRef?
     private let onChange: ([String]) -> Void
+    private let onSidecarChange: (([String]) -> Void)?
 
-    init(onChange: @escaping ([String]) -> Void) {
+    /// - Parameters:
+    ///   - onChange: folders whose photos may have changed (sidecar folders are left out).
+    ///   - onSidecarChange: sidecar files (`…/.halfstop/<name>.json` and `.history.json`) that changed,
+    ///     the app's own saves included; on the main queue.
+    init(onChange: @escaping ([String]) -> Void, onSidecarChange: (([String]) -> Void)? = nil) {
         self.onChange = onChange
+        self.onSidecarChange = onSidecarChange
     }
 
     deinit { stop() }
 
+    /// Watched folders whose real path differs (FSEvents reports /private/tmp/… for /tmp/…): real → as given.
+    private var aliases: [(real: String, given: String)] = []
+
+    /// An event path in the form the folder was given in, so it matches the library's photo paths.
+    private func asWatched(_ path: String) -> String {
+        for a in aliases where path.hasPrefix(a.real + "/") { return a.given + path.dropFirst(a.real.count) }
+        return path
+    }
+
     func watch(_ paths: [String]) {
         stop()
         guard !paths.isEmpty else { return }
+        aliases = paths.compactMap { given in
+            guard let real = realpath(given, nil) else { return nil }
+            defer { free(real) }
+            let r = String(cString: real)
+            return r == given ? nil : (r, given)
+        }
         var ctx = FSEventStreamContext(version: 0, info: Unmanaged.passUnretained(self).toOpaque(),
                                        retain: nil, release: nil, copyDescription: nil)
-        let callback: FSEventStreamCallback = { _, info, _, eventPaths, _, _ in
+        let callback: FSEventStreamCallback = { streamRef, info, _, eventPaths, _, _ in
             guard let info else { return }
             let me = Unmanaged<FolderWatcher>.fromOpaque(info).takeUnretainedValue()
             let paths = (unsafeBitCast(eventPaths, to: NSArray.self) as? [String]) ?? []
+            if streamRef == me.sidecarStream {
+                let marker = "/" + SidecarFiles.folderName + "/"
+                let files = paths.filter { $0.contains(marker) && $0.hasSuffix(".json") }.map(me.asWatched)
+                if !files.isEmpty { me.onSidecarChange?(files) }
+                return
+            }
             let relevant = paths.filter { !$0.contains("/" + SidecarFiles.folderName) && !$0.contains("/" + LegacyNames.sidecarFolder) }
             if !relevant.isEmpty { me.onChange(relevant) }
         }
@@ -410,13 +443,26 @@ final class FolderWatcher {
             FSEventStreamSetDispatchQueue(stream, .main)
             FSEventStreamStart(stream)
         }
+        guard onSidecarChange != nil else { return }
+        // A second stream, so the folder rescans above keep their folder-level events. Short latency:
+        // an edit made from the command line should show up in the editor right away.
+        sidecarStream = FSEventStreamCreate(nil, callback, &ctx, paths as CFArray,
+                                            FSEventStreamEventId(kFSEventStreamEventIdSinceNow), 0.2,
+                                            UInt32(kFSEventStreamCreateFlagUseCFTypes | kFSEventStreamCreateFlagNoDefer | kFSEventStreamCreateFlagFileEvents))
+        if let sidecarStream {
+            FSEventStreamSetDispatchQueue(sidecarStream, .main)
+            FSEventStreamStart(sidecarStream)
+        }
     }
 
     func stop() {
-        guard let stream else { return }
-        FSEventStreamStop(stream)
-        FSEventStreamInvalidate(stream)
-        FSEventStreamRelease(stream)
-        self.stream = nil
+        for s in [stream, sidecarStream] {
+            guard let s else { continue }
+            FSEventStreamStop(s)
+            FSEventStreamInvalidate(s)
+            FSEventStreamRelease(s)
+        }
+        stream = nil
+        sidecarStream = nil
     }
 }

@@ -53,6 +53,27 @@ enum LibraryFilter: String, CaseIterable, Identifiable {
     }
 }
 
+/// How an auto action ended.
+enum AutoOutcome: Equatable, Sendable {
+    /// Applied as one history step.
+    case applied
+    /// Measured, but it would change nothing (no step added).
+    case unchanged
+    /// Auto straighten found no horizon it trusts (shown as a hint).
+    case noHorizon
+    /// Dropped: the user moved to another photo or changed the edits meanwhile.
+    case stale
+    /// The photo couldn't be read.
+    case unreadable
+}
+
+/// An auto action in flight, for the progress state on its chip.
+struct AutoRun: Equatable {
+    let url: URL
+    let kind: AutoKind
+    let id: UUID
+}
+
 @MainActor
 @Observable
 final class LibraryStore {
@@ -95,6 +116,9 @@ final class LibraryStore {
     var importPrefill: URL?
     @ObservationIgnored let catalogURL: URL
     @ObservationIgnored private var watcher: FolderWatcher?
+    /// What each photo's sidecar files held when the app last read or wrote them, so a change made
+    /// outside the app (the `halfstop` command) is noticed, shown and never overwritten.
+    nonisolated let sync = SidecarSync()
     @ObservationIgnored private var reloadPending = false
 
     // Navigation
@@ -114,25 +138,63 @@ final class LibraryStore {
     var editsFilter: EditsFilter = .any { didSet { keepCurrentVisible() } }
 
     // Editor state
-    var isCropping = false { didSet { if isCropping { activeMaskID = nil } } }
+    var isCropping = false { didSet { if isCropping { activeMaskID = nil; removingSpots = false; targetAdjusting = false } } }
     var showBefore = false
     /// Paints blown highlights red and crushed shadows blue on the preview (J).
     var showClipping = false
     /// The next click on the photo sets white balance from that spot (W).
     var pickingWhite = false
+    /// The auto action measuring right now, if any (its chip shows progress).
+    private(set) var autoRun: AutoRun?
     /// Move to the next photo after rating or flagging one (⇧ with the key does it once).
     var autoAdvance = UserDefaults.standard.bool(forKey: "autoAdvance") {
         didSet { UserDefaults.standard.set(autoAdvance, forKey: "autoAdvance") }
     }
     var thumbnailSize: Double = 200
+
+    // Learn from my edits
+    /// ✦ Auto adapts to the user's own edits (Settings). On by default.
+    var learnFromEdits = UserDefaults.standard.object(forKey: LibraryStore.learnFromEditsKey) as? Bool ?? true {
+        didSet {
+            guard learnFromEdits != oldValue else { return }
+            UserDefaults.standard.set(learnFromEdits, forKey: Self.learnFromEditsKey)
+            rebuildStyleModel()
+        }
+    }
+    nonisolated static let learnFromEditsKey = "learnFromEdits"
+    /// Edited photos ✦ Auto learns from, updated one photo at a time (never a catalog rescan per click).
+    @ObservationIgnored var styleModel = StyleModel()
+    /// Whether the model has enough edited photos to act (observed, unlike the model itself).
+    private(set) var styleActive = false
+    @ObservationIgnored private var pendingStyleSamples: [URL: DispatchWorkItem] = [:]
+    @ObservationIgnored private var pendingCatalogSave: DispatchWorkItem?
     var panelTab: PanelTab = .quick { didSet { if panelTab == .quick { activeMaskID = nil } } }
     /// Mask currently being edited; nil = whole photo.
     var activeMaskID: UUID? {
         didSet {
-            if activeMaskID != nil { isCropping = false }
-            if activeMaskID != oldValue { refineMode = nil; activeShapeID = nil }
+            if activeMaskID != nil { isCropping = false; removingSpots = false; targetAdjusting = false }
+            if activeMaskID != oldValue { refineMode = nil; activeShapeID = nil; pickingRangeColor = false }
         }
     }
+    /// The next click on the photo picks the active mask's range color.
+    var pickingRangeColor = false
+    /// Spot removal (Q): a click on the photo removes the spot under it.
+    var removingSpots = false {
+        didSet {
+            if removingSpots { isCropping = false; activeMaskID = nil; targetAdjusting = false; pickingWhite = false }
+            else { activeSpotID = nil }
+        }
+    }
+    /// The removed spot the panel's sliders edit.
+    var activeSpotID: UUID?
+    /// Size of new spots, as a fraction of the photo's long edge.
+    var spotSize: Double = 0.015
+    /// Target adjust (T): dragging up or down on the photo bends the hue curve at that color.
+    var targetAdjusting = false {
+        didSet { if targetAdjusting { isCropping = false; activeMaskID = nil; removingSpots = false; pickingWhite = false } }
+    }
+    /// Which hue curve the panel shows and target adjust edits.
+    var hueCurveChannel: HueCurveChannel = .saturation
     /// Which shape of the active mask the handles edit; nil = the mask's own shape.
     var activeShapeID: UUID?
     var refineMode: RefineMode?
@@ -194,9 +256,11 @@ final class LibraryStore {
             saveCatalog()
         }
         if watch {
-            watcher = FolderWatcher { [weak self] paths in
+            watcher = FolderWatcher(onChange: { [weak self] paths in
                 MainActor.assumeIsolated { self?.scheduleReload(changed: paths) }
-            }
+            }, onSidecarChange: { [weak self] paths in
+                MainActor.assumeIsolated { self?.sidecarsChanged(paths) }
+            })
         }
         reload()
     }
@@ -388,8 +452,13 @@ final class LibraryStore {
             await MainActor.run {
                 var scanned: [UUID: [Photo]] = [:]
                 for item in found {
-                    let p = existing[item.url].flatMap { $0.ref == item.ref ? $0 : nil }
-                        ?? Photo(url: item.url, ref: item.ref, sidecar: item.sidecar ?? Sidecar())
+                    let p: Photo
+                    if let kept = existing[item.url].flatMap({ $0.ref == item.ref ? $0 : nil }) {
+                        p = kept
+                    } else {
+                        p = Photo(url: item.url, ref: item.ref, sidecar: item.sidecar ?? Sidecar())
+                        self.sync.record(item.url, revision: item.revision, base: p.sidecar)
+                    }
                     scanned[item.ref.folder, default: []].append(p)
                 }
                 // Folders in catalog order; untouched ones keep the photos (and order) they had.
@@ -404,9 +473,11 @@ final class LibraryStore {
                 }
                 self.scanOrder = Dictionary(list.enumerated().map { ($1.url, $0) }, uniquingKeysWith: { a, _ in a })
                 self.photos = self.sorted(list)
+                self.sync.keep(only: Set(list.map(\.url)))
                 self.isLoading = false
                 self.keepCurrentVisible()
                 self.backfillFingerprints()
+                self.rebuildStyleModel()
                 completion?()
             }
         }
@@ -416,6 +487,7 @@ final class LibraryStore {
         let url: URL
         let ref: PhotoRef
         let sidecar: Sidecar?
+        let revision: SidecarRevision
     }
 
     nonisolated static func scanCatalog(_ catalog: Catalog, known: Set<URL>, only: Set<UUID>? = nil) -> [ScannedPhoto] {
@@ -434,17 +506,24 @@ final class LibraryStore {
         let box = SidecarBox(count: entries.count)
         DispatchQueue.concurrentPerform(iterations: need.count) { k in
             let i = need[k]
-            box.set(i, SidecarFiles.read(for: entries[i].url))
+            let url = entries[i].url
+            // Under the folder's lock, so a write by the `halfstop` command is never half read.
+            let loaded = (try? SidecarLock.with(url, exclusive: false, create: false) { SidecarFiles.load(for: url) })
+                ?? SidecarFiles.load(for: url)
+            box.set(i, loaded)
         }
-        return entries.indices.map { ScannedPhoto(url: entries[$0].url, ref: entries[$0].ref, sidecar: box.get($0)) }
+        return entries.indices.map {
+            let loaded = box.get($0)
+            return ScannedPhoto(url: entries[$0].url, ref: entries[$0].ref, sidecar: loaded.sidecar, revision: loaded.revision)
+        }
     }
 
     private final class SidecarBox: @unchecked Sendable {
-        private var items: [Sidecar?]
+        private var items: [(sidecar: Sidecar?, revision: SidecarRevision)]
         private let lock = NSLock()
-        init(count: Int) { items = Array(repeating: nil, count: count) }
-        func set(_ i: Int, _ s: Sidecar?) { lock.lock(); items[i] = s; lock.unlock() }
-        func get(_ i: Int) -> Sidecar? { lock.lock(); defer { lock.unlock() }; return items[i] }
+        init(count: Int) { items = Array(repeating: (nil, .none), count: count) }
+        func set(_ i: Int, _ s: (sidecar: Sidecar?, revision: SidecarRevision)) { lock.lock(); items[i] = s; lock.unlock() }
+        func get(_ i: Int) -> (sidecar: Sidecar?, revision: SidecarRevision) { lock.lock(); defer { lock.unlock() }; return items[i] }
     }
 
     nonisolated static func sidecarURL(for photo: URL) -> URL { SidecarFiles.mainURL(for: photo) }
@@ -487,6 +566,7 @@ final class LibraryStore {
             catalog.collections[i].members.removeAll { $0.folder == id }
         }
         catalog.fingerprints = catalog.fingerprints.filter { !$0.key.hasPrefix(id.uuidString + "/") }
+        catalog.styleSamples = catalog.styleSamples.filter { !$0.key.hasPrefix(id.uuidString + "/") }
         if catalog.lastImport?.folder == id { catalog.lastImport = nil }
         if source == .folder(id) || (source == .lastImport && catalog.lastImport == nil) { source = .all }
         saveCatalog()
@@ -596,10 +676,11 @@ final class LibraryStore {
         pendingSaves[url]?.cancel()
         let withHistory = historyDirty.contains(url)
         let token = UUID()
+        let sync = self.sync, epoch = sync.epoch(url)
         let work = DispatchWorkItem { [weak self] in
-            let failure = LibraryStore.writeSidecar(sidecar, for: url, history: withHistory)
+            let outcome = sync.save(sidecar, for: url, history: withHistory, epoch: epoch)
             DispatchQueue.main.async {
-                MainActor.assumeIsolated { self?.didWrite(url, token: token, sidecar: sidecar, failure: failure) }
+                MainActor.assumeIsolated { self?.didWrite(url, token: token, sidecar: sidecar, outcome: outcome) }
             }
         }
         pendingSaves[url] = work
@@ -608,11 +689,25 @@ final class LibraryStore {
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay, execute: work)
     }
 
-    private func didWrite(_ url: URL, token: UUID, sidecar: Sidecar, failure: String?) {
+    private func didWrite(_ url: URL, token: UUID, sidecar: Sidecar, outcome: SidecarSync.SaveOutcome) {
+        if case .changedOnDisk(let change) = outcome {
+            if pendingTokens[url] == token {
+                pendingTokens[url] = nil
+                pendingSaves[url] = nil
+                unsavedCount = pendingSaves.count
+            }
+            // Saved again, merged, if the app had changes of its own.
+            takeExternalChange(change)
+            return
+        }
         guard pendingTokens[url] == token else { return }
         pendingTokens[url] = nil
         pendingSaves[url] = nil
-        recordSave(url, sidecar: sidecar, failure: failure)
+        switch outcome {
+        case .saved: recordSave(url, sidecar: sidecar, failure: nil)
+        case .failed(let error): recordSave(url, sidecar: sidecar, failure: Self.describeSaveError(error))
+        case .superseded, .changedOnDisk: break
+        }
         unsavedCount = pendingSaves.count
     }
 
@@ -647,12 +742,43 @@ final class LibraryStore {
         pendingSaves = [:]
         pendingTokens = [:]
         for url in urls {
-            guard let sidecar = photoByURL[url]?.sidecar ?? failedSnapshots[url]?.sidecar else { continue }
-            if failedSnapshots[url]?.history == true { historyDirty.insert(url) }
-            let failure = LibraryStore.writeSidecar(sidecar, for: url, history: historyDirty.contains(url))
-            recordSave(url, sidecar: sidecar, failure: failure)
+            // A change on disk found while saving is merged in, then saved (a few rounds at most).
+            var unsaved: Sidecar?
+            attempts: for _ in 0..<3 {
+                guard let sidecar = photoByURL[url]?.sidecar ?? failedSnapshots[url]?.sidecar else { unsaved = nil; break }
+                unsaved = sidecar
+                if failedSnapshots[url]?.history == true { historyDirty.insert(url) }
+                switch sync.save(sidecar, for: url, history: historyDirty.contains(url), epoch: sync.epoch(url)) {
+                case .saved:
+                    recordSave(url, sidecar: sidecar, failure: nil)
+                    unsaved = nil
+                    break attempts
+                case .failed(let error):
+                    recordSave(url, sidecar: sidecar, failure: Self.describeSaveError(error))
+                    unsaved = nil
+                    break attempts
+                case .changedOnDisk(let change):
+                    guard takeExternalChange(change, scheduleSave: false) else { unsaved = nil; break attempts }
+                    historyDirty.insert(url)
+                    unsaved = photoByURL[url]?.sidecar
+                case .superseded:
+                    continue
+                }
+            }
+            // Still changing on disk after every round: keep the merged edits as a failed save, so
+            // they're retried (and shown) instead of silently dropped.
+            if let unsaved { recordSave(url, sidecar: unsaved, failure: "The edits kept changing on disk while saving; trying again") }
         }
+        for (_, work) in pendingSaves { work.cancel() }
+        pendingSaves = [:]
+        pendingTokens = [:]
         unsavedCount = 0
+        if let pending = pendingCatalogSave {
+            // Learned samples waiting to be written.
+            pending.cancel()
+            pendingCatalogSave = nil
+            saveCatalog()
+        }
         updateRetryTimer()
     }
 
@@ -716,10 +842,17 @@ final class LibraryStore {
         }
     }
 
-    /// Writes the sidecar; returns why it couldn't be, or nil when it was saved.
-    nonisolated static func writeSidecar(_ sidecar: Sidecar, for url: URL, history: Bool) -> String? {
+    /// Reads, changes and writes back the sidecar of a photo that isn't loaded yet (presets at
+    /// import), all holding the folder's sidecar lock, so an edit made meanwhile by the `halfstop`
+    /// command isn't lost; returns why it couldn't be saved, or nil when it was.
+    @discardableResult
+    nonisolated static func updateSidecar(for url: URL, history: Bool, _ change: (inout Sidecar) -> Void) -> String? {
         do {
-            try SidecarFiles.write(sidecar, for: url, history: history)
+            try SidecarLock.with(url, exclusive: true, create: true) {
+                var sidecar = SidecarFiles.read(for: url) ?? Sidecar()
+                change(&sidecar)
+                _ = try SidecarFiles.write(sidecar, for: url, history: history)
+            }
             return nil
         } catch {
             return describeSaveError(error)
@@ -729,6 +862,7 @@ final class LibraryStore {
     /// A short, plain reason for a failed save.
     nonisolated static func describeSaveError(_ error: Error) -> String {
         if error is SidecarFiles.Failure { return "The edits folder is a link, so it isn’t used" }
+        if error is SidecarLock.Failure { return "Another program kept the edits locked; trying again" }
         let ns = error as NSError
         var posix: Int32?
         if ns.domain == NSPOSIXErrorDomain { posix = Int32(ns.code) }
@@ -790,11 +924,15 @@ final class LibraryStore {
     func stepRow(_ delta: Int, columns: Int) { step(delta * max(columns, 1)) }
 
     private func setCurrent(_ url: URL?) {
-        if currentID != url {
+        let changed = currentID != url
+        if changed {
             if let previous = current { commitPending(previous) }
-            isCropping = false; showBefore = false; activeMaskID = nil
+            isCropping = false; showBefore = false; activeMaskID = nil; activeSpotID = nil
         }
         currentID = url
+        // Opening a photo also looks for edits saved outside the app that file events missed
+        // (made while the library was still being scanned, say). Cheap when nothing changed.
+        if changed, let url, photoByURL[url] != nil { Task { await checkSidecars([url]) } }
     }
 
     private func keepCurrentVisible() {
@@ -845,6 +983,7 @@ final class LibraryStore {
             // Don't let a pending save or history step recreate the sidecar afterwards.
             pendingSaves[p.url]?.cancel(); pendingSaves[p.url] = nil; pendingTokens[p.url] = nil; historyDirty.remove(p.url)
             pendingCommits[p.url]?.cancel(); pendingCommits[p.url] = nil
+            sync.forget(p.url)
             do {
                 try Self.trashFile(p.url)
                 for sidecar in SidecarFiles.all(for: p.url) where fm.fileExists(atPath: sidecar.path) && SidecarFiles.isSafe(sidecar, for: p.url) {
@@ -862,6 +1001,8 @@ final class LibraryStore {
 
         catalog.forget(Set(moved.map(\.ref)))
         saveCatalog()
+        for p in moved { styleModel.remove(p.ref.key) }
+        updateStyleActive()
         let gone = Set(moved.map(\.url))
         photos.removeAll { gone.contains($0.url) }
         selection.subtract(gone)
@@ -895,7 +1036,7 @@ final class LibraryStore {
 
     // MARK: - Editing & history
 
-    static let historyLimit = 100
+    nonisolated static let historyLimit = 100
     /// Pause after the last change before it becomes a history step (one slider drag = one step).
     static let historySettle: TimeInterval = 0.6
 
@@ -961,37 +1102,78 @@ final class LibraryStore {
         photo.history = history
         photo.historyIndex = history.count - 1
         scheduleSave(photo, history: true)
+        noteEdited(photo)
     }
 
     /// Sets a photo's edits as one labelled step (paste, presets, snapshots, reset).
     // MARK: - Auto adjustments
 
     /// White balance that makes the clicked spot neutral gray (`p` normalized in the cropped photo).
-    func pickWhiteBalance(at p: NormPoint, using source: ImageSource) {
+    func pickWhiteBalance(at p: NormPoint) {
         pickingWhite = false
-        guard let photo = current else { return }
         let half = 0.008
-        let region = CGRect(x: p.x - half, y: p.y - half, width: half * 2, height: half * 2)
-        let wb = AutoAdjust.whiteBalance(source: source, adjustments: photo.adjustments, region: region)
-        var a = photo.adjustments
-        a.temperature = wb.temperature; a.tint = wb.tint
-        applyStep(photo, a, label: "White balance (picked)")
+        runAuto(.pickedWhite(NormRect(x: p.x - half, y: p.y - half, width: half * 2, height: half * 2)))
     }
 
-    func autoWhiteBalance(using source: ImageSource) {
-        guard let photo = current else { return }
-        let wb = AutoAdjust.whiteBalance(source: source, adjustments: photo.adjustments, region: nil)
-        var a = photo.adjustments
-        a.temperature = wb.temperature; a.tint = wb.tint
-        applyStep(photo, a, label: "Auto white balance")
+    /// Measures in the background, then applies the result as one history step, unless the user
+    /// moved to another photo or changed the edits meanwhile (then the result is dropped).
+    /// The returned task says whether it was applied.
+    @discardableResult
+    func runAuto(_ kind: AutoKind) -> Task<Bool, Never>? {
+        guard let task = performAuto(kind) else { return nil }
+        return Task { await task.value == .applied }
     }
 
-    func autoTone(using source: ImageSource) {
-        guard let photo = current else { return }
-        let t = AutoAdjust.tone(source: source, adjustments: photo.adjustments)
-        var a = photo.adjustments
-        a.exposure = t.exposure; a.contrast = t.contrast; a.highlights = t.highlights; a.shadows = t.shadows
-        applyStep(photo, a, label: "Auto tone")
+    /// `runAuto` with the full outcome (for callers that report it, like a tool layer).
+    func performAuto(_ kind: AutoKind) -> Task<AutoOutcome, Never>? {
+        guard let photo = current, !isAutoRunning else { return nil }
+        commitPending(photo)
+        let start = photo.adjustments
+        let request = AutoRequest(url: photo.url, kind: kind, adjustments: start)
+        let run = AutoRun(url: photo.url, kind: kind, id: UUID())
+        autoRun = run
+        return Task { [weak self] in
+            let result = await AutoEngine.shared.result(for: request)
+            guard let self else { return .stale }
+            if self.autoRun == run { self.autoRun = nil }
+            return self.finishAuto(request, start: start, result: result)
+        }
+    }
+
+    /// True while an auto action runs for the photo being edited (its row is disabled).
+    var isAutoRunning: Bool { autoRun != nil && autoRun?.url == currentID }
+
+    /// Applies a finished measurement if the photo and its edits are still what it measured.
+    @discardableResult
+    func finishAuto(_ request: AutoRequest, start: Adjustments, result: AutoResult?) -> AutoOutcome {
+        guard let photo = current, photo.url == request.url, photo.adjustments == start else { return .stale }
+        guard var result else { return .unreadable }
+        if request.kind == .straighten {
+            guard result.angle != nil else {
+                showHint("No horizon found")
+                return .noHorizon
+            }
+        }
+        if request.kind == .auto { result.learned = learnedOffset(for: photo, result: result) }
+        let next = result.applied(to: start)
+        guard next != start else {
+            if request.kind == .straighten { showHint("Horizon already level") }
+            return .unchanged
+        }
+        applyStep(photo, next, label: request.kind.label)
+        return .applied
+    }
+
+    /// A short message over the photo (where the editor shows its hints), gone after a moment.
+    private(set) var hint: String?
+    @ObservationIgnored private var hintTimer: DispatchWorkItem?
+
+    func showHint(_ text: String) {
+        hintTimer?.cancel()
+        hint = text
+        let work = DispatchWorkItem { [weak self] in self?.hint = nil }
+        hintTimer = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5, execute: work)
     }
 
     private func applyStep(_ photo: Photo, _ adjustments: Adjustments, label: String) {
@@ -1009,6 +1191,7 @@ final class LibraryStore {
         photo.historyIndex = index
         photo.adjustments = photo.history[index].adjustments
         scheduleSave(photo, history: true)
+        noteEdited(photo)
     }
 
     /// Drops the steps after the current one right away.
@@ -1304,3 +1487,200 @@ struct TrashRequest: Identifiable {
     /// Came from "Delete Rejected…" (changes the wording).
     let rejectedOnly: Bool
 }
+
+// MARK: - Changes made outside the app
+
+extension LibraryStore {
+    /// The photo a sidecar file belongs to: `<folder>/.halfstop/<name>.json` or `.history.json`.
+    nonisolated static func photoURL(forSidecarPath path: String) -> URL? {
+        let url = URL(fileURLWithPath: path)
+        let dir = url.deletingLastPathComponent()
+        guard dir.lastPathComponent == SidecarFiles.folderName else { return nil }
+        let file = url.lastPathComponent
+        let name: String
+        if file.hasSuffix(".history.json") {
+            name = String(file.dropLast(".history.json".count))
+        } else if file.hasSuffix(".json") {
+            name = String(file.dropLast(".json".count))
+        } else {
+            return nil
+        }
+        guard !name.isEmpty, !name.hasPrefix(".") else { return nil }
+        return dir.deletingLastPathComponent().appendingPathComponent(name)
+    }
+
+    /// FSEvents saw sidecar files change: look for changes made outside the app, in the background.
+    func sidecarsChanged(_ paths: [String]) {
+        let urls = Set(paths.compactMap(Self.photoURL(forSidecarPath:)).filter { photoByURL[$0] != nil })
+        guard !urls.isEmpty else { return }
+        Task { await checkSidecars(urls) }
+    }
+
+    /// Reads these photos' sidecars off the main thread and takes in any change made outside the app.
+    /// The app's own saves are recognized (same content as it last wrote) and ignored.
+    func checkSidecars(_ urls: Set<URL>) async {
+        let sync = self.sync
+        let changes = await Task.detached(priority: .utility) { urls.sorted { $0.path < $1.path }.compactMap { sync.check($0) } }.value
+        for change in changes { takeExternalChange(change) }
+    }
+
+    /// Takes in a photo's sidecar as changed on disk by another program. The rule (`SidecarMerge`):
+    /// with no unsaved changes in the app, the disk's version replaces the photo's edits, history
+    /// included; otherwise the app's changes are applied on top as a new step and saved. Either way
+    /// it can be undone in the app. Returns whether the result still has to be saved.
+    @discardableResult
+    func takeExternalChange(_ change: ExternalSidecarChange, scheduleSave save: Bool = true) -> Bool {
+        let url = change.url
+        // An older find (a newer one is on its way), or a photo that's gone.
+        guard change.epoch == sync.epoch(url), let photo = photoByURL[url], let known = sync.state(url) else { return false }
+        commitPending(photo)
+        var theirs = change.sidecar
+        theirs.ensureHistory()
+        let result = SidecarMerge.merge(base: known.base, ours: photo.sidecar, theirs: theirs, historyLimit: Self.historyLimit)
+        sync.record(url, revision: change.revision, base: theirs)
+        // Saves of the app's older version are void now.
+        pendingSaves[url]?.cancel()
+        pendingSaves[url] = nil
+        pendingTokens[url] = nil
+        historyDirty.remove(url)
+        photo.adopt(result.sidecar)
+        if let id = activeMaskID, photo === current, !photo.adjustments.masks.contains(where: { $0.id == id }) { activeMaskID = nil }
+        if result.keptLocalChanges {
+            historyDirty.insert(url)
+            if save { scheduleWrite(url, sidecar: photo.sidecar, delay: 0) }
+        } else {
+            failedSaves[url] = nil
+            failedSnapshots[url] = nil
+        }
+        unsavedCount = pendingSaves.count
+        updateRetryTimer()
+        refreshStyleEntry(photo)
+        if photo === current {
+            if result.keptLocalChanges {
+                showHint("Merged with changes made outside Halfstop")
+            } else if theirs.currentStep?.commandLine == true {
+                showHint("Updated from the command line: \(theirs.currentStep?.label ?? "")")
+            } else {
+                showHint("Updated with changes made outside Halfstop")
+            }
+        }
+        return result.keptLocalChanges
+    }
+}
+
+// MARK: - Learn from my edits
+
+extension LibraryStore {
+    /// ✦ Auto's tooltip says it adapts once this is true: learning is on and there are enough
+    /// edited photos besides the open one (its own edit never feeds its own prediction).
+    var autoIsAdapted: Bool {
+        learnFromEdits && styleActive && styleModel.isActive(for: current?.ref.key)
+    }
+
+    /// What learning adds to ✦ Auto's result for `photo` (nil when off, with too few edited
+    /// photos, or nothing to add). Microseconds: a search over the in-memory index.
+    func learnedOffset(for photo: Photo, result: AutoResult) -> StyleOffset? {
+        guard learnFromEdits, styleModel.isActive, let f = StyleFeatures.make(result, isRAW: photo.isRAW) else { return nil }
+        return styleModel.predict(f, excluding: photo.ref.key)
+    }
+
+    /// Rebuilds the index from the catalog's samples and the photos' current edits (after the
+    /// library loads, or when learning is switched on). O(library), never per click.
+    func rebuildStyleModel() {
+        styleModel.removeAll()
+        if learnFromEdits {
+            // A photo whose current step came from the `halfstop` command isn't an edit by hand.
+            for p in photos where !p.atCommandLineStep {
+                if let sample = catalog.styleSamples[p.ref.key] { styleModel.update(p.ref.key, sample: sample, adjustments: p.adjustments) }
+            }
+        }
+        updateStyleActive()
+    }
+
+    /// After the photo's edits were reloaded from disk: its entry follows them, without measuring.
+    func refreshStyleEntry(_ photo: Photo) {
+        guard learnFromEdits else { return }
+        if photo.atCommandLineStep {
+            styleModel.remove(photo.ref.key)
+        } else {
+            styleModel.update(photo.ref.key, sample: catalog.styleSamples[photo.ref.key], adjustments: photo.adjustments)
+        }
+        updateStyleActive()
+    }
+
+    func updateStyleActive() {
+        let active = styleModel.isActive
+        if styleActive != active { styleActive = active }
+    }
+
+    /// After a history step (or undo/redo): updates the photo's entry, and if it's edited by hand
+    /// but has no current sample, measures one in the background shortly after.
+    func noteEdited(_ photo: Photo) {
+        guard learnFromEdits else { return }
+        // Undo or redo onto a step made by the `halfstop` command: not an edit by hand.
+        guard !photo.atCommandLineStep else {
+            refreshStyleEntry(photo)
+            return
+        }
+        let sample = catalog.styleSamples[photo.ref.key]
+        styleModel.update(photo.ref.key, sample: sample, adjustments: photo.adjustments)
+        updateStyleActive()
+        // Only the photo being edited is measured: pasting or applying a preset to a large
+        // selection would otherwise queue one background ✦ Auto per photo ahead of the next click.
+        if photo === current, StyleSliders.isEdited(photo.adjustments), sample?.isUsable(crop: photo.adjustments.crop) != true {
+            scheduleStyleSample(photo)
+        }
+    }
+
+    /// How long after an edit its sample is measured (edits come in bursts).
+    static let styleSampleDelay: TimeInterval = 1.5
+
+    private func scheduleStyleSample(_ photo: Photo) {
+        let url = photo.url
+        pendingStyleSamples[url]?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated { _ = self?.measureStyleSample(url) }
+        }
+        pendingStyleSamples[url] = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.styleSampleDelay, execute: work)
+    }
+
+    /// Measures ✦ Auto for the photo (off the main thread, on the shared engine, so a later ✦ Auto
+    /// click on it is a cache hit) and stores the sample in the catalog.
+    @discardableResult
+    func measureStyleSample(_ url: URL) -> Task<Void, Never>? {
+        pendingStyleSamples[url] = nil
+        guard learnFromEdits, let photo = photo(for: url), StyleSliders.isEdited(photo.adjustments) else { return nil }
+        let crop = photo.adjustments.crop, ref = photo.ref, isRAW = photo.isRAW
+        let request = AutoRequest(url: url, kind: .auto, adjustments: photo.adjustments)
+        return Task { [weak self] in
+            guard let result = await AutoEngine.shared.result(for: request),
+                  let features = StyleFeatures.make(result, isRAW: isRAW), let self else { return }
+            // The photo may have gone or been re-cropped meanwhile.
+            guard let photo = self.photo(for: url), photo.ref == ref, photo.adjustments.crop == crop else { return }
+            let sample = StyleSample(features: features, auto: StyleSliders.values(result.applied(to: Adjustments())), crop: crop)
+            self.catalog.styleSamples[ref.key] = sample
+            self.scheduleCatalogSave()
+            if self.learnFromEdits, !photo.atCommandLineStep {
+                self.styleModel.update(ref.key, sample: sample, adjustments: photo.adjustments)
+                self.updateStyleActive()
+            }
+        }
+    }
+
+    func photo(for url: URL) -> Photo? { photoByURL[url] }
+
+    /// Saves the catalog a moment after the last of a burst of changes.
+    private func scheduleCatalogSave() {
+        pendingCatalogSave?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated {
+                self?.pendingCatalogSave = nil
+                self?.saveCatalog()
+            }
+        }
+        pendingCatalogSave = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2, execute: work)
+    }
+}
+

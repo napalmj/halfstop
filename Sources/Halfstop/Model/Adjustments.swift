@@ -13,12 +13,19 @@ enum EditLimits {
     static let grow = -100.0...100.0
     static let softness = 0.0...100.0
     static let straighten = -45.0...45.0
+    /// The global sliders, as the panel shows them (values from outside, like the `halfstop` command, are clamped to these).
+    static let slider = -100.0...100.0
+    static let exposure = -5.0...5.0
+    static let detail = 0.0...100.0
     static let minCropSide = 0.0001
     static let pointsPerStroke = 50_000
     static let strokesPerMask = 20_000
     static let shapesPerMask = 200
     static let masks = 500
     static let curvePoints = 1_000
+    static let spots = 2_000
+    static let spotRadius = 0.001...0.25
+    static let grainSize = 1.0...4.0
 }
 
 extension Double {
@@ -235,6 +242,178 @@ struct ColorGrading: Codable, Hashable {
     }
 }
 
+// MARK: - Curves
+
+/// The tone curve as four region sliders. Each pulls its part of the tonal range up or down;
+/// the three splits (0...1, increasing) set where shadows, darks, lights and highlights meet.
+struct ParametricCurve: Codable, Hashable {
+    var shadows: Double = 0
+    var darks: Double = 0
+    var lights: Double = 0
+    var highlights: Double = 0
+    var split1: Double = 0.25
+    var split2: Double = 0.5
+    var split3: Double = 0.75
+
+    var isNeutral: Bool { shadows == 0 && darks == 0 && lights == 0 && highlights == 0 }
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let t = try TolerantContainer(decoder, keyedBy: CodingKeys.self)
+        let d = ParametricCurve()
+        shadows = t.value(.shadows, d.shadows).clamped(to: EditLimits.slider)
+        darks = t.value(.darks, d.darks).clamped(to: EditLimits.slider)
+        lights = t.value(.lights, d.lights).clamped(to: EditLimits.slider)
+        highlights = t.value(.highlights, d.highlights).clamped(to: EditLimits.slider)
+        let a = t.value(.split1, d.split1).clamped(to: 0.05...0.95)
+        let b = t.value(.split2, d.split2).clamped(to: 0.05...0.95)
+        let c = t.value(.split3, d.split3).clamped(to: 0.05...0.95)
+        let sorted = [a, b, c].sorted()
+        split1 = sorted[0]; split2 = sorted[1]; split3 = sorted[2]
+    }
+}
+
+/// Curves over the color wheel: x is the hue (0...1 = 0°...360°, wrapping), y is the change,
+/// with 0.5 meaning none. Empty means flat.
+struct HueCurves: Codable, Hashable {
+    /// Shifts each hue toward its neighbors (up to ±60°).
+    var hue: [CurvePoint] = []
+    /// Scales saturation (0 = gray, 1 = double).
+    var saturation: [CurvePoint] = []
+    /// Brightens or darkens each color.
+    var luminance: [CurvePoint] = []
+
+    var isNeutral: Bool { [hue, saturation, luminance].allSatisfy { $0.allSatisfy { abs($0.y - 0.5) < 1e-6 } } }
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let t = try TolerantContainer(decoder, keyedBy: CodingKeys.self)
+        hue = t.array(.hue, default: [], limit: 64)
+        saturation = t.array(.saturation, default: [], limit: 64)
+        luminance = t.array(.luminance, default: [], limit: 64)
+    }
+}
+
+/// One of the three hue curves.
+enum HueCurveChannel: String, CaseIterable, Identifiable {
+    case hue, saturation, luminance
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .hue: "Hue"
+        case .saturation: "Saturation"
+        case .luminance: "Luminance"
+        }
+    }
+    var keyPath: WritableKeyPath<HueCurves, [CurvePoint]> {
+        switch self {
+        case .hue: \.hue
+        case .saturation: \.saturation
+        case .luminance: \.luminance
+        }
+    }
+}
+
+extension HueCurves {
+    /// Half-width (in hue, 0...1) a new point affects: anchors go this far on each side.
+    static let anchorSpan = 0.08
+
+    /// Sets the curve at `x` to `y`, adding the point (with neutral anchors on both sides, so only
+    /// nearby colors change) when there's none close by. Returns the point's index.
+    @discardableResult
+    static func setPoint(_ points: inout [CurvePoint], x x0: Double, y: Double, near: Double = 0.02) -> Int {
+        let x = x0 - floor(x0)
+        func dist(_ a: Double) -> Double { let d = abs(a - x); return min(d, 1 - d) }
+        if let i = points.indices.min(by: { dist(points[$0].x) < dist(points[$1].x) }), dist(points[i].x) < near {
+            points[i].y = y.clamped(to: EditLimits.unit)
+            return i
+        }
+        if !points.contains(where: { dist($0.x) < anchorSpan * 1.4 }) {
+            for dx in [-anchorSpan, anchorSpan] {
+                let ax = x + dx - floor(x + dx)
+                points.append(CurvePoint(x: ax, y: PeriodicCurve(points: points).evaluate(ax)))
+            }
+        }
+        points.append(CurvePoint(x: x, y: y.clamped(to: EditLimits.unit)))
+        points.sort { $0.x < $1.x }
+        return points.firstIndex { $0.x == x } ?? 0
+    }
+}
+
+// MARK: - Effects and lens
+
+struct Grain: Codable, Hashable {
+    /// 0...100.
+    var amount: Double = 0
+    /// Grain size, 1...4 (×, relative to a 24-megapixel frame).
+    var size: Double = 1.5
+    /// 0 = smooth, 100 = coarse and clumpy.
+    var roughness: Double = 50
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let t = try TolerantContainer(decoder, keyedBy: CodingKeys.self)
+        let d = Grain()
+        amount = t.value(.amount, d.amount).clamped(to: EditLimits.detail)
+        size = t.value(.size, d.size).clamped(to: EditLimits.grainSize)
+        roughness = t.value(.roughness, d.roughness).clamped(to: EditLimits.detail)
+    }
+}
+
+struct LensCorrection: Codable, Hashable {
+    /// Use the camera's lens profile (RAW files that have one).
+    var profile = true
+    /// Remove purple and green fringes along high-contrast edges.
+    var removeFringing = false
+    /// Positive fixes barrel distortion (bulging), negative fixes pincushion.
+    var distortion: Double = 0
+    /// Positive brightens dark corners, negative darkens them.
+    var vignetting: Double = 0
+
+    var isGeometryNeutral: Bool { distortion == 0 && vignetting == 0 && !removeFringing }
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let t = try TolerantContainer(decoder, keyedBy: CodingKeys.self)
+        let d = LensCorrection()
+        profile = t.value(.profile, d.profile)
+        removeFringing = t.value(.removeFringing, d.removeFringing)
+        distortion = t.value(.distortion, d.distortion).clamped(to: EditLimits.slider)
+        vignetting = t.value(.vignetting, d.vignetting).clamped(to: EditLimits.slider)
+    }
+}
+
+// MARK: - Spot removal
+
+/// One removed spot: the area at `center` is replaced with the area at `source`, blended to
+/// match its surroundings. Normalized to the oriented, uncropped image, like masks; `radius` is
+/// a fraction of its long edge.
+struct Spot: Codable, Hashable, Identifiable {
+    var id = UUID()
+    var center: NormPoint
+    var source: NormPoint
+    var radius: Double = 0.015
+    /// 0 = hard edge, 1 = very soft.
+    var feather: Double = 0.5
+
+    init(id: UUID = UUID(), center: NormPoint, source: NormPoint, radius: Double = 0.015, feather: Double = 0.5) {
+        self.id = id; self.center = center; self.source = source; self.radius = radius; self.feather = feather
+    }
+
+    init(from decoder: Decoder) throws {
+        let t = try TolerantContainer(decoder, keyedBy: CodingKeys.self)
+        id = t.value(.id, UUID())
+        center = try t.required(.center)
+        source = try t.required(.source)
+        radius = t.value(.radius, 0.015).clamped(to: EditLimits.spotRadius)
+        feather = t.value(.feather, 0.5).clamped(to: EditLimits.unit)
+    }
+}
+
 // MARK: - Masks
 
 struct NormPoint: Codable, Hashable {
@@ -262,6 +441,9 @@ struct LocalAdjustments: Codable, Hashable {
     var tint: Double = 0
     var vibrance: Double = 0
     var saturation: Double = 0
+    var texture: Double = 0
+    var clarity: Double = 0
+    var dehaze: Double = 0
 
     var isNeutral: Bool { self == LocalAdjustments() }
 
@@ -274,6 +456,7 @@ struct LocalAdjustments: Codable, Hashable {
         exposure = v(.exposure); contrast = v(.contrast); highlights = v(.highlights); shadows = v(.shadows)
         whites = v(.whites); blacks = v(.blacks); temperature = v(.temperature); tint = v(.tint)
         vibrance = v(.vibrance); saturation = v(.saturation)
+        texture = v(.texture); clarity = v(.clarity); dehaze = v(.dehaze)
     }
 }
 
@@ -323,6 +506,39 @@ struct BrushStroke: Codable, Hashable {
 }
 
 enum ShapeKind: String, Codable { case linear, radial }
+
+/// Limits a mask to a band of brightness or to colors near a picked one.
+struct MaskRange: Codable, Hashable {
+    enum Kind: String, Codable, CaseIterable { case luminance, color }
+    var kind: Kind = .luminance
+    /// Luminance band, 0...1 (display brightness).
+    var low: Double = 0
+    var high: Double = 1
+    /// Soft edge of the band, 0...1.
+    var smoothness: Double = 0.15
+    /// Picked color (display RGB, 0...1) and how far from it still counts, 0...100.
+    var red: Double = 0.5
+    var green: Double = 0.5
+    var blue: Double = 0.5
+    var tolerance: Double = 30
+
+    var isNeutral: Bool { kind == .luminance && low <= 0 && high >= 1 }
+
+    init(kind: Kind = .luminance) { self.kind = kind }
+
+    init(from decoder: Decoder) throws {
+        let t = try TolerantContainer(decoder, keyedBy: CodingKeys.self)
+        let d = MaskRange()
+        kind = t.value(.kind, d.kind)
+        low = t.value(.low, d.low).clamped(to: EditLimits.unit)
+        high = t.value(.high, d.high).clamped(to: EditLimits.unit)
+        smoothness = t.value(.smoothness, d.smoothness).clamped(to: EditLimits.unit)
+        red = t.value(.red, d.red).clamped(to: EditLimits.unit)
+        green = t.value(.green, d.green).clamped(to: EditLimits.unit)
+        blue = t.value(.blue, d.blue).clamped(to: EditLimits.unit)
+        tolerance = t.value(.tolerance, d.tolerance).clamped(to: EditLimits.detail)
+    }
+}
 
 enum CombineMode: String, Codable, CaseIterable, Identifiable {
     case add, subtract, intersect
@@ -398,6 +614,8 @@ struct Mask: Codable, Hashable, Identifiable {
     // Automatic masks: expand (+) or shrink (-) the edge, -100...100; and soften it, 0...100.
     var grow: Double = 0
     var softness: Double = 0
+    /// Narrows the mask to a brightness band or a color; nil = no limit.
+    var range: MaskRange?
 
     var local = LocalAdjustments()
 
@@ -412,6 +630,7 @@ struct Mask: Codable, Hashable, Identifiable {
         h.combine(kind); h.combine(invert); h.combine(center); h.combine(radiusX); h.combine(radiusY)
         h.combine(feather); h.combine(start); h.combine(end); h.combine(strokes); h.combine(subjects)
         h.combine(grow); h.combine(softness); h.combine(shapes)
+        // `range` is left out on purpose: it depends on the pixels under the mask, so it's applied after caching.
         return h.finalize()
     }
 
@@ -463,6 +682,7 @@ struct Mask: Codable, Hashable, Identifiable {
         subjects = t.array(.subjects, of: Int.self)
         grow = v(.grow, d.grow).clamped(to: EditLimits.grow)
         softness = v(.softness, d.softness).clamped(to: EditLimits.softness)
+        range = t.optional(.range, as: MaskRange.self)
         local = v(.local, d.local)
     }
 }
@@ -484,16 +704,29 @@ struct Adjustments: Codable, Hashable {
     var saturation: Double = 0
     // Effects
     var vignette: Double = 0       // -100...100 (negative darkens edges)
+    var grain = Grain()
     var sharpening: Double = 0     // 0...100
     var noiseReduction: Double = 0 // 0...100
-    // Curve & HSL
+    // Presence, -100...100
+    var texture: Double = 0
+    var clarity: Double = 0
+    var dehaze: Double = 0
+    // Curves & HSL
     var curve: [CurvePoint] = Adjustments.identityCurve
+    var curveRed: [CurvePoint] = Adjustments.identityCurve
+    var curveGreen: [CurvePoint] = Adjustments.identityCurve
+    var curveBlue: [CurvePoint] = Adjustments.identityCurve
+    var parametric = ParametricCurve()
     var hsl: [HSLBand] = Array(repeating: HSLBand(), count: HSLColor.allCases.count)
+    var hueCurves = HueCurves()
     // Color grading wheels
     var grading = ColorGrading()
     // Local adjustments
     var masks: [Mask] = []
-    // Geometry
+    // Retouching
+    var spots: [Spot] = []
+    // Lens and geometry
+    var lens = LensCorrection()
     var crop = CropSettings()
 
     static let identityCurve = [CurvePoint(x: 0, y: 0), CurvePoint(x: 1, y: 1)]
@@ -502,7 +735,16 @@ struct Adjustments: Codable, Hashable {
 
     var isDefault: Bool { self == Adjustments() }
 
-    var curveIsIdentity: Bool { curve == Adjustments.identityCurve }
+    /// Every tone curve (point curves for all channels and the region sliders) is flat.
+    var curveIsIdentity: Bool {
+        curve == Adjustments.identityCurve && curveRed == Adjustments.identityCurve
+            && curveGreen == Adjustments.identityCurve && curveBlue == Adjustments.identityCurve && parametric.isNeutral
+    }
+
+    mutating func resetCurves() {
+        let d = Adjustments()
+        curve = d.curve; curveRed = d.curveRed; curveGreen = d.curveGreen; curveBlue = d.curveBlue; parametric = d.parametric
+    }
 
     /// Everything except crop — what copy/paste carries over.
     func withCrop(from other: Adjustments) -> Adjustments {
@@ -519,26 +761,32 @@ struct Adjustments: Codable, Hashable {
             case .light:
                 a.exposure = source.exposure; a.contrast = source.contrast; a.highlights = source.highlights
                 a.shadows = source.shadows; a.whites = source.whites; a.blacks = source.blacks
+                a.texture = source.texture; a.clarity = source.clarity; a.dehaze = source.dehaze
             case .color:
                 a.temperature = source.temperature; a.tint = source.tint
                 a.vibrance = source.vibrance; a.saturation = source.saturation
             case .grading: a.grading = source.grading
-            case .curve: a.curve = source.curve
-            case .hsl: a.hsl = source.hsl
+            case .curve:
+                a.curve = source.curve; a.curveRed = source.curveRed; a.curveGreen = source.curveGreen
+                a.curveBlue = source.curveBlue; a.parametric = source.parametric
+            case .hsl: a.hsl = source.hsl; a.hueCurves = source.hueCurves
             case .detail: a.sharpening = source.sharpening; a.noiseReduction = source.noiseReduction
-            case .effects: a.vignette = source.vignette
+            case .effects: a.vignette = source.vignette; a.grain = source.grain
+            case .lens: a.lens = source.lens
             case .masks: a.masks = source.masks
+            case .spots: a.spots = source.spots
             case .crop: a.crop = source.crop
             }
         }
         return a
     }
 
-    /// Global look only — what presets carry over (keeps the target's crop and masks).
+    /// Global look only — what presets carry over (keeps the target's crop, masks and removed spots).
     func asPreset(onto other: Adjustments) -> Adjustments {
         var copy = self
         copy.crop = other.crop
         copy.masks = other.masks
+        copy.spots = other.spots
         return copy
     }
 
@@ -558,16 +806,25 @@ struct Adjustments: Codable, Hashable {
         vibrance = v(.vibrance, d.vibrance)
         saturation = v(.saturation, d.saturation)
         vignette = v(.vignette, d.vignette)
+        grain = v(.grain, d.grain)
         sharpening = v(.sharpening, d.sharpening)
         noiseReduction = v(.noiseReduction, d.noiseReduction)
+        texture = v(.texture, d.texture).clamped(to: EditLimits.slider)
+        clarity = v(.clarity, d.clarity).clamped(to: EditLimits.slider)
+        dehaze = v(.dehaze, d.dehaze).clamped(to: EditLimits.slider)
         // Per point and per mask: one bad entry doesn't reset the rest.
-        let points: [CurvePoint] = t.array(.curve, default: d.curve, limit: EditLimits.curvePoints)
-        if points.count >= 2 {
-            curve = points
-        } else {
-            if t.c.contains(.curve) { t.noteDropped() }
-            curve = d.curve
+        func curve(_ key: CodingKeys) -> [CurvePoint] {
+            let points: [CurvePoint] = t.array(key, default: Adjustments.identityCurve, limit: EditLimits.curvePoints)
+            if points.count >= 2 { return points }
+            if t.c.contains(key) { t.noteDropped() }
+            return Adjustments.identityCurve
         }
+        self.curve = curve(.curve)
+        curveRed = curve(.curveRed)
+        curveGreen = curve(.curveGreen)
+        curveBlue = curve(.curveBlue)
+        parametric = v(.parametric, d.parametric)
+        hueCurves = v(.hueCurves, d.hueCurves)
         var bands = v(.hsl, d.hsl)
         if bands.count != HSLColor.allCases.count {
             t.noteDropped()
@@ -576,6 +833,8 @@ struct Adjustments: Codable, Hashable {
         hsl = bands
         grading = v(.grading, d.grading)
         masks = t.array(.masks, default: d.masks, limit: EditLimits.masks)
+        spots = t.array(.spots, default: d.spots, limit: EditLimits.spots)
+        lens = v(.lens, d.lens)
         crop = v(.crop, d.crop)
     }
 }
@@ -587,7 +846,12 @@ struct ColorLUTKey: Hashable {
     var whites: Double
     var blacks: Double
     var curve: [CurvePoint]
+    var curveRed: [CurvePoint]
+    var curveGreen: [CurvePoint]
+    var curveBlue: [CurvePoint]
+    var parametric: ParametricCurve
     var hsl: [HSLBand]
+    var hueCurves: HueCurves
     var grading: ColorGrading
 
     init(_ a: Adjustments) {
@@ -596,7 +860,12 @@ struct ColorLUTKey: Hashable {
         whites = a.whites
         blacks = a.blacks
         curve = a.curve
+        curveRed = a.curveRed
+        curveGreen = a.curveGreen
+        curveBlue = a.curveBlue
+        parametric = a.parametric
         hsl = a.hsl
+        hueCurves = a.hueCurves
         grading = a.grading
     }
 
@@ -607,33 +876,45 @@ struct ColorLUTKey: Hashable {
         whites = l.whites
         blacks = l.blacks
         curve = Adjustments.identityCurve
+        curveRed = Adjustments.identityCurve
+        curveGreen = Adjustments.identityCurve
+        curveBlue = Adjustments.identityCurve
+        parametric = ParametricCurve()
         hsl = Array(repeating: HSLBand(), count: HSLColor.allCases.count)
+        hueCurves = HueCurves()
         grading = ColorGrading()
+    }
+
+    var channelCurvesAreIdentity: Bool {
+        curveRed == Adjustments.identityCurve && curveGreen == Adjustments.identityCurve && curveBlue == Adjustments.identityCurve
     }
 
     var isIdentity: Bool {
         contrast == 0 && highlights == 0 && whites == 0 && blacks == 0
-            && curve == Adjustments.identityCurve && hsl.allSatisfy(\.isNeutral) && grading.isNeutral
+            && curve == Adjustments.identityCurve && channelCurvesAreIdentity && parametric.isNeutral
+            && hsl.allSatisfy(\.isNeutral) && hueCurves.isNeutral && grading.isNeutral
     }
 }
 
 /// Groups of settings that can be pasted on their own. Together they cover every field of `Adjustments`.
 enum SettingsGroup: String, CaseIterable, Identifiable, Codable {
-    case light, color, grading, curve, hsl, detail, effects, masks, crop
+    case light, color, grading, curve, hsl, detail, effects, lens, masks, spots, crop
     var id: String { rawValue }
     var label: String {
         switch self {
-        case .light: "Light (exposure, contrast, highlights, shadows, whites, blacks)"
+        case .light: "Light (exposure, contrast, highlights, shadows, whites, blacks, texture, clarity, dehaze)"
         case .color: "Color (white balance, vibrance, saturation)"
         case .grading: "Color grading"
         case .curve: "Tone curve"
-        case .hsl: "HSL"
+        case .hsl: "HSL and hue curves"
         case .detail: "Detail (sharpening, noise reduction)"
-        case .effects: "Effects (vignette)"
+        case .effects: "Effects (vignette, grain)"
+        case .lens: "Lens corrections"
         case .masks: "Masks"
+        case .spots: "Removed spots"
         case .crop: "Crop & straighten"
         }
     }
-    /// What a plain paste carries: everything but the crop.
-    static let standard = Set(allCases).subtracting([.crop])
+    /// What a plain paste carries: everything but the crop and removed spots (both belong to one frame).
+    static let standard = Set(allCases).subtracting([.crop, .spots])
 }

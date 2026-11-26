@@ -45,10 +45,10 @@ struct HistoryPanel: View {
             Spacer()
             Button { store.undo() } label: { Image(systemName: "arrow.uturn.backward") }
                 .disabled(!store.canUndo)
-                .help("Undo (⌘Z)")
+                .shortcutTip("Undo", key: "⌘Z")
             Button { store.redo() } label: { Image(systemName: "arrow.uturn.forward") }
                 .disabled(!store.canRedo)
-                .help("Redo (⇧⌘Z)")
+                .shortcutTip("Redo", key: "⇧⌘Z")
         }
         .buttonStyle(.plain)
         .font(.system(size: 12))
