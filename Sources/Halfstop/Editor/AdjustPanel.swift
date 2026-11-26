@@ -60,6 +60,7 @@ private struct TabSwitch: View {
             .background(selection == value ? Theme.panelRaised : .clear, in: RoundedRectangle(cornerRadius: 5))
             .contentShape(Rectangle())
             .onTapGesture { withAnimation(.easeOut(duration: 0.12)) { selection = value } }
+            .shortcutTip("Switch between Quick and Detailed", key: "D")
     }
 }
 
@@ -152,7 +153,7 @@ private struct AutoRow: View {
             }
                 .buttonStyle(ChipStyle(selected: store.pickingWhite))
                 .frame(width: 34)
-                .help("Pick white balance: click something gray (W)")
+                .shortcutTip("Pick white balance: click something gray", key: "W")
         }
         .buttonStyle(ChipStyle(selected: false))
         .disabled(store.current == nil || running != nil)

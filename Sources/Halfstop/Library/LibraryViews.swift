@@ -185,7 +185,7 @@ private struct SaveStatus: View {
                     .background(Theme.accent.opacity(0.16), in: RoundedRectangle(cornerRadius: 6))
             }
             .buttonStyle(.plain)
-            .help("Some edits can’t be saved. Click for details.")
+            .shortcutTip("Some edits can’t be saved. Click for details.")
             .popover(isPresented: $store.showSaveProblems, arrowEdge: .bottom) { SaveProblemsView() }
         } else {
             let saving = store.unsavedCount > 0
@@ -196,7 +196,7 @@ private struct SaveStatus: View {
             .font(.system(size: 11.5, weight: store.savedFlash ? .semibold : .regular))
             .foregroundStyle(store.savedFlash ? Theme.accent : Theme.secondary)
             .animation(.easeOut(duration: 0.2), value: store.savedFlash)
-            .help(helpText)
+            .shortcutTip(helpText)
         }
     }
 
@@ -274,7 +274,7 @@ struct TopBar: View {
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(leftShown ? Theme.text : Theme.secondary)
-                .help(store.mode == .library ? "Show or hide sidebar (⇧⌘S)" : "Show or hide history (⇧⌘S)")
+                .shortcutTip(store.mode == .library ? "Show or hide sidebar" : "Show or hide history", key: "⇧⌘S")
                 HStack(spacing: 6) {
                     Text(store.sourceTitle).fontWeight(.semibold).foregroundStyle(Theme.text)
                     Text("\(store.visiblePhotos.count) photos").foregroundStyle(Theme.secondary)
@@ -299,7 +299,7 @@ struct TopBar: View {
                     }
                     .buttonStyle(.plain)
                     .foregroundStyle(Theme.text.opacity(0.85))
-                    .help("Add the selection to “\(target.name)” (B)")
+                    .shortcutTip("Add the selection to “\(target.name)”", key: "B")
                 }
                 SaveStatus()
                 Button { store.showImportSheet() } label: {
@@ -307,12 +307,12 @@ struct TopBar: View {
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(Theme.text.opacity(0.85))
-                .help("Import photos (⌘I)")
+                .shortcutTip("Import photos", key: "⌘I")
                 if store.mode == .library {
                     Slider(value: $store.thumbnailSize, in: 120...360)
                         .controlSize(.mini)
                         .frame(width: 90)
-                        .help("Thumbnail size")
+                        .shortcutTip("Thumbnail size")
                 }
                 if store.mode == .library {
                     Menu {
@@ -326,7 +326,7 @@ struct TopBar: View {
                     }
                     .menuStyle(.borderlessButton)
                     .fixedSize()
-                    .help("Sort photos")
+                    .shortcutTip("Sort photos")
                 }
                 Menu {
                     Picker("Show", selection: $store.filter) {
@@ -361,6 +361,7 @@ struct TopBar: View {
                 .padding(.vertical, 4)
                 .background(Theme.panelRaised, in: RoundedRectangle(cornerRadius: 6))
                 .disabled(store.targets.isEmpty)
+                .shortcutTip("Export", key: "⇧⌘E")
             }
         }
         .font(.system(size: 12))
@@ -400,17 +401,17 @@ private struct RatingControl: View {
                             if inside { hover = n } else if hover == n { hover = nil }
                         }
                         .onTapGesture { store.setRating(n) }
-                        .help(photo.rating == n ? "Clear rating (0)" : "Rate \(n) star\(n == 1 ? "" : "s") (\(n))")
+                        .shortcutTip(photo.rating == n ? "Clear rating" : "Rate \(n) star\(n == 1 ? "" : "s")", key: photo.rating == n ? "0" : "\(n)")
                 }
             }
             HStack(spacing: 4) {
-                flagButton(.pick, icon: "flag.fill", help: "Pick (P)")
-                flagButton(.reject, icon: "xmark", help: "Reject (X)")
+                flagButton(.pick, icon: "flag.fill", help: "Pick", key: "P")
+                flagButton(.reject, icon: "xmark", help: "Reject", key: "X")
             }
         }
     }
 
-    private func flagButton(_ flag: Flag, icon: String, help: String) -> some View {
+    private func flagButton(_ flag: Flag, icon: String, help: String, key: String) -> some View {
         let on = photo.flag == flag
         return Button {
             store.setFlag(on ? .none : flag)
@@ -422,7 +423,7 @@ private struct RatingControl: View {
         }
         .buttonStyle(.plain)
         .foregroundStyle(on ? (flag == .reject ? Color(red: 1, green: 0.45, blue: 0.4) : Theme.text) : Theme.secondary)
-        .help(on ? "Unflag (U)" : help)
+        .shortcutTip(on ? "Unflag" : help, key: on ? "U" : key)
     }
 }
 
@@ -447,7 +448,7 @@ private struct ModeSwitch: View {
             .background(store.mode == mode ? Theme.panelRaised : .clear, in: RoundedRectangle(cornerRadius: 5))
             .contentShape(Rectangle())
             .onTapGesture { store.mode = mode }
-            .help("\(title) (\(key))")
+            .shortcutTip(title, key: key)
     }
 }
 
