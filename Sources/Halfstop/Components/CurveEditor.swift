@@ -5,6 +5,12 @@ import SwiftUI
 struct CurveEditor: View {
     let points: [CurvePoint]
     let histogram: HistogramData?
+    /// The curve's color (white for the composite curve, the channel's color otherwise).
+    var tint: Color = .white
+    /// Which histogram channel to draw behind it: nil = all three averaged.
+    var channel: Int? = nil
+    /// Curves of other channels, drawn faintly for reference.
+    var others: [(points: [CurvePoint], color: Color)] = []
     let onBegin: () -> Void
     let onChange: ([CurvePoint]) -> Void
 
@@ -21,12 +27,17 @@ struct CurveEditor: View {
                     var path = Path()
                     path.move(to: CGPoint(x: 0, y: size.height))
                     for i in 0..<h.red.count {
-                        let v = (h.red[i] + h.green[i] + h.blue[i]) / 3
+                        let v = switch channel {
+                        case 0: h.red[i]
+                        case 1: h.green[i]
+                        case 2: h.blue[i]
+                        default: (h.red[i] + h.green[i] + h.blue[i]) / 3
+                        }
                         path.addLine(to: CGPoint(x: CGFloat(i) / CGFloat(h.red.count - 1) * size.width,
                                                  y: size.height - CGFloat(v) * size.height * 0.9))
                     }
                     path.addLine(to: CGPoint(x: size.width, y: size.height))
-                    ctx.fill(path, with: .color(.white.opacity(0.06)))
+                    ctx.fill(path, with: .color(tint.opacity(channel == nil ? 0.06 : 0.12)))
                 }
                 // Grid.
                 var grid = Path()
@@ -40,6 +51,10 @@ struct CurveEditor: View {
                 diag.move(to: CGPoint(x: 0, y: size.height)); diag.addLine(to: CGPoint(x: size.width, y: 0))
                 ctx.stroke(diag, with: .color(.white.opacity(0.12)), style: StrokeStyle(lineWidth: 1, dash: [3, 3]))
 
+                for other in others where other.points != Adjustments.identityCurve {
+                    ctx.stroke(Self.path(MonotoneCurve(points: other.points), size), with: .color(other.color.opacity(0.35)), lineWidth: 1)
+                }
+
                 // Curve.
                 let shown = displayPoints
                 let curve = MonotoneCurve(points: shown)
@@ -51,13 +66,13 @@ struct CurveEditor: View {
                     let p = CGPoint(x: x * size.width, y: (1 - y) * size.height)
                     s == 0 ? path.move(to: p) : path.addLine(to: p)
                 }
-                ctx.stroke(path, with: .color(.white.opacity(0.9)), lineWidth: 1.5)
+                ctx.stroke(path, with: .color(tint.opacity(0.9)), lineWidth: 1.5)
 
                 for (i, p) in shown.enumerated() {
                     let c = CGPoint(x: p.x * size.width, y: (1 - p.y) * size.height)
                     let r: CGFloat = i == dragIndex ? 5 : 4
                     let rect = CGRect(x: c.x - r, y: c.y - r, width: r * 2, height: r * 2)
-                    ctx.fill(Path(ellipseIn: rect), with: .color(i == dragIndex ? (removing ? .red : Theme.accent) : .white))
+                    ctx.fill(Path(ellipseIn: rect), with: .color(i == dragIndex ? (removing ? .red : Theme.accent) : tint))
                 }
             }
             .contentShape(Rectangle())
@@ -71,6 +86,16 @@ struct CurveEditor: View {
         .background(Color.black.opacity(0.25))
         .clipShape(RoundedRectangle(cornerRadius: 6))
         .overlay(RoundedRectangle(cornerRadius: 6).stroke(Theme.hairline))
+    }
+
+    static func path(_ curve: MonotoneCurve, _ size: CGSize) -> Path {
+        var path = Path()
+        for s in 0...128 {
+            let x = Double(s) / 128
+            let p = CGPoint(x: x * size.width, y: (1 - min(max(curve.evaluate(x), 0), 1)) * size.height)
+            s == 0 ? path.move(to: p) : path.addLine(to: p)
+        }
+        return path
     }
 
     private var displayPoints: [CurvePoint] {

@@ -1,8 +1,9 @@
 import Foundation
 import CoreImage
 
-/// Bakes contrast / whites / blacks / positive highlights / tone curve / HSL into a single
-/// 3D lookup table, so all of it costs one GPU pass no matter how many sliders are moved.
+/// Bakes contrast / whites / blacks / positive highlights / tone curves / HSL / hue curves /
+/// color grading into a single 3D lookup table, so all of it costs one GPU pass no matter how
+/// many sliders are moved.
 enum ColorLUT {
     static let dimension = 48
 
@@ -32,6 +33,7 @@ enum ColorLUT {
     /// 1D tone table (sRGB-encoded in, sRGB-encoded out).
     static func toneTable(_ key: ColorLUTKey, size: Int = 1024) -> [Float] {
         let curve = MonotoneCurve(points: key.curve)
+        let parametric = ParametricShape(key.parametric)
         let contrastK = pow(2.0, key.contrast / 100.0 * 1.2)
         let whites = key.whites / 100.0
         let blacks = key.blacks / 100.0
@@ -51,10 +53,18 @@ enum ColorLUT {
             if contrastK != 1 {
                 v = v < 0.5 ? 0.5 * pow(2 * v, contrastK) : 1 - 0.5 * pow(2 * (1 - v), contrastK)
             }
+            v = parametric?.evaluate(v) ?? v
             v = curve.evaluate(v)
             table[i] = Float(min(max(v, 0), 1))
         }
         return table
+    }
+
+    /// A per-channel point curve as a table, or nil when it's flat.
+    static func channelTable(_ points: [CurvePoint], size: Int = 1024) -> [Float]? {
+        guard points != Adjustments.identityCurve else { return nil }
+        let curve = MonotoneCurve(points: points)
+        return (0..<size).map { Float(min(max(curve.evaluate(Double($0) / Double(size - 1)), 0), 1)) }
     }
 
     // MARK: - Cube
@@ -67,6 +77,8 @@ enum ColorLUT {
         let hslActive = !key.hsl.allSatisfy(\.isNeutral)
         let grade = GradePrep(key.grading)
         let bands = HSLBands(key.hsl)
+        let hueTables = HueTables(key.hueCurves)
+        let redTable = channelTable(key.curveRed), greenTable = channelTable(key.curveGreen), blueTable = channelTable(key.curveBlue)
 
         var cube = [Float](repeating: 0, count: n * n * n * 4)
         let scale = 1 / Float(n - 1)
@@ -77,22 +89,30 @@ enum ColorLUT {
             do {
                 let toneBuf = tone
                 DispatchQueue.concurrentPerform(iterations: n) { b in
-                    @inline(__always) func applyTone(_ x: Float) -> Float {
+                    @inline(__always) func lookup(_ t: [Float], _ x: Float) -> Float {
                         let p = x * toneMax
-                        let i = min(Int(p), toneBuf.count - 2)
+                        let i = min(Int(p), t.count - 2)
                         let f = p - Float(i)
-                        return toneBuf[i] + (toneBuf[i + 1] - toneBuf[i]) * f
+                        return t[i] + (t[i + 1] - t[i]) * f
+                    }
+                    @inline(__always) func applyTone(_ x: Float, _ channel: [Float]?) -> Float {
+                        let v = lookup(toneBuf, x)
+                        guard let channel else { return v }
+                        return lookup(channel, v)
                     }
                     var idx = b * slice
-                    let bb0 = applyTone(Float(b) * scale)
+                    let bb0 = applyTone(Float(b) * scale, blueTable)
                     for g in 0..<n {
-                        let gg0 = applyTone(Float(g) * scale)
+                        let gg0 = applyTone(Float(g) * scale, greenTable)
                         for r in 0..<n {
-                            var rr = applyTone(Float(r) * scale)
+                            var rr = applyTone(Float(r) * scale, redTable)
                             var gg = gg0
                             var bb = bb0
                             if hslActive {
                                 (rr, gg, bb) = applyHSL(rr, gg, bb, bands: bands)
+                            }
+                            if let hueTables {
+                                (rr, gg, bb) = hueTables.apply(rr, gg, bb)
                             }
                             if let grade {
                                 (rr, gg, bb) = grade.apply(rr, gg, bb)
@@ -162,6 +182,37 @@ enum ColorLUT {
         return hslToRGB(h, s, l)
     }
 
+    /// The hue curves sampled once per degree.
+    struct HueTables {
+        let hue: [Float], sat: [Float], lum: [Float]
+
+        init?(_ c: HueCurves) {
+            guard !c.isNeutral else { return nil }
+            func table(_ pts: [CurvePoint]) -> [Float] {
+                let curve = PeriodicCurve(points: pts)
+                return (0..<360).map { Float(curve.evaluate(Double($0) / 360) - 0.5) * 2 }
+            }
+            hue = table(c.hue); sat = table(c.saturation); lum = table(c.luminance)
+        }
+
+        func apply(_ r: Float, _ g: Float, _ b: Float) -> (Float, Float, Float) {
+            var (h, s, l) = ColorLUT.rgbToHSL(r, g, b)
+            if s < 0.0001 { return (r, g, b) }
+            // Between the two nearest degrees, so a steep curve doesn't band.
+            let i0 = Int(h) % 360, i1 = (i0 + 1) % 360, f = h - Float(Int(h))
+            func at(_ t: [Float]) -> Float { t[i0] + (t[i1] - t[i0]) * f }
+            let dh = at(hue), ds = at(sat), dl = at(lum)
+            // Gray-ish pixels barely respond, so neutrals stay neutral.
+            let w = min(1, s * 2.5)
+            h += dh * 60 * w
+            if h < 0 { h += 360 }
+            if h >= 360 { h -= 360 }
+            s = min(1, max(0, s * (1 + ds * w)))
+            l = min(1, max(0, l + dl * 0.3 * w * (1 - abs(2 * l - 1) * 0.5)))
+            return ColorLUT.hslToRGB(h, s, l)
+        }
+    }
+
     /// Precomputed color-grading wheel offsets.
     struct GradePrep {
         // Chroma offset and luminance shift per wheel: shadows (0), midtones (1), highlights (2).
@@ -206,7 +257,7 @@ enum ColorLUT {
         }
     }
 
-    private static func rgbToHSL(_ r: Float, _ g: Float, _ b: Float) -> (Float, Float, Float) {
+    static func rgbToHSL(_ r: Float, _ g: Float, _ b: Float) -> (Float, Float, Float) {
         let maxC = max(r, g, b), minC = min(r, g, b)
         let l = (maxC + minC) / 2
         let d = maxC - minC
@@ -219,7 +270,7 @@ enum ColorLUT {
         return (h * 60, s, l)
     }
 
-    fileprivate static func hslToRGB(_ h: Float, _ s: Float, _ l: Float) -> (Float, Float, Float) {
+    static func hslToRGB(_ h: Float, _ s: Float, _ l: Float) -> (Float, Float, Float) {
         if s == 0 { return (l, l, l) }
         let q = l < 0.5 ? l * (1 + s) : l + s - l * s
         let p = 2 * l - q
@@ -285,5 +336,96 @@ struct MonotoneCurve {
         let t2 = t * t, t3 = t2 * t
         return (2 * t3 - 3 * t2 + 1) * ys[i] + (t3 - 2 * t2 + t) * h * ms[i]
             + (-2 * t3 + 3 * t2) * ys[i + 1] + (t3 - t2) * h * ms[i + 1]
+    }
+}
+
+/// The parametric tone curve: each region slider pushes its part of the range up or down with a
+/// smooth bump, the ends stay pinned, and the result never folds back on itself.
+struct ParametricShape {
+    private let table: [Double]
+
+    init?(_ p: ParametricCurve) {
+        guard !p.isNeutral else { return nil }
+        let edges = [0, p.split1, p.split2, p.split3, 1]
+        let amounts = [p.shadows, p.darks, p.lights, p.highlights]
+        let n = 256
+        var t = [Double](repeating: 0, count: n)
+        var previous = 0.0
+        for i in 0..<n {
+            let x = Double(i) / Double(n - 1)
+            var y = x
+            for r in 0..<4 where amounts[r] != 0 {
+                let center = (edges[r] + edges[r + 1]) / 2
+                // Reaches into the neighbouring regions so adjacent sliders blend.
+                let half = max(edges[r + 1] - edges[r], 0.05) * 1.25
+                let d = abs(x - center) / half
+                guard d < 1 else { continue }
+                let w = 0.5 * (1 + cos(.pi * d))
+                y += amounts[r] / 100 * 0.22 * w * sin(.pi * x).squareRoot()
+            }
+            y = min(max(y, previous), 1)
+            t[i] = y
+            previous = y
+        }
+        table = t
+    }
+
+    func evaluate(_ x: Double) -> Double {
+        let p = min(max(x, 0), 1) * Double(table.count - 1)
+        let i = min(Int(p), table.count - 2)
+        return table[i] + (table[i + 1] - table[i]) * (p - Double(i))
+    }
+}
+
+/// Smooth interpolation through points on a circle (x wraps at 1), for the hue curves. Monotone
+/// cubic between neighbours: passes through every point and never overshoots, so a stretch
+/// between two neutral points stays exactly neutral. Flat at 0.5 without any points.
+struct PeriodicCurve {
+    private let xs: [Double]
+    private let ys: [Double]
+    private let ms: [Double]
+
+    init(points: [CurvePoint]) {
+        let sorted = points.map { CurvePoint(x: $0.x - floor($0.x), y: $0.y) }.sorted { $0.x < $1.x }
+        var xs: [Double] = [], ys: [Double] = []
+        for p in sorted where xs.last.map({ p.x - $0 > 1e-4 }) ?? true { xs.append(p.x); ys.append(p.y) }
+        let n = xs.count
+        var ms = [Double](repeating: 0, count: n)
+        if n >= 2 {
+            // Slope of the segment from point k to the next one (wrapping).
+            func slope(_ k: Int) -> Double {
+                let i = (k + n) % n, j = (i + 1) % n
+                let dx = (xs[j] - xs[i] + 1).truncatingRemainder(dividingBy: 1)
+                return (ys[j] - ys[i]) / max(dx == 0 ? 1 : dx, 1e-6)
+            }
+            for k in 0..<n {
+                let a = slope(k - 1), b = slope(k)
+                ms[k] = a * b <= 0 ? 0 : 2 * a * b / (a + b)  // harmonic mean: monotone
+            }
+        }
+        self.xs = xs
+        self.ys = ys
+        self.ms = ms
+    }
+
+    func evaluate(_ x0: Double) -> Double {
+        let n = xs.count
+        if n == 0 { return 0.5 }
+        if n == 1 { return ys[0] }
+        let x = x0 - floor(x0)
+        var i = n - 1
+        for j in 0..<n where xs[j] <= x { i = j }
+        let j = (i + 1) % n
+        var x1 = xs[i], x2 = xs[j]
+        if x2 <= x1 { x2 += 1 }
+        var xx = x
+        if xx < x1 { x1 -= 1; x2 -= 1 }
+        if xx > x2 { xx -= 1 }
+        let h = max(x2 - x1, 1e-6)
+        let t = min(max((xx - x1) / h, 0), 1)
+        let t2 = t * t, t3 = t2 * t
+        let v = (2 * t3 - 3 * t2 + 1) * ys[i] + (t3 - 2 * t2 + t) * h * ms[i]
+            + (-2 * t3 + 3 * t2) * ys[j] + (t3 - t2) * h * ms[j]
+        return min(max(v, 0), 1)
     }
 }

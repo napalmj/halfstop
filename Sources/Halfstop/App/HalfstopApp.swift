@@ -238,6 +238,10 @@ enum KeyHandler {
             else if store.mode == .library, store.current != nil { store.mode = .edit }
             return true
         case 51, 117:                                                                 // delete
+            if store.mode == .edit, store.removingSpots, let id = store.activeSpotID {
+                store.deleteSpot(id)
+                return true
+            }
             // In a collection Delete only takes photos out of it; elsewhere it asks to move the files to the Trash.
             guard store.mode == .library else { return false }
             if case .collection(let id) = store.source {
@@ -248,6 +252,9 @@ enum KeyHandler {
             return true
         case 53:                                                                      // esc
             if store.pickingWhite { store.pickingWhite = false }
+            else if store.pickingRangeColor { store.pickingRangeColor = false }
+            else if store.removingSpots { store.removingSpots = false }
+            else if store.targetAdjusting { store.targetAdjusting = false }
             else if store.isCropping { store.isCropping = false }
             else if store.refineMode != nil { store.refineMode = nil }
             else if store.activeMaskID != nil { store.activeMaskID = nil }
@@ -287,8 +294,18 @@ enum KeyHandler {
             store.activeMaskID = nil
             store.pickingWhite.toggle()
         case "o": if store.activeMaskID != nil { store.setOverlay(!store.showMaskOverlay) }
-        case "[": store.brushSize = max(0.005, store.brushSize / 1.2)
-        case "]": store.brushSize = min(0.25, store.brushSize * 1.2)
+        case "[": if store.removingSpots { store.scaleSpotSize(1 / 1.2) } else { store.brushSize = max(0.005, store.brushSize / 1.2) }
+        case "]": if store.removingSpots { store.scaleSpotSize(1.2) } else { store.brushSize = min(0.25, store.brushSize * 1.2) }
+        case "q":
+            guard store.current != nil else { return false }
+            store.mode = .edit
+            store.panelTab = .detailed
+            store.removingSpots.toggle()
+        case "t":
+            guard store.current != nil else { return false }
+            store.mode = .edit
+            store.panelTab = .detailed
+            store.targetAdjusting.toggle()
         case "b": store.addSelectionToTarget()
         case "d": store.panelTab = store.panelTab == .quick ? .detailed : .quick
         default: return false

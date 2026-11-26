@@ -40,7 +40,8 @@ enum CommandLineHelp {
             .history.json. Photo files are never changed, renamed or moved.
           - Every change is one step in the photo's history, so it can be undone here (halfstop undo)
             or in the app (⌘Z). The app shows changes made from the command line straight away.
-          - Masks, crop, tone curve, HSL and color grading can't be changed from the command line.
+          - Masks, crop, tone curves, HSL, hue curves, color grading, removed spots and the lens
+            profile and fringing switches can't be changed from the command line.
           - Many photos per command, and shell patterns (*.jpg) work. A photo that fails is
             reported and the others are still done.
           - Exit status: 0 all done, 1 at least one photo failed, 2 bad usage (nothing done).

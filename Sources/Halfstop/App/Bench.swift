@@ -71,6 +71,30 @@ enum Bench {
             var a = Adjustments(); a.curve = [CurvePoint(x: 0, y: 0), CurvePoint(x: 0.5, y: 0.4 + Double(n) * 0.005), CurvePoint(x: 1, y: 1)]; return a
         }
 
+        scenario("channel + hue curve drag") { n in
+            var a = Adjustments(); a.curveRed = [CurvePoint(x: 0, y: 0), CurvePoint(x: 0.5, y: 0.45 + Double(n) * 0.004), CurvePoint(x: 1, y: 1)]
+            HueCurves.setPoint(&a.hueCurves.saturation, x: 0.6, y: 0.3 + Double(n) * 0.005); return a
+        }
+        scenario("clarity drag") { n in var a = Adjustments(); a.clarity = Double(n * 2); return a }
+        scenario("dehaze drag") { n in var a = Adjustments(); a.dehaze = Double(n * 2); return a }
+        scenario("texture + clarity + dehaze + grain") { n in
+            var a = Adjustments(); a.texture = 20; a.clarity = 25; a.dehaze = 20; a.grain.amount = 20 + Double(n); return a
+        }
+        var spots: [Spot] = []
+        for i in 0..<20 {
+            let x = 0.1 + Double(i % 5) * 0.18, y = 0.15 + Double(i / 5) * 0.2
+            spots.append(Spot(center: NormPoint(x: x, y: y), source: NormPoint(x: x + 0.04, y: y)))
+        }
+        scenario("5 removed spots, exposure drag") { n in
+            var a = Adjustments(); a.exposure = Double(n) * 0.02; a.spots = Array(spots.prefix(5)); return a
+        }
+        scenario("20 removed spots, exposure drag") { n in
+            var a = Adjustments(); a.exposure = Double(n) * 0.02; a.spots = spots; return a
+        }
+        scenario("20 removed spots, HSL drag") { n in
+            var a = Adjustments(); a.hsl[0].saturation = Double(n) - 15; a.spots = spots; return a
+        }
+
         // Brush: 20 earlier strokes, then one growing stroke (a point per frame).
         var mask = Mask(name: "Brush", kind: .brush)
         mask.local.exposure = 0.7

@@ -19,7 +19,10 @@ touches a photo file's name is the optional rename on import, which is off by de
 - **Library.** Sidebar with All photos, Last import, Folders and manual Collections. Thumbnail grid,
   star ratings, pick/reject flags, filters, multi-select and drag to collections.
 - **Quick and Detailed editing.** Quick has the everyday sliders. Detailed adds full light and color,
-  color grading wheels, tone curve, HSL and detail.
+  texture, clarity and dehaze, color grading wheels, tone curves (point curves for RGB, red, green and
+  blue, plus region sliders), HSL with hue curves and a target-adjust tool, detail, grain and lens
+  corrections.
+- **Spot removal.** Click a dust spot or blemish; Halfstop picks a clean patch nearby and blends it in.
 - **One-click auto.** ✦ Auto sets white balance, tone, whites and blacks, and vibrance in one undoable
   step. It reads the scene (well-exposed, low-key, high-key, night) and finds faces on your Mac to
   protect skin tones. Tone and WB do just those, and Auto straighten levels a tilted horizon.
@@ -31,7 +34,8 @@ touches a photo file's name is the optional rename on import, which is off by de
   [Editing from the command line](docs/USER-GUIDE.md#editing-from-the-command-line--with-an-ai-agent).
 - **Masks.** Brush, linear, radial, subject (Apple Vision) and sky masks, each with its own sliders.
   Combine several gradients (add, subtract, intersect), pick individual subjects, grow, shrink and
-  soften automatic masks, and refine any mask with brush strokes.
+  soften automatic masks, refine any mask with brush strokes, and limit it to a brightness range or a
+  picked color.
 - **Crop and straighten** with aspect presets.
 - **Edit history.** Every edit is a named step you can return to, plus named snapshots. Saved per photo.
 - **Presets, copy/paste settings, undo/redo.**
@@ -110,10 +114,12 @@ Press **⌘?** (Help ▸ Halfstop Help) for a searchable list of every shortcut.
 | D | Toggle Quick / Detailed |
 | J | Show clipping (red = blown, blue = crushed) |
 | W | Pick white balance from a neutral spot |
+| Q | Remove spots (⌥-click or Delete removes one; [ ] size) |
+| T | Target adjust: drag up or down on a color to bend the hue curve |
 | ↑ ↓ over a slider | Nudge it (⇧ = bigger steps); click its value to type one |
 | O | Mask overlay |
-| [ ] | Brush size (⌥ while painting erases) |
-| Esc | Leave crop / mask / back to library |
+| [ ] | Brush size (⌥ while painting erases), or spot size while removing spots |
+| Esc | Leave a tool (crop, spots, target adjust, mask) / back to library |
 | ⌘Z / ⇧⌘Z | Undo / redo |
 | ⇧⌘C / ⇧⌘V | Copy / paste settings |
 | ⌥⇧⌘V | Paste only selected settings |

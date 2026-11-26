@@ -26,6 +26,8 @@ final class ImageSource {
     private let asShotTemperature: Float
     private let asShotTint: Float
     private let defaultNoiseReduction: Float
+    /// The camera provides a lens profile for this RAW file.
+    private(set) var lensProfileSupported = false
     /// Oriented pixel size of the undeveloped image at the scale it was loaded.
     let size: CGSize
 
@@ -54,6 +56,7 @@ final class ImageSource {
                 let longEdge = max(native.width, native.height)
                 if longEdge > maxPixelSize { raw.scaleFactor = Float(maxPixelSize / longEdge) }
             }
+            self.lensProfileSupported = raw.isLensCorrectionSupported
             if raw.isLensCorrectionSupported { raw.isLensCorrectionEnabled = true }
             self.raw = raw
             self.base = nil
@@ -108,6 +111,7 @@ final class ImageSource {
                    renderScale: CGFloat = 1) -> CIImage {
         var img: CIImage
         if let raw {
+            if lensProfileSupported, raw.isLensCorrectionEnabled != a.lens.profile { raw.isLensCorrectionEnabled = a.lens.profile }
             raw.exposure = Float(a.exposure)
             raw.neutralTemperature = asShotTemperature * pow(2, Float(a.temperature / 100) * 0.7)
             raw.neutralTint = asShotTint + Float(a.tint) * 1.2
@@ -144,6 +148,10 @@ final class ImageSource {
         let extent = img.extent
         let longEdge = max(extent.width, extent.height)
 
+        // Lens corrections, then removed spots (placed on what the lens-corrected photo shows).
+        img = Effects.lens(img, a.lens)
+        img = Effects.removeSpots(img, a.spots)
+
         // Local highlight recovery + shadow lift.
         if a.highlights < 0 || a.shadows != 0 {
             let f = CIFilter.highlightShadowAdjust()
@@ -154,7 +162,11 @@ final class ImageSource {
             img = (f.outputImage ?? img).cropped(to: extent)
         }
 
-        // Tone + curve + HSL, all in one lookup.
+        if a.texture != 0 || a.clarity != 0 || a.dehaze != 0 {
+            img = Effects.presence(img, texture: a.texture, clarity: a.clarity, dehaze: a.dehaze, longEdge: longEdge)
+        }
+
+        // Tone + curves + HSL + hue curves + grading, all in one lookup.
         let lutKey = ColorLUTKey(a)
         if !lutKey.isIdentity {
             let f = CIFilter.colorCubeWithColorSpace()
@@ -225,6 +237,9 @@ final class ImageSource {
             f.falloff = 0.7
             img = (f.outputImage ?? img).cropped(to: e)
         }
+        if a.grain.amount > 0 {
+            img = Effects.grain(img, a.grain, longEdge: longEdge)
+        }
         return img
     }
 
@@ -272,6 +287,9 @@ final class ImageSource {
             f.shadowAmount = Float(l.shadows / 100)
             f.radius = Float(longEdge / 200)
             img = (f.outputImage ?? img).cropped(to: extent)
+        }
+        if l.texture != 0 || l.clarity != 0 || l.dehaze != 0 {
+            img = Effects.presence(img, texture: l.texture, clarity: l.clarity, dehaze: l.dehaze, longEdge: longEdge)
         }
         let key = ColorLUTKey(local: l)
         if !key.isIdentity {

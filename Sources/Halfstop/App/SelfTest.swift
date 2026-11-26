@@ -132,6 +132,142 @@ enum SelfTest {
         return out.sorted()
     }
 
+    /// Spread of the middle 90% of luminances: a stand-in for overall contrast.
+    static func spread(_ image: CIImage) -> Double {
+        let l = sortedLuminances(image)
+        return l[l.count * 95 / 100] - l[l.count * 5 / 100]
+    }
+
+    /// Standard deviation of luminance in a 24-pixel box around a normalized point.
+    static func noise(_ image: CIImage, _ x: Double, _ y: Double) -> Double {
+        let e = image.extent
+        let box = CGRect(x: e.minX + x * e.width - 12, y: e.minY + (1 - y) * e.height - 12, width: 24, height: 24).integral
+        var px = [Float](repeating: 0, count: 24 * 24 * 4)
+        Render.background.render(image, toBitmap: &px, rowBytes: 24 * 16, bounds: box, format: .RGBAf, colorSpace: Render.sRGB)
+        var l: [Double] = []
+        for i in stride(from: 0, to: px.count, by: 4) {
+            let y: Float = 0.2126 * px[i] + 0.7152 * px[i + 1] + 0.0722 * px[i + 2]
+            l.append(Double(y))
+        }
+        let mean = l.reduce(0, +) / Double(l.count)
+        var sum = 0.0
+        for v in l { sum += (v - mean) * (v - mean) }
+        return (sum / Double(l.count)).squareRoot()
+    }
+
+    /// Curves, presence, grain, lens, ranges and spot removal.
+    static func newToolChecks(src: ImageSource, base: CIImage, check: (String, Bool, String) -> Void) {
+        let gray = (0.55, 0.95), dark = (0.15, 0.95), skyP = (0.3, 0.1), bluePatch = (5.5 / 8, 0.82), corner = (0.02, 0.02)
+        func s(_ i: CIImage, _ p: (Double, Double)) -> RGB { sample(i, p.0, p.1) }
+        let lift = [CurvePoint(x: 0, y: 0), CurvePoint(x: 0.5, y: 0.7), CurvePoint(x: 1, y: 1)]
+
+        var a = Adjustments(); a.curveRed = lift
+        let red = s(src.developed(a), gray), g0 = s(base, gray)
+        check("red curve warms only red", red.r > g0.r + 0.05 && abs(red.g - g0.g) < 0.01 && abs(red.b - g0.b) < 0.01, "\(g0) -> \(red)")
+
+        a = Adjustments(); a.parametric.shadows = 80
+        check("parametric shadows lifts dark tones", s(src.developed(a), dark).luma > s(base, dark).luma + 0.02, "\(s(base, dark)) -> \(s(src.developed(a), dark))")
+        var extreme = ParametricCurve(); extreme.shadows = -100; extreme.darks = 100; extreme.lights = -100; extreme.highlights = 100
+        let shape = ParametricShape(extreme)!
+        let samples = (0...100).map { shape.evaluate(Double($0) / 100) }
+        check("parametric curve never folds back", zip(samples, samples.dropFirst()).allSatisfy { $0 <= $1 + 1e-9 } && samples.first! == 0, "")
+
+        a = Adjustments(); HueCurves.setPoint(&a.hueCurves.saturation, x: 220.0 / 360, y: 0)
+        check("hue curve point gets neutral anchors", a.hueCurves.saturation.count == 3, "\(a.hueCurves.saturation)")
+        let bp = s(base, bluePatch), desat = s(src.developed(a), bluePatch)
+        check("hue vs saturation desaturates blue", desat.sat < bp.sat * 0.5, "\(bp) -> \(desat)")
+        let flatAway = PeriodicCurve(points: a.hueCurves.saturation)
+        check("hue curve stays neutral away from its points", (0..<100).allSatisfy { i in
+            let x = Double(i) / 100
+            return (x > 0.52 && x < 0.70) || abs(flatAway.evaluate(x) - 0.5) < 1e-9
+        }, "")
+        check("hue vs saturation leaves gray alone", abs(s(src.developed(a), gray).luma - g0.luma) < 0.01, "")
+        let pc = PeriodicCurve(points: [CurvePoint(x: 0.02, y: 0.9), CurvePoint(x: 0.5, y: 0.5), CurvePoint(x: 0.95, y: 0.2)])
+        check("hue curve wraps around smoothly", abs(pc.evaluate(0) - pc.evaluate(0.99999)) < 0.01, "\(pc.evaluate(0)) vs \(pc.evaluate(0.99999))")
+        a = Adjustments(); HueCurves.setPoint(&a.hueCurves.hue, x: 220.0 / 360, y: 1)
+        let shifted = s(src.developed(a), bluePatch)
+        check("hue vs hue shifts blue", abs(shifted.r - bp.r) + abs(shifted.g - bp.g) > 0.05, "\(bp) -> \(shifted)")
+
+        let baseSpread = spread(base)
+        a = Adjustments(); a.clarity = 100
+        check("clarity + adds contrast", spread(src.developed(a)) > baseSpread + 0.005, "\(baseSpread) -> \(spread(src.developed(a)))")
+        a = Adjustments(); a.texture = 100
+        check("texture + brings out fine detail", noise(src.developed(a), 0.3, 0.6) > noise(base, 0.3, 0.6) * 1.3,
+              "\(noise(base, 0.3, 0.6)) -> \(noise(src.developed(a), 0.3, 0.6))")
+        a = Adjustments(); a.dehaze = 80
+        let hazeOut = src.developed(a)
+        check("dehaze + deepens veiled midtones and brings back color",
+              s(hazeOut, gray).luma < g0.luma - 0.03 && s(hazeOut, skyP).sat > s(base, skyP).sat + 0.05,
+              "gray \(g0) -> \(s(hazeOut, gray)); sky \(s(base, skyP)) -> \(s(hazeOut, skyP))")
+        // Next to bright sky, a dark edge must not be pushed to black (the haze estimate is blurred).
+        let edgeImage = CIImage(color: CIColor(red: 0.8, green: 0.85, blue: 0.9)).cropped(to: CGRect(x: 0, y: 0, width: 600, height: 400))
+        let darkHalf = CIImage(color: CIColor(red: 0.08, green: 0.06, blue: 0.05)).cropped(to: CGRect(x: 0, y: 0, width: 300, height: 400))
+        let scene = darkHalf.composited(over: edgeImage)
+        let dehazed = Effects.dehaze(scene, amount: 80, longEdge: 600)
+        check("dehaze leaves no dark band along bright edges",
+              sample(dehazed, 0.48, 0.5).luma > sample(dehazed, 0.2, 0.5).luma * 0.85,
+              "near edge \(sample(dehazed, 0.48, 0.5)), inside \(sample(dehazed, 0.2, 0.5))")
+        a = Adjustments(); a.dehaze = -80
+        check("dehaze - flattens", spread(src.developed(a)) < baseSpread - 0.02, "\(baseSpread) -> \(spread(src.developed(a)))")
+
+        a = Adjustments(); a.grain.amount = 80
+        let grained = src.developed(a)
+        check("grain adds noise to flat areas", noise(grained, 0.3, 0.1) > noise(base, 0.3, 0.1) + 0.01, "\(noise(base, 0.3, 0.1)) -> \(noise(grained, 0.3, 0.1))")
+        check("grain keeps the average", abs(s(grained, gray).luma - g0.luma) < 0.03, "\(g0) -> \(s(grained, gray))")
+        check("grain is the same every render", abs(noise(src.developed(a), 0.3, 0.1) - noise(grained, 0.3, 0.1)) < 1e-6, "")
+
+        a = Adjustments(); a.lens.vignetting = 80
+        check("lens vignetting + brightens corners", s(src.developed(a), corner).luma > s(base, corner).luma + 0.02, "\(s(base, corner)) -> \(s(src.developed(a), corner))")
+        a = Adjustments(); a.lens.distortion = 60
+        check("distortion correction moves pixels", abs(s(src.developed(a), (0.5, 0.25)).luma - s(base, (0.5, 0.25)).luma) > 0.002 || abs(s(src.developed(a), (0.25, 0.5)).b - s(base, (0.25, 0.5)).b) > 0.002, "")
+        a = Adjustments(); a.lens.removeFringing = true
+        check("fringe removal leaves flat areas alone", abs(s(src.developed(a), gray).luma - g0.luma) < 0.01 && abs(s(src.developed(a), bluePatch).sat - bp.sat) < 0.02, "")
+
+        // Ranges: a mask over the whole photo limited by brightness, then by color.
+        a = Adjustments()
+        var m = Mask(name: "All", kind: .radial)
+        m.radiusX = 3; m.radiusY = 3; m.feather = 0; m.local.exposure = 1
+        var range = MaskRange(kind: .luminance); range.low = 0.6; range.smoothness = 0.05
+        m.range = range
+        a.masks = [m]
+        let ranged = src.developed(a)
+        check("brightness range keeps dark tones out", abs(s(ranged, dark).luma - s(base, dark).luma) < 0.01, "\(s(base, dark)) -> \(s(ranged, dark))")
+        check("brightness range lets bright tones in", s(ranged, skyP).luma > s(base, skyP).luma + 0.03, "\(s(base, skyP)) -> \(s(ranged, skyP))")
+        var colorRange = MaskRange(kind: .color)
+        colorRange.red = bp.r; colorRange.green = bp.g; colorRange.blue = bp.b; colorRange.tolerance = 25
+        m.range = colorRange
+        a.masks = [m]
+        let colored = src.developed(a)
+        check("color range changes the picked color", s(colored, bluePatch).luma > bp.luma + 0.03, "\(bp) -> \(s(colored, bluePatch))")
+        check("color range leaves other colors", abs(s(colored, gray).luma - g0.luma) < 0.01, "\(g0) -> \(s(colored, gray))")
+
+        // Spot removal on a flat gray frame with a black dot.
+        let frame = CGRect(x: 0, y: 0, width: 400, height: 300)
+        let flat = CIImage(color: CIColor(red: 0.4, green: 0.45, blue: 0.5)).cropped(to: frame)
+        let dot = CIImage(color: .black).cropped(to: CGRect(x: 195, y: 145, width: 10, height: 10))
+        let dirty = dot.composited(over: flat)
+        let spot = Spot(center: NormPoint(x: 0.5, y: 0.5), source: NormPoint(x: 0.7, y: 0.5), radius: 0.03)
+        let cleaned = Effects.removeSpots(dirty, [spot])
+        let before = sample(dirty, 0.5, 0.5), after = sample(cleaned, 0.5, 0.5), clean = sample(flat, 0.5, 0.5)
+        check("spot removal hides the spot", abs(after.luma - clean.luma) < 0.02 && before.luma < clean.luma - 0.1, "\(before) -> \(after) (clean \(clean))")
+        check("spot removal leaves the rest", abs(sample(cleaned, 0.2, 0.2).luma - clean.luma) < 0.002, "")
+
+        // Edits survive a save and load, and old files without the new fields still load.
+        var all = Adjustments()
+        all.curveGreen = lift; all.parametric.lights = 20; all.texture = 10; all.clarity = -5; all.dehaze = 30
+        all.grain.amount = 40; all.lens.removeFringing = true; all.lens.distortion = 12
+        HueCurves.setPoint(&all.hueCurves.luminance, x: 0.3, y: 0.7)
+        all.spots = [spot]
+        var rm = Mask(name: "R", kind: .radial); rm.range = colorRange; rm.local.dehaze = 20
+        all.masks = [rm]
+        let json = try? JSONEncoder().encode(all)
+        let back = json.flatMap { try? JSONDecoder().decode(Adjustments.self, from: $0) }
+        check("new edits round-trip through JSON", back == all, "")
+        let old = try? JSONDecoder().decode(Adjustments.self, from: Data(#"{"exposure": 0.5, "curve": [{"x":0,"y":0},{"x":1,"y":1}]}"#.utf8))
+        check("old edits load with new fields neutral", old?.exposure == 0.5 && old?.spots == [] && old?.lens == LensCorrection() && old?.hueCurves == HueCurves(), "")
+        check("plain paste leaves spots and crop", !SettingsGroup.standard.contains(.spots) && !SettingsGroup.standard.contains(.crop), "")
+    }
+
     static func run(dir: URL) -> Bool {
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let url = dir.appendingPathComponent("selftest.jpg")
@@ -175,6 +311,8 @@ enum SelfTest {
 
         a = Adjustments(); a.curve = [CurvePoint(x: 0, y: 0), CurvePoint(x: 0.5, y: 0.7), CurvePoint(x: 1, y: 1)]
         check("curve lifts mids", s(src.developed(a), gray).luma > s(base, gray).luma + 0.05, "")
+
+        newToolChecks(src: src, base: base, check: check)
 
         a = Adjustments()
         var m = Mask(name: "Radial", kind: .radial)
@@ -1001,6 +1139,70 @@ enum Snapshot {
         return URL(fileURLWithPath: args[i + 1])
     }
 
+    /// The curve, hue curve, effects, lens, spot removal and mask range panels. Panel sections are
+    /// opened through their saved open/closed state, which is put back afterwards.
+    static func newToolShots(store: LibraryStore, shot: @MainActor (String, Bool) -> Void, preview: @MainActor (String) -> Void,
+                             wait: (Double) async -> Void) async {
+        let d = UserDefaults.standard
+        let keys = ["sec.masks", "sec.light", "sec.color", "sec.grading", "sec.curve", "sec.hsl", "sec.detail", "sec.effects",
+                    "sec.lens", "sec.spots", "curve.mode", "curve.channel", "hsl.curves"]
+        let saved = keys.map { d.object(forKey: $0) }
+        defer { for (k, v) in zip(keys, saved) { d.set(v, forKey: k) } }
+        func only(_ open: [String]) { for k in keys where k.hasPrefix("sec.") { d.set(open.contains(k), forKey: k) } }
+
+        store.activeMaskID = nil
+        store.panelTab = .detailed
+        only(["sec.curve"])
+        d.set(false, forKey: "curve.mode"); d.set(1, forKey: "curve.channel")
+        store.edit { $0.curveRed = [CurvePoint(x: 0, y: 0), CurvePoint(x: 0.45, y: 0.55), CurvePoint(x: 1, y: 1)]
+            $0.curve = [CurvePoint(x: 0, y: 0.05), CurvePoint(x: 0.25, y: 0.2), CurvePoint(x: 0.75, y: 0.8), CurvePoint(x: 1, y: 1)] }
+        store.checkpoint()
+        await wait(1.2)
+        shot("13-curve-red", false)
+        d.set(true, forKey: "curve.mode")
+        store.edit { $0.parametric.shadows = 30; $0.parametric.highlights = -25 }
+        store.checkpoint()
+        await wait(1)
+        shot("13b-curve-parametric", false)
+
+        only(["sec.hsl"])
+        d.set(true, forKey: "hsl.curves")
+        store.hueCurveChannel = .saturation
+        store.setHueCurve(at: 215, to: 0.15)
+        store.checkpoint()
+        store.targetAdjusting = true
+        await wait(1.2)
+        shot("14-hue-curves", false)
+        preview("14-hue-curves")
+        store.targetAdjusting = false
+
+        only(["sec.light", "sec.effects", "sec.lens"])
+        store.edit { $0.clarity = 30; $0.dehaze = 25; $0.grain.amount = 35; $0.lens.removeFringing = true; $0.lens.vignetting = 30 }
+        store.checkpoint()
+        await wait(1.2)
+        shot("15-presence-effects-lens", false)
+        preview("15-presence-effects-lens")
+
+        only(["sec.spots"])
+        store.removingSpots = true
+        store.addSpot(center: NormPoint(x: 0.3, y: 0.3), source: NormPoint(x: 0.36, y: 0.3))
+        store.addSpot(center: NormPoint(x: 0.6, y: 0.2), source: NormPoint(x: 0.6, y: 0.27))
+        await wait(1.2)
+        shot("16-remove-spots", false)
+        store.removingSpots = false
+
+        only(["sec.masks", "sec.light"])
+        store.addMask(.radial)
+        store.editMask { $0.radiusX = 0.6; $0.radiusY = 0.6; $0.local.exposure = 0.8
+            var r = MaskRange(kind: .luminance); r.low = 0.55; r.smoothness = 0.1; $0.range = r }
+        store.setOverlay(true)
+        await wait(1.5)
+        shot("17-mask-brightness-range", false)
+        preview("17-mask-brightness-range")
+        store.setOverlay(false)
+        store.activeMaskID = nil
+    }
+
     static func run(store: LibraryStore, renderer: PreviewRenderer) {
         guard let dir = outputDir else { return }
         guard TestOutput.claim(dir) else {
@@ -1114,6 +1316,8 @@ enum Snapshot {
             shot("4b-two-linears")
             preview("4b-two-linears")
             store.setOverlay(false)
+
+            await newToolShots(store: store, shot: shot, preview: preview, wait: wait)
 
             if let subjects = store.visiblePhotos.first(where: { $0.name == "zz-subjects.jpg" }) {
                 store.select(subjects)

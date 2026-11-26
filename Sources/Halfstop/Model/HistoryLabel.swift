@@ -10,14 +10,18 @@ enum HistoryLabel {
         ("Shadows", \.shadows, false), ("Whites", \.whites, false), ("Blacks", \.blacks, false),
         ("Temperature", \.temperature, false), ("Tint", \.tint, false), ("Vibrance", \.vibrance, false),
         ("Saturation", \.saturation, false), ("Vignette", \.vignette, false), ("Sharpening", \.sharpening, false),
-        ("Noise reduction", \.noiseReduction, false),
+        ("Noise reduction", \.noiseReduction, false), ("Texture", \.texture, false), ("Clarity", \.clarity, false),
+        ("Dehaze", \.dehaze, false), ("Grain", \.grain.amount, false), ("Grain size", \.grain.size, false),
+        ("Grain roughness", \.grain.roughness, false), ("Distortion", \.lens.distortion, false),
+        ("Lens vignetting", \.lens.vignetting, false),
     ]
 
     private static let locals: [Local] = [
         ("Exposure", \.exposure, true), ("Contrast", \.contrast, false), ("Highlights", \.highlights, false),
         ("Shadows", \.shadows, false), ("Whites", \.whites, false), ("Blacks", \.blacks, false),
         ("Temperature", \.temperature, false), ("Tint", \.tint, false), ("Vibrance", \.vibrance, false),
-        ("Saturation", \.saturation, false),
+        ("Saturation", \.saturation, false), ("Texture", \.texture, false), ("Clarity", \.clarity, false),
+        ("Dehaze", \.dehaze, false),
     ]
 
     static func value(_ v: Double, ev: Bool) -> String {
@@ -36,8 +40,20 @@ enum HistoryLabel {
             parts += changedGlobals.map { "\($0.name) \(value(b[keyPath: $0.key], ev: $0.ev))" }
         }
 
-        if a.curve != b.curve { parts.append(b.curveIsIdentity ? "Reset tone curve" : "Tone curve") }
+        if a.curve != b.curve || a.curveRed != b.curveRed || a.curveGreen != b.curveGreen || a.curveBlue != b.curveBlue
+            || a.parametric != b.parametric {
+            parts.append(b.curveIsIdentity ? "Reset tone curve" : "Tone curve")
+        }
         if a.hsl != b.hsl { parts.append(hsl(a.hsl, b.hsl)) }
+        if a.hueCurves != b.hueCurves { parts.append(b.hueCurves.isNeutral ? "Reset hue curves" : "Hue curves") }
+        if a.lens.profile != b.lens.profile { parts.append(b.lens.profile ? "Lens profile on" : "Lens profile off") }
+        if a.lens.removeFringing != b.lens.removeFringing { parts.append(b.lens.removeFringing ? "Remove color fringing" : "Keep color fringing") }
+        if a.spots != b.spots {
+            if b.spots.count > a.spots.count { parts.append("Remove spot") }
+            else if b.spots.isEmpty { parts.append("Clear spots") }
+            else if b.spots.count < a.spots.count { parts.append("Delete spot") }
+            else { parts.append("Adjust spot") }
+        }
         if a.grading != b.grading { parts.append(grading(a.grading, b.grading)) }
         if a.crop != b.crop { parts.append(crop(a.crop, b.crop)) }
         parts += masks(a.masks, b.masks)
@@ -114,6 +130,13 @@ enum HistoryLabel {
             if old.subjects != m.subjects { out.append("\(m.name): choose subjects") }
             if old.grow != m.grow { out.append("\(m.name): grow \(value(m.grow, ev: false))") }
             if old.softness != m.softness { out.append("\(m.name): softness \(value(m.softness, ev: false))") }
+            if old.range != m.range {
+                switch m.range?.kind {
+                case nil: out.append("\(m.name): no range")
+                case .luminance: out.append("\(m.name): brightness range")
+                case .color: out.append("\(m.name): color range")
+                }
+            }
             if old.center != m.center || old.radiusX != m.radiusX || old.radiusY != m.radiusY
                 || old.start != m.start || old.end != m.end || old.feather != m.feather {
                 out.append("Adjust \(m.name)")

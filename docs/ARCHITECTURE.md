@@ -12,7 +12,7 @@ Image / Metal pipeline.
 | `Model/` | Plain data types: `Adjustments` (every slider, curve, HSL value, crop and mask), `Photo` (per-photo sidecar, flags, ratings, history steps, supported file extensions), `SidecarFiles` (reading and writing sidecars), `SidecarSync` (the per-folder sidecar lock, file revisions, changes made outside the app, the merge rule and keeping fields from newer versions), `Catalog` (the library index, folder watching) and `HistoryLabel` (names edit history steps) |
 | `Library/` | `LibraryStore` (the central observable state: selection, filters, edits, saving, undo, trash), the import scan and options (`Importer.swift`, `ImportSheet.swift`), the sidebar, and the library grid and export UI |
 | `Editor/` | The editing screen: `EditorView` and the preview area, `AdjustPanel` (sliders and mask controls), `PreviewRenderer` (Metal preview view), `CropOverlay` and `HistoryPanel` |
-| `Rendering/` | The develop pipeline: `ImageSource` (decodes RAW and raster files, builds the Core Image filter graph), `ColorLUT` (bakes tone and color adjustments into one 3D lookup table), `MaskRenderer` (turns mask descriptions into grayscale images), `RenderServices` (thumbnails, histogram, export), and `AutoAdjust` / `AutoEngine` (one-click auto adjustments, measured on a small decode of the photo off the main thread and cached), with `AutoVision` (faces and horizon, via Vision, with a test hook) and `AutoRefine` (face-aware exposure and skin tint, the auto-enhance second opinion, Auto straighten) and `StyleLearner` ("Learn from my edits": per-photo features and a nearest-neighbour model of what the user changes over ✦ Auto) |
+| `Rendering/` | The develop pipeline: `ImageSource` (decodes RAW and raster files, builds the Core Image filter graph), `ColorLUT` (bakes tone and color adjustments into one 3D lookup table), `MaskRenderer` (turns mask descriptions into grayscale images, including brightness and color ranges), `Effects` (texture, clarity, dehaze, grain, lens corrections, spot removal, and the color-weight lookup tables used by color ranges and defringing), `PixelSampler` (reads developed pixels for the photo tools: picked colors and the automatic spot source), `RenderServices` (thumbnails, histogram, export), and `AutoAdjust` / `AutoEngine` (one-click auto adjustments, measured on a small decode of the photo off the main thread and cached), with `AutoVision` (faces and horizon, via Vision, with a test hook) and `AutoRefine` (face-aware exposure and skin tint, the auto-enhance second opinion, Auto straighten) and `StyleLearner` ("Learn from my edits": per-photo features and a nearest-neighbour model of what the user changes over ✦ Auto) |
 | `CLI/` | The `halfstop` command-line tool: `CommandLineTool` (arguments, the commands, render output checks, the read-only learned model), `CommandLineHelp` (`--help` text), `EditFields` (the sliders that can be set from outside, validation, clamping, labels, reporting, metadata-free JPEGs) and `JSONValue` (stable `--json` output) |
 | `Components/` | Reusable views: adjustment slider and `Theme`, curve editor, histogram, thumbnails |
 
@@ -21,9 +21,11 @@ Image / Metal pipeline.
 1. `LibraryStore` holds the current photo's `Adjustments`. Moving a slider mutates it.
 2. `PreviewRenderer` owns a decoded `ImageSource` for the photo, downsampled for preview.
 3. On each draw, `ImageSource.developed(...)` builds a Core Image graph from the adjustments. Most
-   tone and color work is collapsed into a single lookup table by `ColorLUT`, so it costs one GPU pass
-   however many sliders are used. Masks are rendered by `MaskRenderer` and used to blend local
-   adjustments.
+   tone and color work (tone sliders, parametric and point curves per channel, HSL, hue curves,
+   color grading) is collapsed into a single lookup table by `ColorLUT`, so it costs one GPU pass
+   however many sliders are used. Before it come lens corrections, spot removal, highlights/shadows
+   and presence (`Effects`); after it, masks (rendered by `MaskRenderer` and used to blend local
+   adjustments), sharpening, crop, vignette and grain. Spots, like masks, live in the uncropped frame.
 4. The result is rendered into a Metal drawable by the preview view. The histogram is computed from it.
 5. Exports use their own `ImageSource` at full resolution so they never disturb the live preview.
 

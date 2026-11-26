@@ -17,6 +17,20 @@ All notable changes to Halfstop are listed here. The format follows
   drags low-key, high-key or night photos toward middle gray.
 
 ### Added
+- Tone curve modes: Parametric (Highlights, Lights, Darks and Shadows sliders with movable region
+  splits) and Point, with separate Red, Green and Blue curves, a histogram of the channel behind each,
+  and Medium contrast, Matte and Flat shortcuts.
+- Hue curves in HSL (hue, saturation and luminance over the color wheel) and Target adjust (T): drag
+  up or down on a color in the photo to change it.
+- Texture, Clarity and Dehaze, globally and in masks. Clarity holds back along hard edges and Dehaze
+  never pushes dark edges next to bright sky to black, so neither draws halos.
+- Grain (amount, size, roughness) in Effects.
+- Lens section: lens profile switch (RAW), remove color fringing, manual distortion and lens vignetting.
+- Spot removal (Q): click a spot and a nearby clean patch is copied over it and color-matched to its
+  surroundings; drag the spot or its source, resize with [ ], remove with ⌥-click or Delete.
+- Mask ranges: limit any mask to a brightness band or a picked color.
+- The `halfstop` command sets texture, clarity, dehaze, grain, grain_size, grain_roughness,
+  lens_distortion and lens_vignetting, and `info` reports hue curves, removed spots and lens switches.
 - ✦ Auto at the top of the Basic panel (and of Light in Detailed): white balance (balanced on the photo's grayest pixels),
   exposure, contrast, highlights, shadows, whites, blacks and vibrance in one undoable step. It
   reads the scene, so a well-exposed photo barely changes and low-key, high-key and night photos

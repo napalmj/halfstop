@@ -138,7 +138,7 @@ final class LibraryStore {
     var editsFilter: EditsFilter = .any { didSet { keepCurrentVisible() } }
 
     // Editor state
-    var isCropping = false { didSet { if isCropping { activeMaskID = nil } } }
+    var isCropping = false { didSet { if isCropping { activeMaskID = nil; removingSpots = false; targetAdjusting = false } } }
     var showBefore = false
     /// Paints blown highlights red and crushed shadows blue on the preview (J).
     var showClipping = false
@@ -172,10 +172,29 @@ final class LibraryStore {
     /// Mask currently being edited; nil = whole photo.
     var activeMaskID: UUID? {
         didSet {
-            if activeMaskID != nil { isCropping = false }
-            if activeMaskID != oldValue { refineMode = nil; activeShapeID = nil }
+            if activeMaskID != nil { isCropping = false; removingSpots = false; targetAdjusting = false }
+            if activeMaskID != oldValue { refineMode = nil; activeShapeID = nil; pickingRangeColor = false }
         }
     }
+    /// The next click on the photo picks the active mask's range color.
+    var pickingRangeColor = false
+    /// Spot removal (Q): a click on the photo removes the spot under it.
+    var removingSpots = false {
+        didSet {
+            if removingSpots { isCropping = false; activeMaskID = nil; targetAdjusting = false; pickingWhite = false }
+            else { activeSpotID = nil }
+        }
+    }
+    /// The removed spot the panel's sliders edit.
+    var activeSpotID: UUID?
+    /// Size of new spots, as a fraction of the photo's long edge.
+    var spotSize: Double = 0.015
+    /// Target adjust (T): dragging up or down on the photo bends the hue curve at that color.
+    var targetAdjusting = false {
+        didSet { if targetAdjusting { isCropping = false; activeMaskID = nil; removingSpots = false; pickingWhite = false } }
+    }
+    /// Which hue curve the panel shows and target adjust edits.
+    var hueCurveChannel: HueCurveChannel = .saturation
     /// Which shape of the active mask the handles edit; nil = the mask's own shape.
     var activeShapeID: UUID?
     var refineMode: RefineMode?
@@ -908,7 +927,7 @@ final class LibraryStore {
         let changed = currentID != url
         if changed {
             if let previous = current { commitPending(previous) }
-            isCropping = false; showBefore = false; activeMaskID = nil
+            isCropping = false; showBefore = false; activeMaskID = nil; activeSpotID = nil
         }
         currentID = url
         // Opening a photo also looks for edits saved outside the app that file events missed

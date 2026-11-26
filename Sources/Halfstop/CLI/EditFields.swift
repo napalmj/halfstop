@@ -5,7 +5,7 @@ import UniformTypeIdentifiers
 
 /// The global sliders that can be read and set from outside the editor (the `halfstop` command),
 /// how values are checked, clamped and rounded, and how they're reported. Masks, curves, HSL,
-/// color grading and the crop can't be changed this way.
+/// color grading, removed spots and the crop can't be changed this way.
 enum EditFields {
     /// A global slider that can be read and set.
     struct Field {
@@ -40,6 +40,20 @@ enum EditFields {
               about: "negative darkens the corners, positive lightens them", step: 1),
         Field(name: "sharpening", keyPath: \.sharpening, range: EditLimits.detail, about: "sharpening", step: 1),
         Field(name: "noise_reduction", keyPath: \.noiseReduction, range: EditLimits.detail, about: "noise reduction", step: 1),
+        Field(name: "texture", keyPath: \.texture, range: EditLimits.slider,
+              about: "fine detail; positive brings out texture, negative smooths it (skin, say)", step: 1),
+        Field(name: "clarity", keyPath: \.clarity, range: EditLimits.slider,
+              about: "midtone local contrast; positive adds punch, negative softens", step: 1),
+        Field(name: "dehaze", keyPath: \.dehaze, range: EditLimits.slider,
+              about: "positive removes haze and fog, negative adds a soft haze", step: 1),
+        Field(name: "grain", keyPath: \.grain.amount, range: EditLimits.detail, about: "film grain amount", step: 1),
+        Field(name: "grain_size", keyPath: \.grain.size, range: EditLimits.grainSize, about: "grain size, 1 (fine) to 4 (coarse)", step: 0.1),
+        Field(name: "grain_roughness", keyPath: \.grain.roughness, range: EditLimits.detail,
+              about: "0 is smooth grain, 100 coarse and clumpy", step: 1),
+        Field(name: "lens_distortion", keyPath: \.lens.distortion, range: EditLimits.slider,
+              about: "positive straightens lines that bow outward (barrel), negative ones that bow inward", step: 1),
+        Field(name: "lens_vignetting", keyPath: \.lens.vignetting, range: EditLimits.slider,
+              about: "positive brightens dark corners left by the lens, negative darkens them", step: 1),
     ]
     static let fieldByName = Dictionary(uniqueKeysWithValues: fields.map { ($0.name, $0) })
     static var names: [String] { fields.map(\.name) }
@@ -190,6 +204,10 @@ enum EditFields {
             "tone_curve_edited": .bool(!a.curveIsIdentity),
             "hsl_edited": .bool(!a.hsl.allSatisfy(\.isNeutral)),
             "color_grading_edited": .bool(!a.grading.isNeutral),
+            "hue_curves_edited": .bool(!a.hueCurves.isNeutral),
+            "removed_spots": .int(a.spots.count),
+            "lens_profile": .bool(a.lens.profile),
+            "remove_color_fringing": .bool(a.lens.removeFringing),
         ]
     }
 
@@ -201,6 +219,10 @@ enum EditFields {
         if !a.curveIsIdentity { parts.append("tone curve") }
         if !a.hsl.allSatisfy(\.isNeutral) { parts.append("HSL") }
         if !a.grading.isNeutral { parts.append("color grading") }
+        if !a.hueCurves.isNeutral { parts.append("hue curves") }
+        if !a.spots.isEmpty { parts.append("\(a.spots.count) removed spot\(a.spots.count == 1 ? "" : "s")") }
+        if a.lens.removeFringing { parts.append("color fringing removed") }
+        if !a.lens.profile { parts.append("lens profile off") }
         return parts.isEmpty ? "none" : parts.joined(separator: ", ")
     }
 

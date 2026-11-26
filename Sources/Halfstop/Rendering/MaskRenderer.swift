@@ -61,6 +61,10 @@ enum MaskRenderer {
                          baseKey: cacheable ? [unrefined.shapeKey, version, Int(size.width), Int(size.height)] : nil,
                          cacheKey: cacheable ? [mask.shapeKey, version, Int(size.width), Int(size.height)] : nil) ?? out
         }
+        // 4. Limit to a brightness band or a color of what's under the mask.
+        if let range = mask.range, let w = range.weight(for: base) {
+            out = w.applyingFilter("CIMultiplyCompositing", parameters: [kCIInputBackgroundImageKey: out]).cropped(to: extent)
+        }
         return out
     }
 

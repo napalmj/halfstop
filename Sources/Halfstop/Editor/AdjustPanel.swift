@@ -70,6 +70,7 @@ private let signed: (Double) -> String = { v in
     return r > 0 ? "+\(Int(r))" : "\(Int(r))"
 }
 private let ev: (Double) -> String = { v in String(format: v > 0 ? "+%.2f" : "%.2f", v) }
+private let whole: (Double) -> String = { "\(Int($0.rounded()))" }
 private let tempGradient = [Color(red: 0.3, green: 0.5, blue: 1), Color(white: 0.75), Color(red: 1, green: 0.8, blue: 0.3)]
 private let tintGradient = [Color(red: 0.3, green: 0.85, blue: 0.35), Color(white: 0.75), Color(red: 0.95, green: 0.35, blue: 0.85)]
 
@@ -209,6 +210,8 @@ private struct DetailedPanel: View {
     @AppStorage("sec.hsl") private var hslOpen = false
     @AppStorage("sec.detail") private var detailOpen = false
     @AppStorage("sec.effects") private var effectsOpen = false
+    @AppStorage("sec.lens") private var lensOpen = false
+    @AppStorage("sec.spots") private var spotsOpen = false
 
     var body: some View {
         let a = store.current?.adjustments ?? Adjustments()
@@ -223,8 +226,13 @@ private struct DetailedPanel: View {
         }
 
         let lightModified: Bool = {
-            if let mask { let l = mask.local; return l.exposure != 0 || l.contrast != 0 || l.highlights != 0 || l.shadows != 0 || l.whites != 0 || l.blacks != 0 }
+            if let mask {
+                let l = mask.local
+                return l.exposure != 0 || l.contrast != 0 || l.highlights != 0 || l.shadows != 0 || l.whites != 0 || l.blacks != 0
+                    || l.texture != 0 || l.clarity != 0 || l.dehaze != 0
+            }
             return a.exposure != 0 || a.contrast != 0 || a.highlights != 0 || a.shadows != 0 || a.whites != 0 || a.blacks != 0
+                || a.texture != 0 || a.clarity != 0 || a.dehaze != 0
         }()
         if mask == nil {
             AutoRow().padding(.horizontal, 16).padding(.vertical, 10)
@@ -233,9 +241,11 @@ private struct DetailedPanel: View {
         PanelSection(title: mask == nil ? "Light" : "Light · \(mask!.name)", expanded: $lightOpen, isModified: lightModified, onReset: {
             if mask != nil {
                 store.checkpoint()
-                store.editMask { $0.local.exposure = 0; $0.local.contrast = 0; $0.local.highlights = 0; $0.local.shadows = 0; $0.local.whites = 0; $0.local.blacks = 0 }
+                store.editMask { $0.local.exposure = 0; $0.local.contrast = 0; $0.local.highlights = 0; $0.local.shadows = 0; $0.local.whites = 0; $0.local.blacks = 0
+                    $0.local.texture = 0; $0.local.clarity = 0; $0.local.dehaze = 0 }
             } else {
-                store.resetSection { $0.exposure = 0; $0.contrast = 0; $0.highlights = 0; $0.shadows = 0; $0.whites = 0; $0.blacks = 0 }
+                store.resetSection { $0.exposure = 0; $0.contrast = 0; $0.highlights = 0; $0.shadows = 0; $0.whites = 0; $0.blacks = 0
+                    $0.texture = 0; $0.clarity = 0; $0.dehaze = 0 }
             }
         }) {
             ScopedSlider(title: "Exposure", global: \.exposure, local: \.exposure, range: -5...5, step: 0.05, format: ev)
@@ -244,6 +254,10 @@ private struct DetailedPanel: View {
             ScopedSlider(title: "Shadows", global: \.shadows, local: \.shadows)
             ScopedSlider(title: "Whites", global: \.whites, local: \.whites)
             ScopedSlider(title: "Blacks", global: \.blacks, local: \.blacks)
+            Rectangle().fill(Theme.hairline).frame(height: 1).padding(.vertical, 2)
+            ScopedSlider(title: "Texture", global: \.texture, local: \.texture)
+            ScopedSlider(title: "Clarity", global: \.clarity, local: \.clarity)
+            ScopedSlider(title: "Dehaze", global: \.dehaze, local: \.dehaze)
         }
 
         let colorModified: Bool = {
@@ -270,21 +284,34 @@ private struct DetailedPanel: View {
                 GradingControls(grading: a.grading)
             }
             PanelSection(title: "Tone curve", expanded: $curveOpen, isModified: !a.curveIsIdentity,
-                         onReset: { store.resetSection { $0.curve = Adjustments.identityCurve } }) {
-                CurveSection(points: a.curve)
+                         onReset: { store.resetSection { $0.resetCurves() } }) {
+                CurveSection(a: a)
             }
-            PanelSection(title: "HSL", expanded: $hslOpen, isModified: !a.hsl.allSatisfy(\.isNeutral),
-                         onReset: { store.resetSection { $0.hsl = Adjustments().hsl } }) {
-                HSLSection(bands: a.hsl)
+            PanelSection(title: "HSL", expanded: $hslOpen, isModified: !a.hsl.allSatisfy(\.isNeutral) || !a.hueCurves.isNeutral,
+                         onReset: { store.resetSection { $0.hsl = Adjustments().hsl; $0.hueCurves = HueCurves() } }) {
+                HSLSection(bands: a.hsl, curves: a.hueCurves)
             }
             PanelSection(title: "Detail", expanded: $detailOpen, isModified: a.sharpening != 0 || a.noiseReduction != 0,
                          onReset: { store.resetSection { $0.sharpening = 0; $0.noiseReduction = 0 } }) {
                 ScopedSlider(title: "Sharpening", global: \.sharpening, range: 0...100, format: { "\(Int($0.rounded()))" })
                 ScopedSlider(title: "Noise reduction", global: \.noiseReduction, range: 0...100, format: { "\(Int($0.rounded()))" })
             }
-            PanelSection(title: "Effects", expanded: $effectsOpen, isModified: a.vignette != 0,
-                         onReset: { store.resetSection { $0.vignette = 0 } }) {
+            PanelSection(title: "Effects", expanded: $effectsOpen, isModified: a.vignette != 0 || a.grain.amount != 0,
+                         onReset: { store.resetSection { $0.vignette = 0; $0.grain = Grain() } }) {
                 ScopedSlider(title: "Vignette", global: \.vignette)
+                ScopedSlider(title: "Grain", global: \.grain.amount, range: 0...100, format: whole)
+                if a.grain.amount > 0 {
+                    ScopedSlider(title: "Grain size", global: \.grain.size, range: 1...4, step: 0.1, format: { String(format: "%.1f", $0) })
+                    ScopedSlider(title: "Roughness", global: \.grain.roughness, range: 0...100, format: whole)
+                }
+            }
+            PanelSection(title: "Lens", expanded: $lensOpen, isModified: a.lens != LensCorrection(),
+                         onReset: { store.resetSection { $0.lens = LensCorrection() } }) {
+                LensSection(lens: a.lens)
+            }
+            PanelSection(title: "Remove spots", expanded: $spotsOpen, isModified: !a.spots.isEmpty,
+                         onReset: { store.clearSpots() }) {
+                SpotsSection(count: a.spots.count)
             }
             CropButtonRow()
         }
@@ -401,6 +428,7 @@ private struct MaskSettings: View {
             } else {
                 refineControls
             }
+            RangeControls(mask: mask)
             HStack {
                 Toggle("Invert", isOn: Binding(get: { mask.invert }, set: { v in store.checkpoint(); store.editMask { $0.invert = v } }))
                     .toggleStyle(.checkbox)
@@ -469,6 +497,58 @@ private struct MaskSettings: View {
         case .subject: "People and objects detected automatically. Click one on the photo to include or exclude it."
         case .sky: "Bright, blue areas toward the top of the frame."
         }
+    }
+}
+
+/// Narrows a mask to a brightness band or to colors near a picked one.
+private struct RangeControls: View {
+    @Environment(LibraryStore.self) private var store
+    let mask: Mask
+
+    var body: some View {
+        let range = mask.range
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Limit to").font(.system(size: 11.5)).foregroundStyle(Theme.secondary)
+            HStack(spacing: 4) {
+                Button("All") { store.setMaskRangeKind(nil) }.buttonStyle(ChipStyle(selected: range == nil))
+                Button("Brightness") { store.setMaskRangeKind(.luminance) }.buttonStyle(ChipStyle(selected: range?.kind == .luminance))
+                Button("Color") { store.setMaskRangeKind(.color) }.buttonStyle(ChipStyle(selected: range?.kind == .color))
+            }
+        }
+        if let range {
+            switch range.kind {
+            case .luminance:
+                slider("Low", range.low * 100, 0...100) { r, v in r.low = min(v / 100, r.high) }
+                slider("High", range.high * 100, 0...100) { r, v in r.high = max(v / 100, r.low) }
+                slider("Smoothness", range.smoothness * 100, 1...100) { r, v in r.smoothness = v / 100 }
+            case .color:
+                HStack(spacing: 8) {
+                    RoundedRectangle(cornerRadius: 4)
+                        .fill(Color(.sRGB, red: range.red, green: range.green, blue: range.blue))
+                        .frame(width: 22, height: 22)
+                        .overlay(RoundedRectangle(cornerRadius: 4).stroke(Theme.hairline))
+                    Button {
+                        store.pickingRangeColor.toggle()
+                    } label: {
+                        Label(store.pickingRangeColor ? "Click the photo…" : "Pick color", systemImage: "eyedropper")
+                    }
+                    .buttonStyle(ChipStyle(selected: store.pickingRangeColor))
+                }
+                slider("Tolerance", range.tolerance, 1...100) { r, v in r.tolerance = v }
+            }
+            Text("Turn on Overlay (O) to see what's kept.")
+                .font(.system(size: 10.5))
+                .foregroundStyle(Theme.secondary)
+        }
+    }
+
+    private func slider(_ title: String, _ value: Double, _ r: ClosedRange<Double>, _ set: @escaping (inout MaskRange, Double) -> Void) -> some View {
+        AdjustSlider(title: title, value: value, range: r, format: whole, onBegin: store.checkpoint,
+                     onChange: { v in store.editMask { m in
+                         guard var range = m.range else { return }
+                         set(&range, v)
+                         m.range = range
+                     } })
     }
 }
 
@@ -617,23 +697,89 @@ private struct GradingControls: View {
 private struct CurveSection: View {
     @Environment(LibraryStore.self) private var store
     @Environment(PreviewRenderer.self) private var renderer
-    let points: [CurvePoint]
+    let a: Adjustments
+    @AppStorage("curve.mode") private var parametricMode = false
+    @AppStorage("curve.channel") private var channel = 0
+
+    private static let channels: [(name: String, color: Color, key: WritableKeyPath<Adjustments, [CurvePoint]>)] = [
+        ("RGB", .white, \.curve),
+        ("Red", Color(red: 1, green: 0.45, blue: 0.42), \.curveRed),
+        ("Green", Color(red: 0.45, green: 0.88, blue: 0.45), \.curveGreen),
+        ("Blue", Color(red: 0.45, green: 0.62, blue: 1), \.curveBlue),
+    ]
 
     var body: some View {
-        CurveEditor(points: points, histogram: renderer.histogram, onBegin: store.checkpoint,
-                    onChange: { pts in store.edit { $0.curve = pts } })
-        Text("Drag to add or move points. Drag a point off the graph to remove it.")
-            .font(.system(size: 10.5))
-            .foregroundStyle(Theme.secondary)
+        HStack(spacing: 4) {
+            Button("Parametric") { parametricMode = true }.buttonStyle(ChipStyle(selected: parametricMode))
+            Button("Point") { parametricMode = false }.buttonStyle(ChipStyle(selected: !parametricMode))
+        }
+        if parametricMode {
+            ParametricCurveView(parametric: a.parametric, histogram: renderer.histogram, onBegin: store.checkpoint,
+                                onChange: { p in store.edit { $0.parametric = p } })
+            ScopedSlider(title: "Highlights", global: \.parametric.highlights)
+            ScopedSlider(title: "Lights", global: \.parametric.lights)
+            ScopedSlider(title: "Darks", global: \.parametric.darks)
+            ScopedSlider(title: "Shadows", global: \.parametric.shadows)
+        } else {
+            let c = Self.channels[min(max(channel, 0), 3)]
+            HStack(spacing: 4) {
+                ForEach(Self.channels.indices, id: \.self) { i in
+                    let ch = Self.channels[i]
+                    Button {
+                        channel = i
+                    } label: {
+                        HStack(spacing: 4) {
+                            Text(ch.name)
+                            if a[keyPath: ch.key] != Adjustments.identityCurve { Circle().frame(width: 4, height: 4) }
+                        }
+                    }
+                    .buttonStyle(ChipStyle(selected: channel == i))
+                }
+            }
+            CurveEditor(points: a[keyPath: c.key], histogram: renderer.histogram, tint: c.color,
+                        channel: channel == 0 ? nil : channel - 1,
+                        others: Self.channels.indices.filter { $0 != channel }.map { (a[keyPath: Self.channels[$0].key], Self.channels[$0].color) },
+                        onBegin: store.checkpoint,
+                        onChange: { pts in store.edit { $0[keyPath: c.key] = pts } })
+            HStack(spacing: 4) {
+                Button("Medium contrast") { setCurve(c.key, [CurvePoint(x: 0, y: 0), CurvePoint(x: 0.25, y: 0.21), CurvePoint(x: 0.75, y: 0.79), CurvePoint(x: 1, y: 1)]) }
+                Button("Matte") { setCurve(c.key, [CurvePoint(x: 0, y: 0.08), CurvePoint(x: 0.3, y: 0.27), CurvePoint(x: 0.75, y: 0.77), CurvePoint(x: 1, y: 0.96)]) }
+                Button("Flat") { setCurve(c.key, Adjustments.identityCurve) }
+            }
+            .buttonStyle(ChipStyle(selected: false))
+            Text("Drag to add or move points. Drag a point off the graph to remove it.")
+                .font(.system(size: 10.5))
+                .foregroundStyle(Theme.secondary)
+        }
+    }
+
+    private func setCurve(_ key: WritableKeyPath<Adjustments, [CurvePoint]>, _ points: [CurvePoint]) {
+        store.checkpoint()
+        store.edit { $0[keyPath: key] = points }
     }
 }
 
 private struct HSLSection: View {
     @Environment(LibraryStore.self) private var store
     let bands: [HSLBand]
+    let curves: HueCurves
     @AppStorage("hsl.mode") private var mode = 0
+    @AppStorage("hsl.curves") private var showCurves = false
 
     var body: some View {
+        HStack(spacing: 4) {
+            Button("Sliders") { showCurves = false; store.targetAdjusting = false }.buttonStyle(ChipStyle(selected: !showCurves))
+            Button("Curves") { showCurves = true }.buttonStyle(ChipStyle(selected: showCurves))
+        }
+        if showCurves {
+            HueCurvesControls(curves: curves)
+        } else {
+            sliders
+        }
+    }
+
+    @ViewBuilder
+    private var sliders: some View {
         Picker("", selection: $mode) {
             Text("Hue").tag(0)
             Text("Saturation").tag(1)
@@ -663,6 +809,116 @@ private struct HSLSection: View {
                                  }
                              }
                          })
+        }
+    }
+}
+
+private struct HueCurvesControls: View {
+    @Environment(LibraryStore.self) private var store
+    let curves: HueCurves
+
+    var body: some View {
+        let channel = store.hueCurveChannel
+        HStack(spacing: 4) {
+            ForEach(HueCurveChannel.allCases) { ch in
+                Button {
+                    store.hueCurveChannel = ch
+                } label: {
+                    HStack(spacing: 4) {
+                        Text(ch.label)
+                        if curves[keyPath: ch.keyPath].contains(where: { abs($0.y - 0.5) > 1e-6 }) { Circle().frame(width: 4, height: 4) }
+                    }
+                }
+                .buttonStyle(ChipStyle(selected: channel == ch))
+            }
+        }
+        HueCurveEditor(points: curves[keyPath: channel.keyPath], channel: channel, onBegin: store.checkpoint,
+                       onChange: { pts in store.edit { $0.hueCurves[keyPath: channel.keyPath] = pts } })
+        HStack(spacing: 4) {
+            Button {
+                store.targetAdjusting.toggle()
+            } label: {
+                Label("Target adjust (T)", systemImage: "scope")
+            }
+            .buttonStyle(ChipStyle(selected: store.targetAdjusting))
+            .help("Drag up or down on a color in the photo to change it on this curve")
+            Button("Flat") {
+                store.checkpoint()
+                store.edit { $0.hueCurves[keyPath: channel.keyPath] = [] }
+            }
+            .buttonStyle(ChipStyle(selected: false))
+            .frame(width: 60)
+        }
+        Text(store.targetAdjusting
+             ? "Drag up or down on a color in the photo. Esc stops."
+             : "Drag on the graph to bend one color. Drag a point off the graph to remove it.")
+            .font(.system(size: 10.5))
+            .foregroundStyle(Theme.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+private struct LensSection: View {
+    @Environment(LibraryStore.self) private var store
+    @Environment(PreviewRenderer.self) private var renderer
+    let lens: LensCorrection
+
+    var body: some View {
+        let supported = store.currentID.flatMap { renderer.source(for: $0) }?.lensProfileSupported ?? false
+        Toggle("Use lens profile", isOn: binding(\.profile))
+            .toggleStyle(.checkbox)
+            .disabled(!supported)
+            .help(supported ? "Correct distortion and vignetting with the profile the camera recorded"
+                            : "Only RAW files whose camera records a lens profile have one")
+        Toggle("Remove color fringing", isOn: binding(\.removeFringing))
+            .toggleStyle(.checkbox)
+            .help("Takes the color out of purple and green fringes along high-contrast edges")
+        AdjustSlider(title: "Distortion", value: lens.distortion, range: -100...100,
+                     onBegin: store.checkpoint, onChange: { v in store.edit { $0.lens.distortion = v } })
+            .help("Positive straightens lines that bow outward (barrel), negative ones that bow inward")
+        AdjustSlider(title: "Lens vignetting", value: lens.vignetting, range: -100...100,
+                     onBegin: store.checkpoint, onChange: { v in store.edit { $0.lens.vignetting = v } })
+            .help("Positive brightens dark corners")
+    }
+
+    private func binding(_ kp: WritableKeyPath<LensCorrection, Bool>) -> Binding<Bool> {
+        Binding(get: { lens[keyPath: kp] }, set: { v in store.checkpoint(); store.edit { $0.lens[keyPath: kp] = v } })
+    }
+}
+
+private struct SpotsSection: View {
+    @Environment(LibraryStore.self) private var store
+    let count: Int
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Button {
+                store.removingSpots.toggle()
+            } label: {
+                Label(store.removingSpots ? "Done" : "Remove spots (Q)", systemImage: "bandage")
+            }
+            .buttonStyle(ChipStyle(selected: store.removingSpots))
+            if count > 0 {
+                Button("Clear \(count)") { store.clearSpots() }
+                    .buttonStyle(ChipStyle(selected: false))
+                    .frame(width: 80)
+            }
+        }
+        if store.removingSpots {
+            if let spot = store.activeSpot {
+                AdjustSlider(title: "Size", value: spot.radius * 1000, range: 3...150, format: whole,
+                             onBegin: store.checkpoint,
+                             onChange: { v in store.spotSize = v / 1000; store.editSpot(spot.id) { $0.radius = v / 1000 } })
+                AdjustSlider(title: "Feather", value: spot.feather * 100, range: 0...100, format: whole,
+                             onBegin: store.checkpoint, onChange: { v in store.editSpot(spot.id) { $0.feather = v / 100 } })
+            } else {
+                AdjustSlider(title: "Size", value: store.spotSize * 1000, range: 3...150, format: whole,
+                             onBegin: {}, onChange: { store.spotSize = $0 / 1000 })
+            }
+            Text("Click a spot to remove it; Halfstop picks a clean patch nearby to copy from. Drag either circle to move it. ⌥-click a spot to delete it. [ and ] change size.")
+                .font(.system(size: 10.5))
+                .foregroundStyle(Theme.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 }

@@ -39,8 +39,8 @@ The sidebar lists **All photos**, **Last import**, your **Folders** and your **C
 Press **E** or **Return** on a photo. Use ← → to move to the next photo and **G** to return to the library.
 
 - **Quick** tab: exposure, contrast, highlights, shadows, temperature, saturation, vignette.
-- **Detailed** tab (press **D** to switch): full light and color, color grading wheels, tone curve,
-  HSL and detail (sharpening, noise reduction).
+- **Detailed** tab (press **D** to switch): full light and color, color grading wheels, tone curves,
+  HSL and hue curves, detail (sharpening, noise reduction), effects, lens corrections and spot removal.
 - **Double-click** any slider to reset it. Hold **⌥** while dragging for fine control.
 - **\\** shows the original for comparison.
 - **Crop and straighten**: press **C** (or **R**). **Esc** leaves the tool.
@@ -87,6 +87,61 @@ ones, within modest limits, and its tooltip reads "Auto (adapted to your edits)"
 - Only ✦ Auto adapts; Tone and WB stay as they are. Turning the setting off stops collecting and
   using it immediately, and keeps what was learned in case you turn it back on.
 
+### Presence: texture, clarity and dehaze
+
+At the bottom of **Light**. Each also works inside a mask.
+
+- **Texture** brings out (or, below 0, smooths) fine detail such as fabric, foliage or skin.
+- **Clarity** adds punch to midtones by raising contrast between neighbouring areas. It holds back
+  right along hard edges, so a skyline doesn't get a dark outline. Below 0 it softens.
+- **Dehaze** removes haze and fog and brings back the color they wash out. Below 0 it adds a soft haze.
+
+### Tone curves
+
+**Tone curve** has two modes:
+
+- **Parametric**: four sliders (Highlights, Lights, Darks, Shadows) each bend their part of the
+  tonal range. Drag the three markers under the graph to move where the regions meet.
+- **Point**: drag on the curve to add and move points; drag a point off the graph to remove it.
+  **RGB** changes brightness; **Red**, **Green** and **Blue** change one channel, for color casts and
+  film-style looks. The other channels' curves show faintly behind. **Medium contrast**, **Matte**
+  and **Flat** set the curve in one click.
+
+Both modes apply together (the region sliders first).
+
+### HSL and hue curves
+
+**HSL** switches between **Sliders** (eight colors) and **Curves**. The curves run over the color
+wheel, with the middle line meaning no change:
+
+- **Hue**: up moves a color toward the next hue to the right, down toward the left.
+- **Saturation**: up makes a color more saturated, down takes it toward gray.
+- **Luminance**: up brightens a color, down darkens it.
+
+Drag on the graph to bend one color: Halfstop adds a point there with neutral points on each side, so
+neighbouring colors change gently and the rest not at all. **Target adjust** (**T**) lets you drag up
+or down on the photo itself, on the color you want to change. Gray areas don't respond.
+
+### Effects and lens
+
+- **Grain** adds film-like grain, with **Grain size** and **Roughness**. It's sized relative to the
+  photo, so the preview matches the export, and the same photo always gets the same grain.
+- **Lens**: **Use lens profile** corrects distortion and vignetting with the profile the camera
+  recorded (RAW files that have one; on by default). **Remove color fringing** takes the color out of
+  purple and green fringes along high-contrast edges. **Distortion** straightens lines that bow
+  outward (positive) or inward (negative), and **Lens vignetting** brightens dark corners.
+
+### Removing spots
+
+Press **Q** (or **Remove spots** at the bottom of the Detailed tab) and click a dust spot or blemish.
+Halfstop picks a clean patch nearby, copies it over the spot and matches its color and brightness to
+the surroundings. The selected spot shows its source as a dashed circle: drag either circle to move
+it. **[** and **]** change the size, **⌥-click** or **Delete** removes a spot, **Esc** finishes.
+
+Spots belong to one photo, so pasting settings and presets leave them out (choose **Removed spots**
+in **Paste Selected Settings…** to copy them anyway). Many spots slow the preview a little while you
+drag exposure or white balance; other sliders aren't affected.
+
 ### Masks
 
 Masks apply adjustments to part of the photo, each with its own sliders.
@@ -97,6 +152,8 @@ Masks apply adjustments to part of the photo, each with its own sliders.
 - **Subject** (Apple Vision) and **sky**: detected automatically. For subject masks, click the
   subjects on the photo to include or leave them out. Grow, shrink and soften the result as needed.
 - Any mask can be **refined** with add or subtract brush strokes.
+- **Limit to** narrows any mask to a **Brightness** range (Low, High, Smoothness) or a **Color**:
+  click the photo to pick it, then set the **Tolerance**. Turn on the overlay to see what's kept.
 - **O** shows or hides the red overlay that displays the mask.
 
 ### History and snapshots
@@ -109,7 +166,7 @@ time. **Snapshots ▸ Save** keeps a named version that survives trimming and cl
 ### Presets and copying settings
 
 - **Photo ▸ Save Preset…** stores the current global look. Presets carry only the global look, never
-  crop or masks.
+  crop, masks or removed spots.
 - **⇧⌘C** copies a photo's settings and **⇧⌘V** pastes them onto the selected photos. Each photo keeps
   its own crop.
 - **⇧⌘R** resets all adjustments on the photo.
@@ -153,7 +210,8 @@ Halfstop.app, run the line again. To remove the tool, delete `~/.local/bin/halfs
 The sliders are `temperature`, `tint`, `exposure` (in EV, -5 to 5), `contrast`, `highlights`,
 `shadows`, `whites`, `blacks`, `vibrance`, `saturation`, `vignette` (each -100 to 100),
 `sharpening` and `noise_reduction` (0 to 100). Values outside the range are clamped, and the tool
-says so. Masks, crop, the tone curve, HSL and color grading can't be changed from the command line.
+says so. Masks, crop, tone curves, HSL and hue curves, color grading, removed spots and the lens
+profile and fringing switches can't be changed from the command line.
 
 Several photos at once work, shell patterns too (`halfstop auto trip/*.jpg`). If one photo can't be
 done (not found, not a photo), the tool says why and carries on with the rest. Add `--json` for
