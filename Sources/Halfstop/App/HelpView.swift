@@ -25,6 +25,12 @@ struct HelpView: View {
             Item(keys: ["Return"], what: "Open the photo in the editor"),
             Item(keys: ["G"], what: "Library"),
             Item(keys: ["E"], what: "Edit"),
+            Item(keys: ["⇧-click", "⌘-click"], what: "Select a range of photos, or add one to the selection (grid and filmstrip)"),
+            Item(keys: ["⌘A", "⌥⌘A"], what: "Select all photos in view, or deselect all"),
+            Item(keys: ["⇧ ← → ↑ ↓"], what: "Extend the selection"),
+            Item(keys: ["Drag on empty space"], what: "Select the photos the box touches (⇧ or ⌘ adds to the selection)"),
+            Item(keys: ["⇧⌘A"], what: "✦ Auto on every selected photo (or right-click ▸ Auto, Auto Tone, Auto White Balance)"),
+            Item(keys: ["Right-click ▸ Apply Preset"], what: "Apply a preset to every selected photo"),
             Item(keys: ["B"], what: "Add the selection to the target collection"),
             Item(keys: ["Delete"], what: "In a collection: remove from it. Elsewhere: move to Trash (asks first)"),
             Item(keys: ["⇧⌘S"], what: "Show or hide the sidebar (history in the editor)"),
@@ -46,6 +52,10 @@ struct HelpView: View {
         ]),
         Section(title: "Editing", icon: "slider.horizontal.3", items: [
             Item(keys: ["\\"], what: "Before / after"),
+            Item(keys: ["Pinch", "Scroll wheel"], what: "Zoom in or out around the pointer (⌘ or ⌥ + trackpad scroll too)"),
+            Item(keys: ["Double-click", "Z"], what: "Zoom to 100% on that spot, and back to fit"),
+            Item(keys: ["⌘+", "⌘−", "⌘0"], what: "Zoom in, out, back to fit"),
+            Item(keys: ["Drag", "Space-drag"], what: "Move around a zoomed-in photo (Space with a tool active)"),
             Item(keys: ["J"], what: "Show clipping: red = blown highlights, blue = crushed shadows"),
             Item(keys: ["W"], what: "Pick white balance: click something that should be gray"),
             Item(keys: ["Q"], what: "Remove spots: click a spot. ⌥-click or Delete removes one, [ ] change the size"),
@@ -92,7 +102,7 @@ struct HelpView: View {
         ("Deleting goes to the Trash", "Halfstop never erases files. Trashed photos come back with Finder's Put Back until you empty the Trash."),
         ("✦ Auto learns from your edits", "Once you have edited 20 photos, ✦ Auto adds what you usually change on similar ones. It learns on this Mac only; turn it off in Settings (⌘,)."),
         ("Edit from the command line or with an AI agent", "The halfstop command reads and edits photos from Terminal, so an AI agent with a shell, such as Claude Code, can edit with you (run halfstop --help). Settings (⌘,) shows how to install it. It only changes Halfstop's own edit files, never your photos, and every change is an undoable step."),
-        ("Each photo keeps its own crop", "Paste settings copies everything except the crop. Presets carry only the global look, never crop or masks."),
+        ("Each photo keeps its own crop", "Paste settings copies everything except the crop. Presets never carry the crop, and carry masks only when saved with Include the masks."),
     ]
 
     private var filtered: [Section] {

@@ -44,6 +44,16 @@ final class ImageSource {
         return w * h
     }
 
+    /// Oriented width × height as the file's header declares them, without decoding; nil if unreadable.
+    static func declaredPixelSize(url: URL) -> CGSize? {
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary),
+              let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+              let w = (props[kCGImagePropertyPixelWidth] as? NSNumber)?.doubleValue,
+              let h = (props[kCGImagePropertyPixelHeight] as? NSNumber)?.doubleValue, w > 0, h > 0 else { return nil }
+        let orientation = (props[kCGImagePropertyOrientation] as? NSNumber)?.intValue ?? 1
+        return orientation >= 5 ? CGSize(width: h, height: w) : CGSize(width: w, height: h)
+    }
+
     /// Loads a photo. `maxPixelSize` downsamples for fast previews; nil means full resolution
     /// (refused above `maxFullSizePixels`).
     init?(url: URL, maxPixelSize: CGFloat?) {

@@ -27,8 +27,16 @@ The sidebar lists **All photos**, **Last import**, your **Folders** and your **C
 
 - **Rate** with **1–5** (press the same number again to clear, **0** clears). **Pick** with **P**,
   **reject** with **X**, **unflag** with **U**.
-- **Select** several photos with ⇧-click (range) or ⌘-click (add). Most actions, such as paste
-  settings or move to Trash, apply to the whole selection.
+- **Select** several photos the usual way, in the grid or in the editor's filmstrip:
+  - ⇧-click selects a range, ⌘-click adds or removes one photo.
+  - **⌘A** selects every photo in view; **⌥⌘A** (Photo ▸ Deselect All) or a click on empty space in
+    the grid clears the selection, and **Esc** drops it back to one photo.
+  - **⇧ with the arrow keys** extends the selection.
+  - In the grid, drag a box over empty space to select the photos it touches (hold ⇧ or ⌘ to add
+    to the selection).
+
+  Most actions, such as rating, flagging, Auto, presets, paste settings or move to Trash, apply to
+  the whole selection. Sliders only change the photo on screen.
 - **Filter** by flag (All, Picks, Unflagged, Rejected) and by edited or unedited from the filter menu.
 - **Collections** are manual groups of photos. Create one in the sidebar, then drag photos onto it, or
   make it the target and press **B** to add the selection. A photo can be in many collections, and
@@ -42,6 +50,23 @@ Press **E** or **Return** on a photo. Use ← → to move to the next photo and 
 - **Detailed** tab (press **D** to switch): full light and color, color grading wheels, tone curves,
   HSL and hue curves, detail (sharpening, noise reduction), effects, lens corrections and spot removal.
 - **Double-click** any slider to reset it. Hold **⌥** while dragging for fine control.
+
+### Zooming in
+
+To check sharpness, zoom in on the photo:
+
+- **Pinch** on the trackpad, or roll a **mouse's scroll wheel**, to zoom around the pointer. On a
+  trackpad, hold **⌘** or **⌥** while scrolling to zoom that way too.
+- **Double-click** the photo (or a two-finger double-tap) to jump to **100%** on that spot, and again
+  to go back to fit. **Z** does the same around the middle of the view. **⌘+**, **⌘−** and **⌘0** (View menu) zoom in, out and back to fit.
+- Zoomed in, **drag** the photo or **scroll with two fingers** to move around. With a tool active
+  (a mask, spot removal), hold **Space** and drag.
+
+The badge at the top right shows the zoom as a percentage of the photo's own pixels (100% = one
+photo pixel per screen pixel); click it to go back to fit. Zoomed in, the full-resolution photo is
+decoded in the background (a spinner shows meanwhile). The zoom stays as you move to the next
+photo, so you can compare sharpness across a burst. Crop & straighten always shows the whole frame,
+and the histogram keeps showing the whole photo.
 - **\\** shows the original for comparison.
 - **Crop and straighten**: press **C** (or **R**). **Esc** leaves the tool.
 
@@ -64,6 +89,11 @@ change the edits while it measures, the result is dropped rather than applied on
 
 Pressing an auto chip again, or undo then redo, is instant: results are remembered per photo.
 
+**Many photos at once:** select them in the library (⇧-click for a range, ⌘-click to add), then
+right-click one of them and choose **Auto**, **Auto Tone** or **Auto White Balance**, or press
+**⇧⌘A** (**Photo ▸ Auto**). Each photo is measured on its own and gets its own "Auto" step, so you can
+undo it photo by photo. The top bar shows progress; ✕ stops, and photos already done keep their edits.
+
 ### Auto straighten
 
 In **Crop & straighten** (**C**), **Auto straighten** under the Straighten slider looks for the horizon
@@ -81,8 +111,8 @@ ones, within modest limits, and its tooltip reads "Auto (adapted to your edits)"
 
 - It learns on this Mac, from your own edits only. Nothing is uploaded, and there is no training data
   from anyone else. What it learned is kept in the library index (`catalog.json`).
-- Photos count once you edit them (any history step, undo or redo). Pasting settings or applying a
-  preset to many photos at once only measures the one that's open. Photos edited before this
+- Photos count once you edit them (any history step, undo or redo). Pasting settings, applying a
+  preset or running Auto on many photos at once only measures the one that's open. Photos edited before this
   feature existed aren't measured until you change them again.
 - Only ✦ Auto adapts; Tone and WB stay as they are. Turning the setting off stops collecting and
   using it immediately, and keeps what was learned in case you turn it back on.
@@ -165,8 +195,13 @@ time. **Snapshots ▸ Save** keeps a named version that survives trimming and cl
 
 ### Presets and copying settings
 
-- **Photo ▸ Save Preset…** stores the current global look. Presets carry only the global look, never
-  crop, masks or removed spots.
+- **Photo ▸ Save Preset…** stores the current look. If the photo has masks, tick **Include the
+  masks** to save them too: applying the preset then adds them to each photo, next to any masks it
+  already has. Subject and sky masks are found again on each photo (every subject, not just the ones
+  you picked); drawn masks (brush, linear, radial) keep their place in the frame. Presets never carry
+  the crop or removed spots.
+- **Apply a preset** from **Presets** under the editor's panel, or to many photos at once: select
+  them in the library, then right-click ▸ **Apply Preset** (or **Photo ▸ Apply Preset**).
 - **⇧⌘C** copies a photo's settings and **⇧⌘V** pastes them onto the selected photos. Each photo keeps
   its own crop.
 - **⇧⌘R** resets all adjustments on the photo.

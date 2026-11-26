@@ -172,8 +172,9 @@ struct ContentView: View {
         .onAppear {
             SubjectDetector.shared.onDetected = { _ in renderer.bump() }
             Snapshot.run(store: store, renderer: renderer)
-            keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-                KeyHandler.handle(event, store: store) ? nil : event
+            keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp]) { event in
+                if event.type == .keyUp { return KeyHandler.handleUp(event, store: store) ? nil : event }
+                return KeyHandler.handle(event, store: store) ? nil : event
             }
         }
     }
@@ -215,12 +216,27 @@ enum TrashText {
 /// Single-key shortcuts for culling and editing.
 @MainActor
 enum KeyHandler {
+    /// Letting go of Space ends panning.
+    static func handleUp(_ event: NSEvent, store: LibraryStore) -> Bool {
+        guard event.keyCode == 49, store.spacePanning else { return false }
+        store.spacePanning = false
+        NSCursor.arrow.set()
+        return true
+    }
+
     static func handle(_ event: NSEvent, store: LibraryStore) -> Bool {
         guard let window = NSApp.keyWindow, window.sheetParent == nil, window.attachedSheet == nil else { return false }
         if window.firstResponder is NSText { return false }
         let mods = event.modifierFlags.intersection([.command, .control, .option])
+        // ⌘A selects every photo. Handled here, not as a menu shortcut, so text fields keep their own ⌘A.
+        if mods == .command, !event.modifierFlags.contains(.shift), store.hasLibrary,
+           event.charactersIgnoringModifiers?.lowercased() == "a" {
+            store.selectAll()
+            return true
+        }
         if !mods.isEmpty { return false }
         guard store.hasLibrary else { return false }
+        let shift = event.modifierFlags.contains(.shift)
 
         // ↑/↓ over a slider nudge it (⇧ = 5 steps) instead of changing photos.
         if store.mode == .edit, event.keyCode == 125 || event.keyCode == 126 {
@@ -229,10 +245,12 @@ enum KeyHandler {
         }
 
         switch event.keyCode {
-        case 123: store.step(-1); return true                                         // ←
-        case 124: store.step(1); return true                                          // →
-        case 125: store.mode == .library ? store.stepRow(1, columns: store.gridColumns) : store.step(1); return true  // ↓
-        case 126: store.mode == .library ? store.stepRow(-1, columns: store.gridColumns) : store.step(-1); return true // ↑
+        // Arrows move to the next photo; with ⇧ they extend the selection instead.
+        case 123, 124, 125, 126:
+            let row = store.mode == .library ? max(store.gridColumns, 1) : 1
+            let delta = [123: -1, 124: 1, 125: row, 126: -row][event.keyCode]!
+            if shift { store.extendSelection(by: delta) } else { store.step(delta) }
+            return true
         case 36, 76:                                                                  // return
             if store.isCropping { store.isCropping = false }
             else if store.mode == .library, store.current != nil { store.mode = .edit }
@@ -250,6 +268,12 @@ enum KeyHandler {
                 store.requestTrash(store.selectedPhotos)
             }
             return true
+        case 49:                                                                      // space
+            // Held in the editor: drag to pan a zoomed-in photo, even with a tool active.
+            guard store.mode == .edit else { return false }
+            if !store.spacePanning, store.zoom.isZoomed { NSCursor.openHand.set() }
+            store.spacePanning = true
+            return true
         case 53:                                                                      // esc
             if store.pickingWhite { store.pickingWhite = false }
             else if store.pickingRangeColor { store.pickingRangeColor = false }
@@ -259,6 +283,7 @@ enum KeyHandler {
             else if store.refineMode != nil { store.refineMode = nil }
             else if store.activeMaskID != nil { store.activeMaskID = nil }
             else if store.showBefore { store.showBefore = false }
+            else if store.selection.count > 1 { store.deselectAll() }
             else if store.mode == .edit { store.mode = .library }
             return true
         default: break
@@ -286,6 +311,9 @@ enum KeyHandler {
             store.mode = .edit
             store.isCropping.toggle()
         case "\\": if store.mode == .edit { store.showBefore.toggle() }
+        case "z":
+            guard store.mode == .edit, !store.isCropping else { return false }
+            store.toggleZoom()
         case "j": if store.mode == .edit { store.showClipping.toggle() }
         case "w":
             guard store.current != nil else { return false }
@@ -317,6 +345,12 @@ enum KeyHandler {
 struct HalfstopCommands: Commands {
     let store: LibraryStore
     @Environment(\.openWindow) private var openWindow
+
+    /// "Auto", or "Auto (12 Photos)" when it will run over a library selection.
+    private var autoTitle: String {
+        let n = store.selectedPhotos.count
+        return n > 1 ? "Auto (\(n) Photos)" : "Auto"
+    }
 
     var body: some Commands {
         CommandGroup(replacing: .help) {
@@ -352,6 +386,21 @@ struct HalfstopCommands: Commands {
             Button("Reset All Adjustments") { store.resetAdjustments() }
                 .keyboardShortcut("r", modifiers: [.command, .shift])
             Divider()
+            Button("Deselect All") { store.deselectAll() }
+                .keyboardShortcut("a", modifiers: [.command, .option])
+                .disabled(store.selection.isEmpty)
+            Divider()
+            Button(autoTitle) { store.runAutoOnSelection(.auto) }
+                .keyboardShortcut("a", modifiers: [.command, .shift])
+                .disabled(store.batchAuto != nil || store.selectedPhotos.isEmpty)
+            Menu("Apply Preset") {
+                if store.presets.isEmpty { Text("No presets yet") }
+                ForEach(store.presets) { preset in
+                    Button(preset.name) { store.apply(preset) }
+                }
+            }
+            .disabled(store.targets.isEmpty)
+            Divider()
             Button("Save Preset…") { store.showSavePreset = true }
             Divider()
             Button("Add to Target Collection") { store.addSelectionToTarget() }
@@ -376,6 +425,19 @@ struct HalfstopCommands: Commands {
             Divider()
             Button(store.showClipping ? "Hide Clipping (J)" : "Show Clipping (J)") { store.showClipping.toggle() }
                 .disabled(store.mode != .edit)
+        }
+        CommandGroup(after: .toolbar) {
+            Button("Zoom In") { store.zoomStep(1.5) }
+                .keyboardShortcut("=", modifiers: .command)
+                .disabled(store.mode != .edit || store.isCropping)
+            Button("Zoom Out") { store.zoomStep(1 / 1.5) }
+                .keyboardShortcut("-", modifiers: .command)
+                .disabled(store.mode != .edit || !store.zoom.isZoomed)
+            Button("Zoom to Fit") { store.zoom = PreviewZoom() }
+                .keyboardShortcut("0", modifiers: .command)
+                .disabled(store.mode != .edit || !store.zoom.isZoomed)
+            Button(store.zoom.isZoomed ? "Back to Fit (Z)" : "Zoom to 100% (Z)") { store.toggleZoom() }
+                .disabled(store.mode != .edit || store.isCropping)
         }
     }
 }

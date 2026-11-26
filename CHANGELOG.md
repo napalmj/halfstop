@@ -17,6 +17,18 @@ All notable changes to Halfstop are listed here. The format follows
   drags low-key, high-key or night photos toward middle gray.
 
 ### Added
+- Auto and presets for many photos at once: select photos in the library, then right-click ▸
+  Auto, Auto Tone, Auto White Balance or Apply Preset, or press ⇧⌘A for Auto. Each photo gets its
+  own undoable step; the top bar shows progress and can stop the run.
+- Standard selection everywhere: ⇧-click and ⌘-click also work in the editor's filmstrip, ⌘A
+  selects all, ⌥⌘A or a click on empty space deselects, ⇧ with the arrow keys extends the
+  selection, and dragging a box over empty space in the grid selects the photos it touches.
+  Rating, flags, Auto, presets and paste apply to a filmstrip selection too.
+- Zoom in the editor to check sharpness: pinch or a mouse's scroll wheel zooms around the pointer,
+  double-click or Z toggles 100%, ⌘+ ⌘− ⌘0 in the View menu, and drag, two-finger scroll or
+  Space-drag pans. Zoomed in, the photo is shown from its full-resolution decode.
+- Presets can include masks: tick Include the masks when saving. Applying the preset adds them to
+  each photo; subject and sky masks are detected again on each one.
 - Tone curve modes: Parametric (Highlights, Lights, Darks and Shadows sliders with movable region
   splits) and Point, with separate Red, Green and Blue curves, a histogram of the channel behind each,
   and Medium contrast, Matte and Flat shortcuts.

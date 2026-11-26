@@ -85,6 +85,30 @@ enum Bench {
             let x = 0.1 + Double(i % 5) * 0.18, y = 0.15 + Double(i / 5) * 0.2
             spots.append(Spot(center: NormPoint(x: x, y: y), source: NormPoint(x: x + 0.04, y: y)))
         }
+        // Zoomed in to 100% on the full-resolution decode (what checking sharpness costs).
+        if let full = ImageSource(url: url, maxPixelSize: nil) {
+            let fit = PreviewLayout.fit(full.size, in: CGSize(width: drawable.width / 2, height: drawable.height / 2))
+            var zoom = PreviewZoom()
+            zoom.scale = max(full.size.width / (fit.width * 2), 1.01)
+            zoom.focus = CGPoint(x: 0.4, y: 0.45)
+            for w in 0..<3 { _ = frame(full, { var a = Adjustments(); a.exposure = Double(w) * 0.1; return a }(), tex: tex, histogram: false, zoom: zoom) }
+            func zoomed(_ name: String, _ make: (Int) -> Adjustments) {
+                var cpu: [Double] = [], total: [Double] = []
+                for n in 0..<frames {
+                    let (c, t) = frame(full, make(n), tex: tex, histogram: false, zoom: zoom)
+                    cpu.append(c); total.append(t)
+                }
+                print("  " + name.padding(toLength: 34, withPad: " ", startingAt: 0) + String(format: "cpu %7.2f ms   frame %7.2f ms", median(cpu), median(total)))
+            }
+            zoomed("100% zoom, exposure drag") { n in var a = Adjustments(); a.exposure = Double(n) * 0.02; return a }
+            zoomed("100% zoom, sharpen + NR drag") { n in
+                var a = Adjustments(); a.sharpening = Double(20 + n); a.noiseReduction = 30; return a
+            }
+            var t = CACurrentMediaTime()
+            _ = ImageSource(url: url, maxPixelSize: nil).map { frame($0, Adjustments(), tex: tex, histogram: false, zoom: zoom) }
+            t = CACurrentMediaTime() - t
+            print("  " + "100% zoom, first frame (decode)".padding(toLength: 34, withPad: " ", startingAt: 0) + String(format: "%7.0f ms", t * 1000))
+        }
         scenario("5 removed spots, exposure drag") { n in
             var a = Adjustments(); a.exposure = Double(n) * 0.02; a.spots = Array(spots.prefix(5)); return a
         }
@@ -155,13 +179,15 @@ enum Bench {
     }
 
     /// One preview frame through the same code path the editor uses.
-    static func frame(_ src: ImageSource, _ a: Adjustments, tex: MTLTexture, histogram: Bool) -> (Double, Double) {
+    static func frame(_ src: ImageSource, _ a: Adjustments, tex: MTLTexture, histogram: Bool,
+                      zoom: PreviewZoom = PreviewZoom()) -> (Double, Double) {
         let t0 = CACurrentMediaTime()
-        let img = PreviewRenderer.previewImage(src, a, geometry: .full, overlayMask: nil, drawableSize: drawable, scale: 2)
+        let img = PreviewRenderer.previewImage(src, a, geometry: .full, overlayMask: nil, drawableSize: drawable, scale: 2, zoom: zoom.scale)
         let t1 = CACurrentMediaTime()
         guard let cb = Render.commandQueue.makeCommandBuffer() else { return (0, 0) }
         let rect = PreviewMTKView.encode(img, drawableSize: drawable, scale: 2, background: CIColor(red: 0.09, green: 0.09, blue: 0.095),
-                                         colorSpace: Render.displayP3, pixelFormat: .bgra8Unorm, commandBuffer: cb, texture: { tex })
+                                         colorSpace: Render.displayP3, pixelFormat: .bgra8Unorm, commandBuffer: cb, texture: { tex },
+                                         placement: { c, v in zoom.rect(content: c, in: v) })
         let readback = histogram ? rect.flatMap { HistogramReadback(source: tex, rect: $0, commandBuffer: cb) } : nil
         cb.commit()
         cb.waitUntilCompleted()

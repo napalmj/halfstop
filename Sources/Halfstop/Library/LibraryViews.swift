@@ -2,10 +2,20 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 
+/// The library grid. Click, ⇧-click (range) and ⌘-click (add or remove) select photos; a click on
+/// empty space clears the selection, and dragging a box over empty space selects what it touches
+/// (with ⇧ or ⌘ held, adds to the selection).
 struct LibraryGridView: View {
     @Environment(LibraryStore.self) private var store
     private let spacing: CGFloat = 14
     private let padding: CGFloat = 20
+    private static let space = "libraryGrid"
+
+    /// Where each cell on screen sits in the grid's content. Not observed: it changes as you
+    /// scroll and only the drag box reads it.
+    @State private var cellFrames = CellFrames()
+    @State private var box: CGRect?
+    @State private var boxBase: Set<URL> = []
 
     var body: some View {
         GeometryReader { geo in
@@ -19,9 +29,31 @@ struct LibraryGridView: View {
                                      selected: store.selection.contains(photo.url),
                                      isCurrent: store.currentID == photo.url)
                                 .id(photo.url)
+                                .onGeometryChange(for: CGRect.self) { $0.frame(in: .named(Self.space)) } action: {
+                                    cellFrames.frames[photo.url] = $0
+                                }
+                                .onDisappear { cellFrames.frames[photo.url] = nil }
                         }
                     }
                     .padding(padding)
+                    .frame(minHeight: geo.size.height, alignment: .top)
+                    .background {
+                        Color.clear
+                            .contentShape(Rectangle())
+                            .onTapGesture { store.deselectAll() }
+                            .gesture(boxGesture)
+                    }
+                    .overlay(alignment: .topLeading) {
+                        if let box {
+                            Rectangle()
+                                .fill(Theme.accent.opacity(0.12))
+                                .overlay(Rectangle().strokeBorder(Theme.accent.opacity(0.7), lineWidth: 1))
+                                .frame(width: box.width, height: box.height)
+                                .offset(x: box.minX, y: box.minY)
+                                .allowsHitTesting(false)
+                        }
+                    }
+                    .coordinateSpace(.named(Self.space))
                 }
                 .onChange(of: store.currentID) { _, id in
                     withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo(id) }
@@ -46,6 +78,32 @@ struct LibraryGridView: View {
             }
         }
     }
+}
+
+extension LibraryGridView {
+    private var boxGesture: some Gesture {
+        DragGesture(minimumDistance: 3, coordinateSpace: .named(Self.space))
+            .onChanged { g in
+                if box == nil {
+                    let adding = !NSEvent.modifierFlags.intersection([.shift, .command]).isEmpty
+                    boxBase = adding ? store.selection : []
+                }
+                let rect = CGRect(x: min(g.startLocation.x, g.location.x), y: min(g.startLocation.y, g.location.y),
+                                  width: abs(g.location.x - g.startLocation.x), height: abs(g.location.y - g.startLocation.y))
+                box = rect
+                let hits = cellFrames.frames.filter { $0.value.intersects(rect) }.map(\.key)
+                store.selectBox(Set(hits), adding: boxBase)
+            }
+            .onEnded { _ in
+                box = nil
+                boxBase = []
+                store.finishBoxSelection()
+            }
+    }
+}
+
+private final class CellFrames {
+    var frames: [URL: CGRect] = [:]
 }
 
 private struct GridCell: View {
@@ -123,6 +181,8 @@ private struct GridCell: View {
             if case .collection(let id) = store.source {
                 Button("Remove from collection") { store.removeFromCollection(id, contextTargets) }
             }
+            Divider()
+            AutoAndPresetItems(photos: contextTargets)
             Divider()
             Button("Pick") { store.select(photo); store.setFlag(.pick) }
             Button("Reject") { store.select(photo); store.setFlag(.reject) }
@@ -278,7 +338,7 @@ struct TopBar: View {
                 HStack(spacing: 6) {
                     Text(store.sourceTitle).fontWeight(.semibold).foregroundStyle(Theme.text)
                     Text("\(store.visiblePhotos.count) photos").foregroundStyle(Theme.secondary)
-                    if store.mode == .library && store.selection.count > 1 {
+                    if store.selection.count > 1 {
                         Text("· \(store.selection.count) selected").foregroundStyle(Theme.secondary)
                     }
                 }
@@ -301,6 +361,7 @@ struct TopBar: View {
                     .foregroundStyle(Theme.text.opacity(0.85))
                     .shortcutTip("Add the selection to “\(target.name)”", key: "B")
                 }
+                BatchAutoStatus()
                 SaveStatus()
                 Button { store.showImportSheet() } label: {
                     Label("Import", systemImage: "square.and.arrow.down")
@@ -427,6 +488,57 @@ private struct RatingControl: View {
     }
 }
 
+/// Auto and preset items for a menu, acting on `photos`: the grid's right-click menu (the
+/// selection, or the photo clicked) and the Photo menu.
+struct AutoAndPresetItems: View {
+    @Environment(LibraryStore.self) private var store
+    let photos: [Photo]
+
+    var body: some View {
+        let busy = store.batchAuto != nil
+        let suffix = photos.count > 1 ? " (\(photos.count) Photos)" : ""
+        Button("Auto" + suffix) { store.runAuto(.auto, on: photos) }
+            .disabled(busy || photos.isEmpty)
+        Button("Auto Tone" + suffix) { store.runAuto(.tone, on: photos) }
+            .disabled(busy || photos.isEmpty)
+        Button("Auto White Balance" + suffix) { store.runAuto(.whiteBalance, on: photos) }
+            .disabled(busy || photos.isEmpty)
+        Menu("Apply Preset" + suffix) {
+            if store.presets.isEmpty {
+                Text("No presets yet. Save one from the editor.")
+            }
+            ForEach(store.presets) { preset in
+                Button(preset.name) { store.apply(preset, to: photos) }
+            }
+        }
+        .disabled(photos.isEmpty)
+    }
+}
+
+/// "Auto 12 of 40" with a stop button while an auto action runs over several photos.
+private struct BatchAutoStatus: View {
+    @Environment(LibraryStore.self) private var store
+
+    var body: some View {
+        if let batch = store.batchAuto {
+            HStack(spacing: 6) {
+                ProgressView(value: Double(batch.done), total: Double(max(batch.total, 1)))
+                    .progressViewStyle(.linear)
+                    .controlSize(.mini)
+                    .frame(width: 60)
+                Text("\(batch.kind.label) \(min(batch.done + 1, batch.total)) of \(batch.total)")
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(Theme.secondary)
+                    .monospacedDigit()
+                Button { store.cancelBatchAuto() } label: { Image(systemName: "xmark.circle.fill") }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(Theme.secondary)
+                    .shortcutTip("Stop. Photos already done keep their edits.")
+            }
+        }
+    }
+}
+
 private struct ModeSwitch: View {
     @Environment(LibraryStore.self) private var store
 
@@ -488,16 +600,34 @@ struct SavePresetSheet: View {
     @Environment(LibraryStore.self) private var store
     @Environment(\.dismiss) private var dismiss
     @State private var name = ""
+    @State private var includeMasks = true
 
     var body: some View {
+        let maskCount = store.current?.adjustments.masks.count ?? 0
         VStack(alignment: .leading, spacing: 12) {
             Text("Save preset").font(.headline)
-            Text("Saves the current global look. Crop and masks aren't included.")
+            Text(maskCount > 0 && includeMasks
+                 ? "Saves the current look and its masks. Crop and removed spots aren’t included."
+                 : "Saves the current global look. Crop, masks and removed spots aren’t included.")
                 .font(.system(size: 11.5))
                 .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
             TextField("Moody blue", text: $name)
                 .textFieldStyle(.roundedBorder)
                 .onSubmit(save)
+            if maskCount > 0 {
+                VStack(alignment: .leading, spacing: 4) {
+                    Toggle(maskCount == 1 ? "Include the mask" : "Include the \(maskCount) masks", isOn: $includeMasks)
+                        .toggleStyle(.checkbox)
+                    if includeMasks {
+                        Text("Applying the preset adds them to each photo. Subject and sky masks are found again on each photo; drawn masks keep their place in the frame.")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(.leading, 20)
+                    }
+                }
+            }
             HStack {
                 Spacer()
                 Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
@@ -511,7 +641,7 @@ struct SavePresetSheet: View {
 
     private func save() {
         guard !name.trimmingCharacters(in: .whitespaces).isEmpty else { return }
-        store.saveCurrentAsPreset(named: name)
+        store.saveCurrentAsPreset(named: name, includeMasks: includeMasks)
         dismiss()
     }
 }

@@ -781,11 +781,31 @@ struct Adjustments: Codable, Hashable {
         return a
     }
 
-    /// Global look only — what presets carry over (keeps the target's crop, masks and removed spots).
+    /// What a preset saved from these edits stores: everything but the crop, and the masks only
+    /// with `includeMasks`. Subject and sky masks are detected again on each photo the preset is
+    /// applied to (all subjects, since which ones were picked only makes sense on this photo);
+    /// drawn masks keep their place in the frame.
+    func presetLook(includeMasks: Bool) -> Adjustments {
+        var look = self
+        look.crop = CropSettings()
+        look.masks = includeMasks ? masks.map { mask in
+            var m = mask
+            if m.kind == .subject { m.subjects = nil }
+            return m
+        } : []
+        return look
+    }
+
+    /// What a preset carries over: the global look, plus the preset's own masks (when it was saved
+    /// with them), added after the target's. The target keeps its crop, its masks and its removed spots.
     func asPreset(onto other: Adjustments) -> Adjustments {
         var copy = self
         copy.crop = other.crop
-        copy.masks = other.masks
+        copy.masks = other.masks + masks.map { mask in
+            var m = mask
+            m.id = UUID()   // applying the preset twice gives two masks, not one id twice
+            return m
+        }
         copy.spots = other.spots
         return copy
     }

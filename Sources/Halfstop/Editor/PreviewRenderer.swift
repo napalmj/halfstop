@@ -21,6 +21,12 @@ final class PreviewRenderer {
     /// Bumped whenever a source finishes loading so views redraw.
     private(set) var generation = 0
 
+    /// The full-resolution decode of one photo, for zooming in past what the preview holds.
+    @ObservationIgnored private var detail: (url: URL, source: ImageSource)?
+    @ObservationIgnored private var detailInflight: URL?
+    private(set) var isLoadingDetail = false
+    @ObservationIgnored private var originalSizes: [URL: CGSize] = [:]
+
     /// Best available source right now: full preview if decoded, else the thumbnail.
     func source(for url: URL) -> ImageSource? {
         if let s = sources[url] { return s }
@@ -35,25 +41,63 @@ final class PreviewRenderer {
 
     func hasFullSource(_ url: URL) -> Bool { sources[url] != nil }
 
+    /// The full-resolution source, once `loadDetail` has decoded it.
+    func detailSource(for url: URL) -> ImageSource? {
+        detail?.url == url ? detail?.source : nil
+    }
+
+    /// Decodes the photo at full resolution in the background, if the preview holds less than
+    /// that. Only one is kept: a 50 MP photo is a lot of memory.
+    func loadDetail(_ url: URL) {
+        guard detail?.url != url, detailInflight != url, let preview = sources[url] else { return }
+        guard max(preview.size.width, preview.size.height) >= Self.previewPixelSize - 1 else { return }
+        detailInflight = url
+        isLoadingDetail = true
+        Task.detached(priority: .userInitiated) {
+            let source = ImageSource(url: url, maxPixelSize: nil)
+            await MainActor.run {
+                guard self.detailInflight == url else { return }
+                self.detailInflight = nil
+                self.isLoadingDetail = false
+                if let source {
+                    self.detail = (url, source)
+                    self.generation += 1
+                }
+            }
+        }
+    }
+
+    /// The photo's oriented pixel size as stored (not the preview's), for showing zoom as a percentage.
+    func originalSize(for url: URL) -> CGSize? {
+        if let s = detail?.url == url ? detail?.source.size : nil { return s }
+        if let s = originalSizes[url] { return s }
+        guard let s = ImageSource.declaredPixelSize(url: url) else { return nil }
+        originalSizes[url] = s
+        if originalSizes.count > 200 { originalSizes.removeAll() }
+        return s
+    }
+
     /// The image the live preview draws for a frame (shared with `--bench`).
     ///
     /// Develops at the resolution the image actually occupies on screen rather than the
     /// full decoded preview size: every filter then touches only the pixels you can see.
     nonisolated static func previewImage(_ source: ImageSource, _ a: Adjustments, geometry: GeometryMode, overlayMask: UUID?,
-                                         drawableSize: CGSize, scale: CGFloat) -> CIImage {
+                                         drawableSize: CGSize, scale: CGFloat, zoom: CGFloat = 1) -> CIImage {
         source.developed(a, geometry: geometry, overlayMask: overlayMask,
-                         renderScale: renderScale(source: source, a, geometry: geometry, drawableSize: drawableSize, scale: scale))
+                         renderScale: renderScale(source: source, a, geometry: geometry, drawableSize: drawableSize,
+                                                  scale: scale, zoom: zoom))
     }
 
     /// Fraction of the decoded source's resolution needed to fill the on-screen image rect,
     /// quantized so small window resizes don't keep invalidating cached intermediates.
+    /// `zoom` is the editor's zoom (1 = fit): zoomed in, the photo needs that many times the pixels.
     nonisolated static func renderScale(source: ImageSource, _ a: Adjustments, geometry: GeometryMode,
-                                        drawableSize: CGSize, scale: CGFloat) -> CGFloat {
+                                        drawableSize: CGSize, scale: CGFloat, zoom: CGFloat = 1) -> CGFloat {
         guard source.size.width > 0, drawableSize.width > 0, scale > 0 else { return 1 }
         let content = PreviewLayout.contentSize(source.size, a, geometry)
         let rect = PreviewLayout.fit(content, in: CGSize(width: drawableSize.width / scale, height: drawableSize.height / scale))
         guard content.width > 0, rect.width > 0 else { return 1 }
-        let needed = rect.width * scale / content.width
+        let needed = rect.width * scale * max(zoom, 1) / content.width
         let step: CGFloat = 1 / 16
         return min(1, max(step, (needed / step).rounded(.up) * step))
     }
@@ -182,6 +226,8 @@ enum PreviewLayout {
 final class PreviewMTKView: MTKView {
     /// Called with the drawable size (pixels) and backing scale.
     var imageProvider: ((CGSize, CGFloat) -> CIImage?)?
+    /// Where the image goes (points), given its size and the view's; nil fits it (see `PreviewZoom`).
+    var placement: ((CGSize, CGSize) -> CGRect)?
     /// When set, gets the histogram of each drawn frame (main thread).
     var onHistogram: ((HistogramData) -> Void)?
     var backgroundColor = CIColor(red: 0.09, green: 0.09, blue: 0.095)
@@ -208,7 +254,7 @@ final class PreviewMTKView: MTKView {
         let image = imageProvider?(drawableSize, scale)
         let rect = Self.encode(image, drawableSize: drawableSize, scale: scale,
                                background: backgroundColor, colorSpace: colorSpace, pixelFormat: colorPixelFormat,
-                               commandBuffer: commandBuffer, texture: { drawable.texture })
+                               commandBuffer: commandBuffer, texture: { drawable.texture }, placement: placement)
         // Histogram of the pixels just drawn: no second trip through the develop pipeline.
         if let onHistogram, let rect,
            let readback = HistogramReadback(source: drawable.texture, rect: rect, commandBuffer: commandBuffer) {
@@ -226,12 +272,14 @@ final class PreviewMTKView: MTKView {
     @discardableResult
     static func encode(_ image: CIImage?, drawableSize: CGSize, scale: CGFloat, background: CIColor,
                        colorSpace: CGColorSpace, pixelFormat: MTLPixelFormat,
-                       commandBuffer: MTLCommandBuffer, texture: @escaping () -> MTLTexture) -> CGRect? {
+                       commandBuffer: MTLCommandBuffer, texture: @escaping () -> MTLTexture,
+                       placement: ((CGSize, CGSize) -> CGRect)? = nil) -> CGRect? {
         let full = CGRect(origin: .zero, size: drawableSize)
         var composite = CIImage(color: background).cropped(to: full)
         var placedRect: CGRect?
         if let image, !image.extent.isEmpty, image.extent.width.isFinite {
-            let rectPts = PreviewLayout.fit(image.extent.size, in: CGSize(width: drawableSize.width / scale, height: drawableSize.height / scale))
+            let viewPts = CGSize(width: drawableSize.width / scale, height: drawableSize.height / scale)
+            let rectPts = placement?(image.extent.size, viewPts) ?? PreviewLayout.fit(image.extent.size, in: viewPts)
             let rect = CGRect(x: rectPts.minX * scale, y: drawableSize.height - rectPts.maxY * scale,
                               width: rectPts.width * scale, height: rectPts.height * scale)
             let s = rect.width / image.extent.width
@@ -240,7 +288,9 @@ final class PreviewMTKView: MTKView {
                 .transformed(by: CGAffineTransform(scaleX: s, y: s))
                 .transformed(by: CGAffineTransform(translationX: rect.minX, y: rect.minY))
             composite = placed.composited(over: composite)
+            // Only what's on screen (zoomed in, the photo runs past the edges).
             placedRect = CGRect(x: rect.minX, y: drawableSize.height - rect.maxY, width: rect.width, height: rect.height)
+                .intersection(full)
         }
         let dest = CIRenderDestination(width: Int(drawableSize.width), height: Int(drawableSize.height),
                                        pixelFormat: pixelFormat, commandBuffer: commandBuffer,
@@ -277,6 +327,7 @@ struct PreviewImageView: NSViewRepresentable {
     /// Changes to this value trigger a redraw.
     let token: AnyHashable
     let provider: (CGSize, CGFloat) -> CIImage?
+    var placement: ((CGSize, CGSize) -> CGRect)? = nil
     /// nil = don't take histograms (e.g. while the red mask overlay is showing).
     let onHistogram: ((HistogramData) -> Void)?
 
@@ -287,6 +338,7 @@ struct PreviewImageView: NSViewRepresentable {
     func makeNSView(context: Context) -> PreviewMTKView {
         let v = PreviewMTKView()
         v.imageProvider = provider
+        v.placement = placement
         v.onHistogram = onHistogram
         context.coordinator.lastToken = token
         return v
@@ -294,6 +346,7 @@ struct PreviewImageView: NSViewRepresentable {
 
     func updateNSView(_ view: PreviewMTKView, context: Context) {
         view.imageProvider = provider
+        view.placement = placement
         view.onHistogram = onHistogram
         // Only redraw when what's shown actually changed (histogram updates re-run body too).
         if context.coordinator.lastToken != token {

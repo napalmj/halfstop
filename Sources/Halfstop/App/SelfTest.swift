@@ -535,6 +535,71 @@ enum SelfTest {
         let big = PreviewRenderer.renderScale(source: ImageSource(image: img, url: url), Adjustments(), geometry: .full,
                                               drawableSize: CGSize(width: 5000, height: 3000), scale: 2)
         check("render scale fits the drawable", laptop > 0.55 && laptop < 0.75 && big == 1, "\(laptop) / \(big)")
+        let zoomedScale = PreviewRenderer.renderScale(source: ImageSource(image: img, url: url), Adjustments(), geometry: .full,
+                                                      drawableSize: CGSize(width: 1000, height: 700), scale: 2, zoom: 4)
+        check("zoomed in, the preview renders more of the photo's pixels", zoomedScale == 1, "\(zoomedScale)")
+
+        // Editor zoom: the maths.
+        let zContent = CGSize(width: 3000, height: 2000), zView = CGSize(width: 1000, height: 700)
+        let zFit = PreviewLayout.fit(zContent, in: zView)
+        var zoom = PreviewZoom()
+        check("zoom starts at fit", zoom.rect(content: zContent, in: zView) == zFit && !zoom.isZoomed, "")
+        let anchor = CGPoint(x: 300, y: 250)
+        let zBefore = zoom.rect(content: zContent, in: zView)
+        let pointBefore = CGPoint(x: (anchor.x - zBefore.minX) / zBefore.width, y: (anchor.y - zBefore.minY) / zBefore.height)
+        zoom.zoom(by: 3, anchor: anchor, content: zContent, in: zView, maxScale: 8)
+        let zAfter = zoom.rect(content: zContent, in: zView)
+        let pointAfter = CGPoint(x: (anchor.x - zAfter.minX) / zAfter.width, y: (anchor.y - zAfter.minY) / zAfter.height)
+        check("zooming keeps the point under the pointer still", abs(zoom.scale - 3) < 1e-9
+              && abs(pointAfter.x - pointBefore.x) < 1e-6 && abs(pointAfter.y - pointBefore.y) < 1e-6, "\(pointBefore) → \(pointAfter)")
+        zoom.pan(by: CGSize(width: 100_000, height: 100_000), content: zContent, in: zView)
+        let zPanned = zoom.rect(content: zContent, in: zView)
+        check("panning stops at the photo's edges", abs(zPanned.minX) < 1e-6 && abs(zPanned.minY) < 1e-6, "\(zPanned)")
+        zoom.pan(by: CGSize(width: -100_000, height: -100_000), content: zContent, in: zView)
+        let zPannedBack = zoom.rect(content: zContent, in: zView)
+        check("… on every side", abs(zPannedBack.maxX - zView.width) < 1e-6 && abs(zPannedBack.maxY - zView.height) < 1e-6, "\(zPannedBack)")
+        zoom.zoom(by: 100, anchor: anchor, content: zContent, in: zView, maxScale: 8)
+        check("zooming in stops at the most", zoom.scale == 8, "\(zoom.scale)")
+        zoom.zoom(by: 0.0001, anchor: anchor, content: zContent, in: zView, maxScale: 8)
+        check("zooming out stops at fit", !zoom.isZoomed && zoom.rect(content: zContent, in: zView) == zFit, "\(zoom)")
+        zoom.toggle(to: 4, anchor: CGPoint(x: zFit.minX + zFit.width * 0.3, y: zFit.midY), content: zContent, in: zView)
+        check("double-click zooms to 100% on the point clicked", zoom.scale == 4 && abs(zoom.focus.x - 0.3) < 0.01
+              && abs(zoom.focus.y - 0.5) < 0.01, "\(zoom)")
+        zoom.toggle(to: 4, anchor: nil, content: zContent, in: zView)
+        check("double-click again goes back to fit", !zoom.isZoomed && zoom.focus == CGPoint(x: 0.5, y: 0.5), "\(zoom)")
+
+        // Editor zoom: the frame is drawn where the zoom says. 4× on the left of a dark-to-light ramp
+        // fills the view with its darkest quarter.
+        let zoomTexDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: 1200, height: 400, mipmapped: false)
+        zoomTexDesc.usage = [.shaderWrite, .shaderRead, .renderTarget]
+        zoomTexDesc.storageMode = .shared
+        func grayRamp() -> CIImage {
+            let ctx = CGContext(data: nil, width: 1024, height: 128, bitsPerComponent: 8, bytesPerRow: 0, space: Render.sRGB,
+                                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+            for x in 0..<1024 {
+                let v = CGFloat(x) / 1023
+                ctx.setFillColor(CGColor(colorSpace: Render.sRGB, components: [v, v, v, 1])!)
+                ctx.fill(CGRect(x: x, y: 0, width: 1, height: 128))
+            }
+            return CIImage(cgImage: ctx.makeImage()!)
+        }
+        if let tex = Render.device.makeTexture(descriptor: zoomTexDesc), let cb = Render.commandQueue.makeCommandBuffer() {
+            var drawn = PreviewZoom(); drawn.scale = 4; drawn.focus = CGPoint(x: 0.125, y: 0.5)
+            PreviewMTKView.encode(grayRamp(), drawableSize: CGSize(width: 1200, height: 400), scale: 1, background: CIColor(red: 1, green: 0, blue: 0),
+                                  colorSpace: Render.sRGB, pixelFormat: .bgra8Unorm, commandBuffer: cb, texture: { tex },
+                                  placement: { c, v in drawn.rect(content: c, in: v) })
+            cb.commit(); cb.waitUntilCompleted()
+            var px = [UInt8](repeating: 0, count: 1200 * 400 * 4)
+            tex.getBytes(&px, bytesPerRow: 1200 * 4, from: MTLRegionMake2D(0, 0, 1200, 400), mipmapLevel: 0)
+            func at(_ x: Int, _ y: Int) -> (r: Int, g: Int, b: Int) {
+                let i = (y * 1200 + x) * 4
+                return (Int(px[i + 2]), Int(px[i + 1]), Int(px[i]))
+            }
+            let corners = [at(0, 0), at(1199, 0), at(0, 399), at(1199, 399)]
+            let left = at(2, 200), right = at(1197, 200)
+            check("zoomed in, the photo fills the view", corners.allSatisfy { abs($0.r - $0.b) < 6 }, "\(corners)")
+            check("zoomed in, it shows the part asked for", left.r < 12 && right.r > 50 && right.r < 85, "\(left) … \(right)")
+        }
 
         // Histogram from the drawn frame: a gray ramp (evenly spread sRGB values) must read back flat.
         let rampCtx = CGContext(data: nil, width: 1024, height: 128, bitsPerComponent: 8, bytesPerRow: 0, space: Render.sRGB,
@@ -1551,6 +1616,100 @@ enum LibraryTest {
             check("clear keeps current edits", photo.history.count == 1 && photo.adjustments.saturation == -30)
             store.resetAdjustments()
             store.mode = .library
+        }
+
+        // Standard selection: ⌘A, deselect, ⇧-arrows, drag box, and the filmstrip in the editor.
+        let all = store.visiblePhotos
+        if all.count >= 3 {
+            store.mode = .library
+            store.select(all[0])
+            store.selectAll()
+            check("⌘A selects every photo in view", store.selectedPhotos.count == all.count && store.targets.count == all.count)
+            store.deselectAll()
+            check("deselect all leaves only the current photo to act on", store.selection.isEmpty
+                  && store.selectedPhotos.map(\.url) == [all[0].url])
+            store.select(all[0])
+            store.extendSelection(by: 1)
+            store.extendSelection(by: 1)
+            check("⇧→ extends the selection from the anchor", Set(store.selectedPhotos.map(\.url)) == Set(all[0...2].map(\.url))
+                  && store.currentID == all[2].url)
+            store.extendSelection(by: -1)
+            check("⇧← shrinks it back toward the anchor", Set(store.selectedPhotos.map(\.url)) == Set(all[0...1].map(\.url)))
+            store.select(all[0])
+            store.selectBox([all[1].url, all[2].url], adding: [])
+            store.finishBoxSelection()
+            check("a drag box selects what it touches", store.selection == Set([all[1].url, all[2].url]) && store.currentID == all[1].url)
+            store.selectBox([all[0].url], adding: store.selection)
+            check("⇧-drag adds to the selection", store.selection == Set(all[0...2].map(\.url)))
+
+            store.mode = .edit
+            store.select(all[0])
+            check("editor: one photo acts on the photo on screen", store.targets.map(\.url) == [all[0].url])
+            store.select(all[2], extend: true)
+            check("editor: ⇧-click in the filmstrip selects the range", Set(store.targets.map(\.url)) == Set(all[0...2].map(\.url)))
+            store.select(all[1], toggle: true)
+            check("editor: ⌘-click takes one out", Set(store.selectedPhotos.map(\.url)) == [all[0].url, all[2].url])
+            store.step(1)
+            check("editor: an arrow key goes back to one photo", store.targets.count == 1 && store.selection.count == 1)
+            store.mode = .library
+            store.select(all[0])
+        } else {
+            check("selection test has photos", false, "\(all.count) visible")
+        }
+
+        // Auto and presets over a library selection: each photo measured on its own, one step each.
+        let picked = Array(store.visiblePhotos.prefix(3))
+        if picked.count == 3 {
+            store.mode = .library
+            for p in picked { store.select(p); store.resetAdjustments(); store.commitPending(p) }
+            store.select(picked[0])
+            store.select(picked[2], extend: true)
+            check("the menu acts on a ⇧-click selection", store.selectedPhotos.map(\.url) == picked.map(\.url))
+            let steps = picked.map(\.history.count), before = picked.map(\.adjustments)
+            let task = store.runAuto(.tone, on: store.selectedPhotos)
+            check("batch auto runs in the background", task != nil && store.batchAuto?.total == 3 && picked[0].adjustments == before[0])
+            check("batch auto ignores a second start", store.runAuto(.auto, on: picked) == nil)
+            let changed = await task?.value ?? 0
+            check("batch auto gives each photo one step", changed == 3 && store.batchAuto == nil
+                  && zip(picked, steps).allSatisfy { $0.history.count == $1 + 1 && $0.history.last?.label == "Auto tone" },
+                  "\(changed) changed")
+            for p in picked { store.select(p); store.undo() }
+            check("each photo's batch step undoes on its own", zip(picked, before).allSatisfy { $0.adjustments == $1 })
+
+            let stopped = store.runAuto(.whiteBalance, on: picked)
+            store.cancelBatchAuto()
+            let stoppedCount = await stopped?.value ?? -1
+            check("stopping a batch leaves the rest alone", stoppedCount == 0 && store.batchAuto == nil
+                  && zip(picked, before).allSatisfy { $0.adjustments == $1 }, "\(stoppedCount) changed")
+
+            var look = Adjustments(); look.exposure = 0.7
+            store.apply(Preset(name: "Test look", adjustments: look), to: picked)
+            check("a preset applies to every selected photo",
+                  picked.allSatisfy { $0.adjustments.exposure == 0.7 && $0.history.last?.label == "Preset: Test look" })
+
+            // Presets with masks.
+            var source = Adjustments(); source.exposure = 0.4
+            let fade = Mask(name: "Sky fade", kind: .linear)
+            var person = Mask(name: "Subject", kind: .subject); person.subjects = [2]
+            source.masks = [fade, person]
+            let plain = source.presetLook(includeMasks: false)
+            check("a preset saved without masks has none", plain.masks.isEmpty && plain.exposure == 0.4)
+            let masked = source.presetLook(includeMasks: true)
+            check("a preset saved with masks keeps them, subject masks for every subject",
+                  masked.masks.count == 2 && masked.masks[0] == fade && masked.masks[1].subjects == nil)
+            var target = Adjustments(); let own = Mask(name: "Own", kind: .radial); target.masks = [own]
+            let once = masked.asPreset(onto: target)
+            check("applying it adds its masks after the photo's own", once.masks.map(\.name) == ["Own", "Sky fade", "Subject"]
+                  && once.masks[0] == own && once.exposure == 0.4 && once.masks[1].id != fade.id,
+                  once.masks.map(\.name).joined(separator: ", "))
+            let twice = masked.asPreset(onto: once)
+            check("applying it twice gives distinct masks", Set(twice.masks.map(\.id)).count == 5)
+            check("a preset without masks leaves the photo's masks alone", plain.asPreset(onto: target).masks == [own])
+            store.apply(Preset(name: "Masked", adjustments: masked), to: picked)
+            check("a preset with masks adds them to every selected photo", picked.allSatisfy { $0.adjustments.masks.count == 2 })
+            for p in picked { store.select(p); store.resetAdjustments(); store.commitPending(p) }
+        } else {
+            check("batch auto test has photos", false, "\(picked.count) visible")
         }
 
         // Auto actions: measured off the main thread, applied as one step, dropped when stale.

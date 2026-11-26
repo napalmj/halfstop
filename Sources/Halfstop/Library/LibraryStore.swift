@@ -74,6 +74,13 @@ struct AutoRun: Equatable {
     let id: UUID
 }
 
+/// Progress of an auto action over several photos.
+struct BatchAuto: Equatable {
+    let kind: AutoKind
+    var done: Int
+    let total: Int
+}
+
 @MainActor
 @Observable
 final class LibraryStore {
@@ -142,10 +149,32 @@ final class LibraryStore {
     var showBefore = false
     /// Paints blown highlights red and crushed shadows blue on the preview (J).
     var showClipping = false
+    /// How far the editor is zoomed in, and where (kept when moving to another photo).
+    var zoom = PreviewZoom()
+    /// Space is held in the editor: dragging pans the photo, even with a tool active.
+    var spacePanning = false
+    /// The preview's geometry, for zooming from the keyboard and the menu.
+    @ObservationIgnored let zoomContext = PreviewZoomContext()
+
+    /// Z, or a double-click: fit ↔ 100%.
+    func toggleZoom() {
+        let c = zoomContext
+        zoom.toggle(to: c.actualSize, anchor: nil, content: c.content, in: c.bounds)
+    }
+
+    /// ⌘+ and ⌘−: zoom around the middle of the view.
+    func zoomStep(_ factor: CGFloat) {
+        let c = zoomContext
+        zoom.zoom(by: factor, anchor: CGPoint(x: c.bounds.width / 2, y: c.bounds.height / 2),
+                  content: c.content, in: c.bounds, maxScale: c.maxScale)
+    }
     /// The next click on the photo sets white balance from that spot (W).
     var pickingWhite = false
     /// The auto action measuring right now, if any (its chip shows progress).
     private(set) var autoRun: AutoRun?
+    /// An auto action running over several photos (the top bar shows progress).
+    private(set) var batchAuto: BatchAuto?
+    @ObservationIgnored private var batchAutoTask: Task<Int, Never>?
     /// Move to the next photo after rating or flagging one (⇧ with the key does it once).
     var autoAdvance = UserDefaults.standard.bool(forKey: "autoAdvance") {
         didSet { UserDefaults.standard.set(autoAdvance, forKey: "autoAdvance") }
@@ -383,17 +412,19 @@ final class LibraryStore {
         return photoByURL[currentID]
     }
 
-    /// Photos an action like "apply preset" should hit: the selection in the grid, the current photo in the editor.
+    /// Photos an action like "apply preset" should hit: the selection when several photos are
+    /// selected (in the grid or the editor's filmstrip), otherwise the current photo.
     var targets: [Photo] {
-        if mode == .library && selection.count > 1 {
+        if selection.count > 1 {
             return photos.filter { selection.contains($0.url) }
         }
         return current.map { [$0] } ?? []
     }
 
-    /// Selection in the grid (or the current photo).
+    /// The selected photos (or the current photo). In the editor a single selection is always the
+    /// photo on screen, so only a multiple selection counts there.
     var selectedPhotos: [Photo] {
-        if mode == .library && !selection.isEmpty {
+        if selection.count > 1 || (mode == .library && !selection.isEmpty) {
             return visiblePhotos.filter { selection.contains($0.url) }
         }
         return current.map { [$0] } ?? []
@@ -923,6 +954,44 @@ final class LibraryStore {
 
     func stepRow(_ delta: Int, columns: Int) { step(delta * max(columns, 1)) }
 
+    /// ⇧-arrow: moves `delta` photos and selects everything from the anchor to there.
+    func extendSelection(by delta: Int) {
+        let list = visiblePhotos
+        guard !list.isEmpty else { return }
+        let index = list.firstIndex { $0.url == currentID } ?? 0
+        select(list[min(max(index + delta, 0), list.count - 1)], extend: true)
+    }
+
+    /// ⌘A: every photo in view (the current filter, folder or collection).
+    func selectAll() {
+        let list = visiblePhotos
+        guard !list.isEmpty else { return }
+        selection = Set(list.map(\.url))
+        if currentID == nil || !selection.contains(currentID!) { setCurrent(list.first?.url) }
+        selectionAnchor = list.first?.url
+    }
+
+    /// ⌥⌘A, a click on empty space in the grid, or Esc: nothing selected. Actions then fall back
+    /// to the current photo.
+    func deselectAll() {
+        selection = []
+        selectionAnchor = currentID
+    }
+
+    /// Selection from a drag box in the grid: the photos it touches, added to `base` (the selection
+    /// it started from when ⇧ or ⌘ was held).
+    func selectBox(_ urls: Set<URL>, adding base: Set<URL>) {
+        selection = base.union(urls)
+    }
+
+    /// When a drag box ends: the current photo moves into the selection if it isn't in it.
+    func finishBoxSelection() {
+        if let currentID, selection.contains(currentID) { selectionAnchor = currentID; return }
+        guard let first = visiblePhotos.first(where: { selection.contains($0.url) }) else { return }
+        setCurrent(first.url)
+        selectionAnchor = first.url
+    }
+
     private func setCurrent(_ url: URL?) {
         let changed = currentID != url
         if changed {
@@ -1146,22 +1215,65 @@ final class LibraryStore {
     /// Applies a finished measurement if the photo and its edits are still what it measured.
     @discardableResult
     func finishAuto(_ request: AutoRequest, start: Adjustments, result: AutoResult?) -> AutoOutcome {
-        guard let photo = current, photo.url == request.url, photo.adjustments == start else { return .stale }
+        guard let photo = current, photo.url == request.url else { return .stale }
+        let outcome = applyAuto(to: photo, request, start: start, result: result)
+        if outcome == .noHorizon { showHint("No horizon found") }
+        if outcome == .unchanged && request.kind == .straighten { showHint("Horizon already level") }
+        return outcome
+    }
+
+    /// Applies a measurement to `photo` as one history step, if its edits are still `start`.
+    private func applyAuto(to photo: Photo, _ request: AutoRequest, start: Adjustments, result: AutoResult?) -> AutoOutcome {
+        guard photo.adjustments == start else { return .stale }
         guard var result else { return .unreadable }
-        if request.kind == .straighten {
-            guard result.angle != nil else {
-                showHint("No horizon found")
-                return .noHorizon
-            }
-        }
+        if request.kind == .straighten && result.angle == nil { return .noHorizon }
         if request.kind == .auto { result.learned = learnedOffset(for: photo, result: result) }
         let next = result.applied(to: start)
-        guard next != start else {
-            if request.kind == .straighten { showHint("Horizon already level") }
-            return .unchanged
-        }
+        guard next != start else { return .unchanged }
         applyStep(photo, next, label: request.kind.label)
         return .applied
+    }
+
+    /// Runs an auto action on each of `photos` in turn (the library selection, say): each photo is
+    /// measured on its own and gets its own history step. A photo edited while it waits is
+    /// skipped. Returns how many were changed; nil if a batch is already running.
+    @discardableResult
+    func runAuto(_ kind: AutoKind, on photos: [Photo]) -> Task<Int, Never>? {
+        guard batchAuto == nil, !photos.isEmpty else { return nil }
+        for p in photos { commitPending(p) }
+        batchAuto = BatchAuto(kind: kind, done: 0, total: photos.count)
+        let task = Task { [weak self] () -> Int in
+            var applied = 0
+            for photo in photos {
+                guard let self, !Task.isCancelled else { break }
+                let start = photo.adjustments
+                let request = AutoRequest(url: photo.url, kind: kind, adjustments: start)
+                let result = await AutoEngine.shared.result(for: request)
+                if !Task.isCancelled, self.applyAuto(to: photo, request, start: start, result: result) == .applied {
+                    applied += 1
+                }
+                self.batchAuto?.done += 1
+            }
+            self?.batchAuto = nil
+            self?.batchAutoTask = nil
+            return applied
+        }
+        batchAutoTask = task
+        return task
+    }
+
+    /// Stops a running batch. Photos already done keep their edits.
+    func cancelBatchAuto() {
+        batchAutoTask?.cancel()
+    }
+
+    /// An auto action from a menu: the photo being edited in the editor, the selection in the grid.
+    func runAutoOnSelection(_ kind: AutoKind) {
+        if mode == .edit && selection.count <= 1 {
+            runAuto(kind)
+        } else {
+            runAuto(kind, on: selectedPhotos)
+        }
     }
 
     /// A short message over the photo (where the editor shows its hints), gone after a moment.
@@ -1410,16 +1522,19 @@ final class LibraryStore {
     }
 
     func apply(_ preset: Preset) {
-        for p in targets { applyStep(p, preset.adjustments.asPreset(onto: p.adjustments), label: "Preset: \(preset.name)") }
+        apply(preset, to: targets)
     }
 
-    func saveCurrentAsPreset(named name: String) {
+    func apply(_ preset: Preset, to photos: [Photo]) {
+        for p in photos { applyStep(p, preset.adjustments.asPreset(onto: p.adjustments), label: "Preset: \(preset.name)") }
+    }
+
+    /// Saves the current photo's look as a preset, with its masks when `includeMasks` is set.
+    func saveCurrentAsPreset(named name: String, includeMasks: Bool = false) {
         guard let a = current?.adjustments else { return }
         let trimmed = name.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty else { return }
-        var stripped = a
-        stripped.crop = CropSettings()
-        stripped.masks = []
+        let stripped = a.presetLook(includeMasks: includeMasks)
         if let i = presets.firstIndex(where: { $0.name == trimmed }) {
             presets[i].adjustments = stripped
         } else {

@@ -30,11 +30,15 @@ private struct PreviewToken: Hashable {
     let geometry: String
     let overlay: UUID?
     let generation: Int
+    let zoomScale: CGFloat
+    let zoomX: CGFloat
+    let zoomY: CGFloat
 }
 
 struct PreviewArea: View {
     @Environment(LibraryStore.self) private var store
     @Environment(PreviewRenderer.self) private var renderer
+    @State private var zoomEvents = PreviewZoomEvents()
 
     var body: some View {
         GeometryReader { geo in
@@ -46,12 +50,40 @@ struct PreviewArea: View {
                     Text("No photo selected").foregroundStyle(Theme.secondary)
                 }
             }
+            .clipped()
+            .onContinuousHover { phase in
+                if case .active(let p) = phase { store.zoomContext.hover = p } else { store.zoomContext.hover = nil }
+            }
         }
         .onAppear {
             prepare()
             AutoVision.shared.warmUp()
+            zoomEvents.install(store: store, context: store.zoomContext)
         }
-        .onChange(of: store.currentID) { prepare() }
+        .onDisappear {
+            zoomEvents.remove()
+            store.zoomContext.hover = nil
+            store.spacePanning = false
+        }
+        .onChange(of: store.currentID) { prepare(); loadDetailIfZoomed() }
+        .onChange(of: store.zoom.isZoomed) { loadDetailIfZoomed() }
+        .onChange(of: renderer.hasFullSource(store.currentID ?? URL(fileURLWithPath: "/"))) { loadDetailIfZoomed() }
+    }
+
+    /// Zoomed in, the full-resolution photo replaces the preview (once it's decoded).
+    private func loadDetailIfZoomed() {
+        guard store.zoom.isZoomed, let url = store.currentID else { return }
+        renderer.loadDetail(url)
+    }
+
+    /// A tool that takes clicks and drags on the photo is active (Space then pans instead).
+    private var toolActive: Bool {
+        (store.pickingWhite && !store.isCropping && store.activeMaskID == nil)
+            || (store.pickingRangeColor && store.activeMask != nil && !store.showBefore)
+            || (store.removingSpots && !store.showBefore)
+            || (store.targetAdjusting && !store.showBefore)
+            || store.isCropping
+            || (store.activeMask != nil && !store.showBefore)
     }
 
     private var geometryMode: GeometryMode {
@@ -76,24 +108,32 @@ struct PreviewArea: View {
         let wantsOverlay = store.showMaskOverlay || store.maskInteracting || (store.activeMask?.local.isNeutral ?? false)
         let overlayID = wantsOverlay && !store.showBefore ? store.activeMaskID : nil
         let clipping = store.showClipping && overlayID == nil
+        // Cropping always shows the whole frame.
+        let zoom = store.isCropping ? PreviewZoom() : store.zoom
+        let detail = zoom.isZoomed ? renderer.detailSource(for: url) : nil
         let token = PreviewToken(url: url, revision: photo.revision, before: store.showBefore, clipping: clipping,
-                                 geometry: "\(mode)", overlay: overlayID, generation: renderer.generation)
+                                 geometry: "\(mode)", overlay: overlayID, generation: renderer.generation,
+                                 zoomScale: zoom.scale, zoomX: zoom.focus.x, zoomY: zoom.focus.y)
 
         PreviewImageView(
             token: token,
             provider: { drawable, scale in
-                renderer.source(for: url).map {
-                    let img = PreviewRenderer.previewImage($0, shown, geometry: mode, overlayMask: overlayID, drawableSize: drawable, scale: scale)
+                (detail ?? renderer.source(for: url)).map {
+                    let img = PreviewRenderer.previewImage($0, shown, geometry: mode, overlayMask: overlayID,
+                                                           drawableSize: drawable, scale: scale, zoom: zoom.scale)
                     return clipping ? ClippingOverlay.apply(img) : img
                 }
             },
-            // The histogram reads the drawn pixels, so skip it while overlays are drawn on them.
-            onHistogram: overlayID == nil && !clipping ? { renderer.receiveHistogram($0) } : nil
+            placement: { content, view in zoom.rect(content: content, in: view) },
+            // The histogram reads the drawn pixels, so skip it while overlays are drawn on them, and
+            // while zoomed in (it would only see part of the photo).
+            onHistogram: overlayID == nil && !clipping && !zoom.isZoomed ? { renderer.receiveHistogram($0) } : nil
         )
 
         if let source = renderer.source(for: url) {
             let contentSize = PreviewLayout.contentSize(source.size, a, mode)
-            let rect = PreviewLayout.fit(contentSize, in: size)
+            let rect = zoom.rect(content: contentSize, in: size)
+            let _ = updateZoomContext(url: url, adjustments: a, mode: mode, content: contentSize, bounds: size)
             if store.pickingWhite && !store.isCropping && store.activeMaskID == nil {
                 WhitePicker(imageRect: rect) { p in store.pickWhiteBalance(at: p) }
             } else if store.pickingRangeColor, store.activeMask != nil, !store.showBefore {
@@ -125,6 +165,10 @@ struct PreviewArea: View {
             } else if let mask = store.activeMask, !store.showBefore {
                 MaskOverlay(mask: mask, imageRect: rect)
             }
+            // Drag to pan and double-click to zoom; over the tools only while Space is held.
+            if !store.isCropping && (!toolActive || store.spacePanning) {
+                ZoomPanLayer(context: store.zoomContext)
+            }
         }
 
         VStack {
@@ -139,12 +183,38 @@ struct PreviewArea: View {
                 else if let mask = store.activeMask { badge("Editing \(mask.name)") }
                 else if store.isCropping { badge("Crop") }
                 Spacer()
-                if !renderer.hasFullSource(url) {
+                if !renderer.hasFullSource(url) || (zoom.isZoomed && renderer.isLoadingDetail) {
                     ProgressView().controlSize(.small).padding(10)
+                }
+                if zoom.isZoomed {
+                    Button { store.zoom = PreviewZoom() } label: { badge(zoomLabel(zoom)) }
+                        .buttonStyle(.plain)
+                        .shortcutTip("Back to fit", key: "Z")
                 }
             }
             Spacer()
         }
+    }
+
+    /// Keeps the zoom gestures' geometry current, and works out the zoom that shows 100%.
+    private func updateZoomContext(url: URL, adjustments a: Adjustments, mode: GeometryMode, content: CGSize, bounds: CGSize) {
+        let c = store.zoomContext
+        c.bounds = bounds
+        c.content = content
+        let fit = PreviewLayout.fit(content, in: bounds)
+        let backing = NSApp.keyWindow?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
+        if let original = renderer.originalSize(for: url), fit.width > 0 {
+            let full = PreviewLayout.contentSize(original, a, mode)
+            c.actualSize = max(full.width / (fit.width * backing), 1.01)
+        } else {
+            c.actualSize = 2
+        }
+    }
+
+    /// "100%", "250%"… of the photo's own pixels.
+    private func zoomLabel(_ zoom: PreviewZoom) -> String {
+        let percent = zoom.scale / store.zoomContext.actualSize * 100
+        return "\(Int(percent.rounded()))%"
     }
 
     private func badge(_ text: String) -> some View {
@@ -419,7 +489,8 @@ struct Filmstrip: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 LazyHStack(spacing: 6) {
                     ForEach(store.visiblePhotos) { photo in
-                        FilmstripCell(photo: photo, isCurrent: photo.url == store.currentID)
+                        FilmstripCell(photo: photo, isCurrent: photo.url == store.currentID,
+                                      isSelected: store.selection.count > 1 && store.selection.contains(photo.url))
                             .id(photo.url)
                     }
                 }
@@ -436,10 +507,12 @@ struct Filmstrip: View {
 }
 
 /// Its own view so a cell's edits re-render only that cell, not the whole strip.
+/// ⇧-click selects a range and ⌘-click adds or removes a photo, as in the grid.
 private struct FilmstripCell: View {
     @Environment(LibraryStore.self) private var store
     let photo: Photo
     let isCurrent: Bool
+    let isSelected: Bool
 
     var body: some View {
         ThumbnailView(photo: photo, maxSize: 150)
@@ -447,14 +520,17 @@ private struct FilmstripCell: View {
             .opacity(photo.flag == .reject ? 0.35 : 1)
             .overlay(
                 RoundedRectangle(cornerRadius: 4)
-                    .stroke(isCurrent ? Theme.accent : .clear, lineWidth: 2)
+                    .stroke(isCurrent ? Theme.accent : isSelected ? Theme.accent.opacity(0.45) : .clear, lineWidth: 2)
             )
             .overlay(alignment: .bottomLeading) { StarsBadge(rating: photo.rating, size: 7) }
             .overlay(alignment: .topTrailing) {
                 if !photo.adjustments.isDefault { EditedBadge(compact: true).padding(3) }
             }
             .contentShape(Rectangle())
-            .onTapGesture { store.select(photo) }
+            .onTapGesture {
+                let flags = NSEvent.modifierFlags
+                store.select(photo, extend: flags.contains(.shift), toggle: flags.contains(.command))
+            }
     }
 }
 
